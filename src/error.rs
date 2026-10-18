@@ -34,6 +34,12 @@ pub enum RiptideError {
     #[error("download cancelled")]
     Cancelled,
 
+    /// The bytes-per-window budget ran out. Distinct from `Cancelled` because the job is
+    /// not suspended by the user and it will become runnable again on its own; the engine
+    /// records it as `Paused` so the queue can retry it after the window rolls.
+    #[error("{0}")]
+    QuotaExhausted(#[from] crate::quota::QuotaExhausted),
+
     #[error("not supported: {0}")]
     Unsupported(String),
 

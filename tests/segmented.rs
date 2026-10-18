@@ -411,6 +411,128 @@ async fn a_truncating_server_fails_cleanly_then_the_next_run_resumes() {
 }
 
 #[tokio::test]
+async fn the_download_quota_pauses_the_job_and_a_later_window_resumes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = body_of(2 << 20);
+    let srv = TestServer::start(data.clone()).await;
+
+    // A budget far smaller than the file, so the transfer has to stop part-way.
+    let mut cfg = test_config(&dir.path().join("state"), &dir.path().join("dl"));
+    cfg.quota_bytes = Some(256 << 10);
+    cfg.quota_window_secs = 3600;
+    let out = dir.path().join("dl/file.bin");
+    let sched = Scheduler::new(cfg).unwrap();
+
+    let job = make_job(&srv.file_url(), &out, 4, 2);
+    let id = job.id.clone();
+
+    let first = sched.execute(job).await;
+    assert!(first.is_err(), "the budget cannot cover the whole file");
+
+    let stored = sched.store.load(&id).unwrap();
+    assert_eq!(
+        stored.state,
+        JobState::Paused,
+        "a spent quota must pause rather than fail: {:?} / {:?}",
+        stored.state,
+        stored.error
+    );
+    assert!(stored.quota_paused, "the job should be marked quota-paused");
+    assert!(
+        stored
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("download quota"),
+        "the message should say why: {:?}",
+        stored.error
+    );
+    assert!(
+        !out.exists(),
+        "a paused download must not publish a partial file as final"
+    );
+    assert!(stored.downloaded > 0, "some progress must have been made");
+    assert!(
+        stored.downloaded < data.len() as u64,
+        "the quota was supposed to stop it early, but {} of {} bytes arrived",
+        stored.downloaded,
+        data.len()
+    );
+    assert!(
+        stored.part_path().exists(),
+        "the partial file must survive for the resume"
+    );
+
+    // --- A later window: fresh scheduler, budget refilled --------------------------
+    let mut cfg2 = test_config(&dir.path().join("state"), &dir.path().join("dl"));
+    cfg2.quota_bytes = None;
+    let sched2 = Scheduler::new(cfg2).unwrap();
+
+    let resumed = sched2.store.load(&id).unwrap();
+    assert!(
+        resumed.quota_paused,
+        "the marker persists until the job completes"
+    );
+    let finished = sched2.execute(resumed).await.unwrap();
+    assert_eq!(finished.state, JobState::Done);
+    assert!(!finished.quota_paused, "completing clears the marker");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        data,
+        "resumed bytes must be correct"
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_scheduler_does_not_hand_back_a_fresh_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = body_of(2 << 20);
+    let srv = TestServer::start(data.clone()).await;
+
+    let mut cfg = test_config(&dir.path().join("state"), &dir.path().join("dl"));
+    cfg.quota_bytes = Some(256 << 10);
+    cfg.quota_window_secs = 3600;
+    let out = dir.path().join("dl/file.bin");
+
+    // --- Run 1: spend the budget, and pause ---------------------------------------
+    let sched = Scheduler::new(cfg.clone()).unwrap();
+    let job = make_job(&srv.file_url(), &out, 4, 2);
+    let id = job.id.clone();
+    assert!(sched.execute(job).await.is_err());
+    let first = sched.store.load(&id).unwrap();
+    assert_eq!(first.state, JobState::Paused);
+    let spent = first.downloaded;
+    assert!(spent > 0, "run 1 should have transferred something");
+    drop(sched);
+
+    // --- Run 2: a whole new scheduler, same state directory, same budget -----------
+    // A quota that vanished on restart would be trivially bypassed, so this is the point
+    // of the feature rather than a detail.
+    let restarted = Scheduler::new(cfg).unwrap();
+    assert!(restarted.execute(first).await.is_err());
+    let second = restarted.store.load(&id).unwrap();
+    assert_eq!(second.state, JobState::Paused);
+    // Run 1 stopped when no *whole* chunk would still fit, so a little budget was left
+    // unspent and run 2 may use it. What it must not do is start a fresh window: that
+    // would put it near 500 KB (two budgets' worth) instead of just over one.
+    let budget = 256u64 << 10;
+    assert!(
+        second.downloaded <= budget + budget / 2,
+        "after a restart the job reached {} bytes, which looks like a refreshed budget \
+         rather than a remembered one (run 1 spent {spent})",
+        second.downloaded
+    );
+
+    // --- Run 3: only lifting the budget lets it finish, byte for byte ---------------
+    let mut lifted = test_config(&dir.path().join("state"), &dir.path().join("dl"));
+    lifted.quota_bytes = None;
+    let finisher = Scheduler::new(lifted).unwrap();
+    let done = finisher.execute(second).await.unwrap();
+    assert_eq!(done.state, JobState::Done);
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+}
+
+#[tokio::test]
 async fn a_server_without_range_support_still_produces_correct_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let data = body_of(300 << 10);

@@ -12,10 +12,11 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
-use crate::engine::{Engine, ProgressFn};
+use crate::engine::{Engine, ProgressFn, SharedLimits};
 use crate::error::Result;
 use crate::job::{Job, JobState};
 use crate::net::ServerLimits;
+use crate::quota::Quota;
 use crate::state::JobStore;
 use crate::throttle::RateLimiter;
 
@@ -27,6 +28,9 @@ pub struct Scheduler {
     /// Shared across every job, so "Max. connections number for a server" is enforced
     /// process-wide rather than per job.
     pub servers: Arc<ServerLimits>,
+    /// Shared across every job, so "Download limits" is a budget for the *machine*, not
+    /// for one download. A fresh `Scheduler` starts the window over.
+    pub quota: Arc<Quota>,
     slots: Arc<Semaphore>,
     /// Raised on Ctrl-C. Every in-flight engine watches this and stops cleanly, leaving a
     /// resumable partial file rather than a truncated one.
@@ -38,12 +42,14 @@ impl Scheduler {
         let store = JobStore::open(cfg.state_dir.clone())?;
         let global = Arc::new(RateLimiter::new(cfg.speed_limit));
         let servers = Arc::new(ServerLimits::new(cfg.per_server_connections));
+        let quota = Arc::new(cfg.persistent_quota());
         let slots = Arc::new(Semaphore::new(cfg.max_concurrent_jobs.max(1)));
         Ok(Scheduler {
             cfg,
             store,
             global,
             servers,
+            quota,
             slots,
             shutdown: None,
         })
@@ -64,11 +70,14 @@ impl Scheduler {
         job.touch();
         self.store.save(&job)?;
 
-        let mut engine = Engine::with_limits(
+        let mut engine = Engine::with_shared(
             self.cfg.clone(),
             job,
-            Some(self.global.clone()),
-            Some(self.servers.clone()),
+            SharedLimits {
+                global: Some(self.global.clone()),
+                servers: Some(self.servers.clone()),
+                quota: Some(self.quota.clone()),
+            },
         )?;
         if let Some(p) = progress {
             engine.on_progress(p);
@@ -109,6 +118,9 @@ impl Scheduler {
         }
         finished.touch();
         self.store.save(&finished)?;
+        // A job boundary is a natural checkpoint: persist the budget now so a process
+        // killed straight afterwards cannot lose the bytes it just charged for.
+        self.quota.flush();
         outcome.map(|_| finished)
     }
 
@@ -169,6 +181,19 @@ impl Scheduler {
                 }
             }
         }
+
+        // A job stopped by the download quota is Paused, not Failed, and becomes runnable
+        // again by itself. Say so plainly, because a queue run that returns with work
+        // still outstanding otherwise looks like a bug.
+        for job in out.iter().filter_map(|r| r.as_ref().ok()) {
+            if job.quota_paused {
+                tracing::info!(
+                    id = %job.id,
+                    reason = job.error.as_deref().unwrap_or("download quota exhausted"),
+                    "paused on the download quota; run the queue again after the window refills"
+                );
+            }
+        }
         Ok(out)
     }
 
@@ -179,6 +204,7 @@ impl Scheduler {
             store: self.store.clone(),
             global: self.global.clone(),
             servers: self.servers.clone(),
+            quota: self.quota.clone(),
             slots: self.slots.clone(),
             shutdown: self.shutdown.clone(),
         }

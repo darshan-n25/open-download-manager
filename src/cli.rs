@@ -277,6 +277,13 @@ pub struct QueueArgs {
     /// Cap on simultaneous transfers while draining the queue.
     #[arg(short = 'j', long)]
     pub jobs: Option<usize>,
+    /// Override the download quota for this run, e.g. `--quota 500M` ("Download limits").
+    /// `none` or `0` disables it.
+    #[arg(long)]
+    pub quota: Option<String>,
+    /// Length of the quota window for this run, e.g. `1h`, `30m`, or seconds.
+    #[arg(long, value_name = "SPAN")]
+    pub quota_window: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -854,10 +861,8 @@ fn cmd_list(args: ListArgs) -> Result<()> {
         "ID", "STATE", "SIZE", "DONE"
     );
     for j in &jobs {
-        let pct = j
-            .progress()
-            .map(|p| format!("{:.0}%", p * 100.0))
-            .unwrap_or_default();
+        // `Job::progress` is already a percentage in 0.0..=100.0.
+        let pct = j.progress().map(|p| format!("{p:.0}%")).unwrap_or_default();
         println!(
             "{:<10} {:<9} {:>10} {:>7}  {}",
             j.id,
@@ -909,6 +914,23 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
     if let Some(j) = args.jobs {
         cfg.max_concurrent_jobs = j.max(1);
     }
+    // Per-run overrides for "Download limits", so a one-off budget does not have to be
+    // written into the config file.
+    if let Some(spec) = &args.quota {
+        let spec = spec.trim();
+        cfg.quota_bytes = if spec.is_empty() || spec.eq_ignore_ascii_case("none") || spec == "0" {
+            None
+        } else {
+            Some(util::parse_size(spec).ok_or_else(|| {
+                RiptideError::other(format!("cannot read {spec:?} as a size; try 500M or 1G"))
+            })?)
+        };
+    }
+    if let Some(span) = &args.quota_window {
+        let d = humantime::parse_duration(span.trim())
+            .map_err(|e| RiptideError::other(format!("bad quota window {span:?}: {e}")))?;
+        cfg.quota_window_secs = d.as_secs().max(1);
+    }
     let mut sched = Scheduler::new(cfg)?;
     let stop = Arc::new(AtomicBool::new(false));
     sched.set_shutdown(stop.clone());
@@ -921,22 +943,45 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
     }
     if !quiet {
         eprintln!("restarting {} job(s)", pending.len());
+        if sched.quota.limit_bytes().is_some() {
+            eprintln!("download quota: {}", sched.quota.describe());
+        }
     }
 
     let ctrl_c = spawn_ctrl_c(stop);
     let mut handles = Vec::new();
     for job in pending {
         let label = job.display_name();
-        handles.push((label.clone(), sched.spawn_with(job, reporter(label, quiet))));
+        let id = job.id.clone();
+        handles.push((
+            id,
+            label.clone(),
+            sched.spawn_with(job, reporter(label, quiet)),
+        ));
     }
 
     let mut failed = 0usize;
-    for (label, h) in handles {
-        match h.await {
+    let mut quota_paused = 0usize;
+    for (id, label, h) in handles {
+        let outcome = h.await;
+        // The engine persists the outcome before the handle resolves, so the stored job is
+        // the authoritative record of *why* it stopped.
+        let was_quota_paused = sched
+            .store
+            .load(&id)
+            .map(|j| j.quota_paused)
+            .unwrap_or(false);
+        match outcome {
             Ok(Ok(job)) => println!("{} → {}", label, job.output.display()),
             Ok(Err(e)) => {
-                failed += 1;
-                eprintln!("{label}: failed: {e}");
+                if was_quota_paused {
+                    // Paused, not failed: it resumes on its own in a later window.
+                    quota_paused += 1;
+                    eprintln!("{label}: paused — {e}");
+                } else {
+                    failed += 1;
+                    eprintln!("{label}: failed: {e}");
+                }
             }
             Err(e) => {
                 failed += 1;
@@ -945,8 +990,18 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
         }
     }
     ctrl_c.abort();
+
+    if sched.quota.limit_bytes().is_some() {
+        println!("download quota: {}", sched.quota.describe());
+    }
+    if quota_paused > 0 {
+        println!(
+            "{quota_paused} job(s) paused on the download quota; \
+             run `riptide queue` again once the window refills"
+        );
+    }
     if failed > 0 {
-        eprintln!("{failed} job(s) failed or remain paused");
+        eprintln!("{failed} job(s) failed");
     }
     Ok(())
 }
@@ -954,6 +1009,39 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
+
+/// Settings that hold a byte count, so `config set` accepts the same `500M` shorthand as
+/// `--limit` and `--quota`, and can switch the limit back off with `none`.
+const BYTE_SETTINGS: [&str; 2] = ["speed_limit", "quota_bytes"];
+
+/// Coerce a `config set` value before it is written.
+///
+/// For a byte-count setting: a size (`500M`, `2048`) becomes a number and `none` / `off` /
+/// the empty string becomes JSON `null`. `0` is left as `0`, which the engine already reads
+/// as "unlimited". Everything else is passed through untouched, so naming the byte settings
+/// explicitly is worth it — guessing from the *current* value's JSON type used to make the
+/// limit un-switchable-off once it had been set to a number.
+fn coerce_setting(key: &str, parsed: serde_json::Value) -> Result<serde_json::Value> {
+    use serde_json::Value;
+    if !BYTE_SETTINGS.contains(&key) {
+        return Ok(parsed);
+    }
+    let Value::String(s) = parsed else {
+        // A bare number, or something that already parsed as JSON: leave the type check to
+        // serde when the value is read back into `Config`.
+        return Ok(parsed);
+    };
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("off") {
+        return Ok(Value::Null);
+    }
+    match crate::util::parse_size(s) {
+        Some(n) => Ok(Value::Number(n.into())),
+        None => Err(RiptideError::other(format!(
+            "{key} wants a byte count or \"none\", got {s:?} (try 500M, 2048, or none)"
+        ))),
+    }
+}
 
 fn cmd_config(args: ConfigArgs) -> Result<()> {
     match args.action {
@@ -999,6 +1087,7 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
             }
             let parsed: serde_json::Value = serde_json::from_str(&value)
                 .unwrap_or_else(|_| serde_json::Value::String(value.clone()));
+            let parsed = coerce_setting(&key, parsed)?;
             obj.insert(key.clone(), parsed);
             let updated: Config = serde_json::from_value(v)?;
             updated.save()?;
@@ -1018,6 +1107,42 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn byte_settings_accept_sizes_and_can_be_switched_off() {
+        use serde_json::json;
+        let coerce = |key: &str, raw: &str| {
+            let parsed = serde_json::from_str(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+            coerce_setting(key, parsed)
+        };
+
+        assert_eq!(
+            coerce("quota_bytes", "500M").unwrap(),
+            json!(524_288_000u64)
+        );
+        assert_eq!(coerce("quota_bytes", "2G").unwrap(), json!(2u64 << 30));
+        assert_eq!(
+            coerce("speed_limit", "4194304").unwrap(),
+            json!(4_194_304u64)
+        );
+        // Switch-off words, and 0, meaning "unlimited".
+        assert_eq!(
+            coerce("quota_bytes", "none").unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            coerce("quota_bytes", "off").unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(coerce("quota_bytes", "0").unwrap(), json!(0));
+
+        // A non-byte setting is untouched even when it looks like a size.
+        assert_eq!(coerce("user_agent", "500M").unwrap(), json!("500M"));
+        assert_eq!(coerce("connections", "16").unwrap(), json!(16));
+
+        assert!(coerce("quota_bytes", "banana").is_err());
     }
 
     #[test]

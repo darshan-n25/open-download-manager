@@ -349,6 +349,10 @@ async fn handle_ws(
                         .with("hls", "1")
                         .with("dash", "1")
                         .with("ftp", "1")
+                        // Our own additions; IDM has no equivalent handshake field. `quota`
+                        // is 0 when unlimited, which is the common case.
+                        .with("quota", sched.quota.limit_bytes().unwrap_or(0).to_string())
+                        .with("quotawin", sched.quota.window().as_secs().to_string())
                         .with("server", format!("riptide/{}", env!("CARGO_PKG_VERSION")));
                     respond(&mut ws, reply).await?;
                 }
@@ -400,11 +404,17 @@ async fn handle_ws(
                             )
                         })
                         .count();
+                    let paused_quota = jobs.iter().filter(|j| j.quota_paused).count();
+                    let snap = sched.quota.snapshot();
                     let reply = Message::new(frame.id, msg::STATUS_ACK)
                         .with("total", jobs.len().to_string())
                         .with("active", active.to_string())
                         .with("queued", queued.to_string())
-                        .with("slots", sched.available_slots().to_string());
+                        .with("slots", sched.available_slots().to_string())
+                        .with("quota_used", snap.used.to_string())
+                        .with("quota_total", snap.limit.unwrap_or(0).to_string())
+                        .with("quota_reset", snap.resets_in_secs.unwrap_or(0).to_string())
+                        .with("quota_paused", paused_quota.to_string());
                     respond(&mut ws, reply).await?;
                 }
                 msg::BYE => break,
@@ -530,6 +540,11 @@ async fn handle_http(stream: &mut TcpStream, sched: Arc<Scheduler>) -> Result<()
             .await
         }
         ("GET", "/health") => write_response(stream, 200, "OK", "text/plain", b"ok").await,
+        ("GET", "/api/quota") => {
+            let snap = sched.quota.snapshot();
+            let json = serde_json::to_vec_pretty(&snap).unwrap_or_else(|_| b"{}".to_vec());
+            write_response(stream, 200, "OK", "application/json", &json).await
+        }
         ("GET", "/api/jobs") => {
             let jobs = sched.store.list().unwrap_or_default();
             let json = serde_json::to_vec_pretty(&jobs).unwrap_or_else(|_| b"[]".to_vec());
@@ -640,6 +655,7 @@ WebSocket subprotocol on this port. This page is the plain-HTTP control surface.
 <pre id="out"></pre>
 
 <h2>Jobs</h2>
+<p id="quota" class="muted"></p>
 <ul id="jobs"></ul>
 
 <script>
@@ -657,6 +673,16 @@ async function refresh(){
     return `<li><b>${j.output.split('/').pop()}</b> — ${j.state}
       ${j.total?`(${p}% of ${j.total})`:''}<br><span class="muted">${j.url}</span></li>`;
   }).join('');
+  const q=await (await fetch('/api/quota')).json();
+  document.getElementById('quota').textContent = q.limit
+    ? `Download quota: ${fmtBytes(q.used)} of ${fmtBytes(q.limit)} used this window`+
+      (q.resets_in_secs!=null?`, refills in ${q.resets_in_secs}s`:'')+'.'
+    : 'No download quota set.';
+}
+function fmtBytes(n){
+  const u=['B','KB','MB','GB','TB'];let i=0;
+  while(n>=1024&&i<u.length-1){n/=1024;i++;}
+  return (i?n.toFixed(2):n)+' '+u[i];
 }
 refresh();setInterval(refresh,1000);
 </script>

@@ -15,8 +15,8 @@ code is used or present. The analysis lives in
 > evaluation, FTPS, MMS and MPEG-TS remuxing without `ffmpeg` are honest gaps, and NTLM has
 > not been tested against a real server. §12 of that document checks IDM's own advertised
 > feature list line by line and names four whole features Riptide has no answer for —
-> periodic file synchronization, scheduled grabber projects, download quotas, and offline
-> site archiving.
+> periodic file synchronization, scheduled grabber projects, and offline site archiving, plus
+> download quotas, which are now implemented.
 
 ---
 
@@ -33,8 +33,10 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
   list (`ChLst`) while running. Riptide's segment table is live: when a worker finishes early,
   it halves the largest outstanding segment and hands the tail to an idle worker. A download
   therefore speeds up as connections free up instead of being frozen at its initial split.
-- **Independent limits.** A global ceiling, a per-file ceiling, and a per-server cap, exactly
-  as IDM's settings expose them.
+- **Independent limits.** A global ceiling (bytes/second), a per-file ceiling, a per-server
+  cap on simultaneous connections, and a process-wide budget over a time window ("no more
+  than 500 MB per hour", IDM's *Download limits*) — exactly as IDM's settings expose them.
+  The window survives a restart.
 - **No end-of-download merge.** IDM assembles parts at the end. Riptide writes every chunk at
   its final offset into a preallocated sparse file and finishes with a `rename`, so the cost of
   finishing is O(1) and the file is never in a half-merged state.
@@ -47,6 +49,7 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Auth | Basic, Digest (RFC 7616), Bearer, NTLMv2 (RFC/MS-NLMP implemented from scratch — see gaps) |
 | Proxies | `http`, `https`, `socks5`, IDM's compact `mode:value;bypass` strings, Tor presets |
 | Queue | Persistent job store, configurable width, scheduled starts, pause/resume across restarts |
+| Limits | Global and per-file rate limits, a per-server connection cap, and a bytes-per-window budget (`--quota 500M --quota-window 1h`) that pauses jobs instead of failing them |
 | Media | HLS (`EXT-X-*`, byteranges, AES-128 keys, master playlists) and DASH (SegmentTemplate, SegmentTimeline, SegmentList); separate audio+video tracks are muxed into one file |
 | FTP | Passive mode, `SIZE`, `REST`-based resume, anonymous defaults |
 | Grabber | BFS crawl with depth/page limits, include/exclude wildcards, media/archive classification, tracker filtering |
@@ -61,7 +64,7 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 152 tests: unit + protocol + end-to-end
+cargo test         # 180 tests: unit + protocol + end-to-end
 ```
 
 ## Use
@@ -91,16 +94,27 @@ riptide grab https://example.com/downloads --download --output-dir ~/Downloads
 # See the queue.
 riptide list
 riptide show 3f1a9c02
+
+# Stay inside a data budget: at most 500 MB per hour, shared by every job.
+riptide queue --quota 500M --quota-window 1h
+# ...or make it the standing policy.
+riptide config set quota_bytes 500M
+riptide config set quota_window_secs 3600
 ```
+
+A job that runs out of budget is **paused**, not failed: the partial file is kept and
+`riptide queue` continues it once the window refills.
 
 `riptide` keeps its configuration and job state under your platform's config/data
 directories; `riptide config path` and `riptide state-dir` print the exact locations.
-Every setting is editable from the CLI:
+Every setting is editable from the CLI, and byte-valued settings accept the same `500M`
+shorthand:
 
 ```sh
 riptide config show
 riptide config set connections 16
-riptide config set speed_limit '"4M"'
+riptide config set speed_limit 4M
+riptide config set quota_bytes 500M
 ```
 
 ## Browser integration
@@ -119,6 +133,7 @@ Scripts can use the daemon directly:
 
 ```sh
 curl -s http://127.0.0.1:1001/api/jobs
+curl -s http://127.0.0.1:1001/api/quota   # bytes used / left in the current window
 curl -s -X POST http://127.0.0.1:1001/api/jobs \
      -H 'content-type: application/json' \
      -d '{"url":"https://example.com/big.iso","connections":16}'
@@ -137,6 +152,7 @@ src/
   storage.rs     preallocated sparse sink with positional writes + atomic finalize
   state.rs       crash-safe job store (temp file + fsync + rename per job)
   throttle.rs    global / per-file token-bucket rate limiting
+  quota.rs       bytes-per-window budget ("Download limits"), persisted across restarts
   scheduler.rs   queue width, scheduled starts, cancellation propagation
   auth.rs        Basic, Digest, Bearer; spec parsing and challenge handling
   auth/ntlm.rs   NTLMv2 (NTOWFv2, Type 1/2/3 messages) from MS-NLMP
@@ -160,7 +176,7 @@ browser.
 - A hand-rolled transfer path with `Range`/`If-Range`/`Content-Range` handling rather than a
   library that hides the primitives.
 - A mutable chunk table with runtime re-splitting.
-- Independent global, per-file and per-server limits.
+- Independent global, per-file, per-server and per-window limits.
 - A thin browser extension paired with a privileged local daemon: the browser supplies session
   state, the daemon does the work.
 
@@ -204,13 +220,15 @@ against this implementation (§12 there). The short version:
   was read.
 - **No live-stream sniffing.** A player that fetches its manifest from JavaScript will not be
   detected; paste the manifest URL, or let the extension's page scan find it.
+- **A quota pauses between chunks, not inside one.** If the remaining budget cannot fit the
+  next chunk the charge is refused outright, so a job can pause with up to one chunk of budget
+  unspent. It continues on the next `riptide queue` after the window refills. The window is a
+  fixed span from the first byte charged, not a wall-clock bucket.
 
 **Whole features IDM has that Riptide does not**
 
 - **No periodic file synchronization** and **no scheduled grabber projects** — the "keep this
   mirror in step" mode. Riptide downloads what you ask it to, once.
-- **No download quota over a time window** ("stop after 500 MB this hour"). Rate limits
-  (bytes/second, global and per file) are implemented; quotas are not.
 - **No offline site archiving.** The grabber finds and downloads matching targets; it does not
   fetch a page's CSS/JS/images and rewrite its links for offline browsing.
 - **No antivirus-on-completion hook**, no self-updater, no installation wizard, and no UI
@@ -228,12 +246,12 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 152 tests
+cargo test                              # Rust: 180 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 13 tests
 ```
 
-152 Rust tests: 138 unit tests across every module, 7 daemon-protocol tests driving a real
-WebSocket client against a bound daemon, and 7 end-to-end tests that stand up an HTTP server
+180 Rust tests: 162 unit tests across every module, 9 daemon-protocol tests driving a real
+WebSocket client against a bound daemon, and 9 end-to-end tests that stand up an HTTP server
 which really does byte ranges.
 
 The end-to-end ones assert that
@@ -245,6 +263,9 @@ The end-to-end ones assert that
 - a server that refuses ranges still yields correct bytes in single-stream mode;
 - the **per-server ceiling** is honoured: a job that asks for 8 connections while the ceiling is
   2 never makes the server see more than 2 at once, and still uses both slots;
+- a **download quota** stops a job mid-transfer as `paused` (not `failed`), keeps the partial
+  file, and a later run finishes it byte-identically; and that a **restarted** process does not
+  hand back a fresh budget;
 - the grabber follows exactly one level per `depth` and filters trackers.
 
 The unit tests pin the parts that are easy to get subtly wrong: the segment table's filing

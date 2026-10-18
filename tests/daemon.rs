@@ -25,12 +25,17 @@ struct Running {
 }
 
 async fn start_daemon() -> Running {
+    start_daemon_with(|_| {}).await
+}
+
+async fn start_daemon_with(tweak: impl FnOnce(&mut Config)) -> Running {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.state_dir = dir.path().join("state");
     cfg.download_dir = dir.path().join("dl");
     cfg.daemon_addr = "127.0.0.1:0".to_string();
     cfg.auto_categorize = false;
+    tweak(&mut cfg);
 
     let (listener, sched) = daemon::bind(&cfg).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -223,12 +228,82 @@ async fn the_http_api_creates_and_lists_jobs() {
 }
 
 #[tokio::test]
+async fn the_download_quota_is_reported_over_every_surface() {
+    // 300 MB per 10 minutes: a value that cannot be confused with a default.
+    let d = start_daemon_with(|cfg| {
+        cfg.quota_bytes = Some(300 << 20);
+        cfg.quota_window_secs = 600;
+    })
+    .await;
+    let mut ws = connect(d.addr).await;
+
+    // The handshake advertises the budget, so the extension can show it before any download.
+    ws.send(WsMessage::Text(encode_frame(&Message::new(0, msg::HELLO))))
+        .await
+        .unwrap();
+    let hello = next_frame(&mut ws).await;
+    assert_eq!(hello.mtype, msg::HELLO_ACK);
+    assert_eq!(
+        hello.get("quota"),
+        Some((300u64 << 20).to_string().as_str())
+    );
+    assert_eq!(hello.get("quotawin"), Some("600"));
+
+    // The status frame reports consumption and the time left in the window.
+    ws.send(WsMessage::Text(encode_frame(&Message::new(6, msg::STATUS))))
+        .await
+        .unwrap();
+    let status = next_frame(&mut ws).await;
+    assert_eq!(status.mtype, msg::STATUS_ACK);
+    assert_eq!(status.get("quota_used"), Some("0"));
+    assert_eq!(
+        status.get("quota_total"),
+        Some((300u64 << 20).to_string().as_str())
+    );
+    assert_eq!(status.get("quota_paused"), Some("0"));
+    let reset: u64 = status.get("quota_reset").unwrap().parse().unwrap();
+    assert!(reset <= 600 && reset > 590, "reset was {reset}");
+
+    // And the JSON API exposes the same snapshot.
+    let snap: serde_json::Value =
+        serde_json::from_str(&http_get(d.addr, "/api/quota").await).unwrap();
+    assert_eq!(snap["limit"], serde_json::json!(300u64 << 20));
+    assert_eq!(snap["used"], serde_json::json!(0));
+    assert_eq!(snap["remaining"], serde_json::json!(300u64 << 20));
+}
+
+#[tokio::test]
+async fn with_no_quota_configured_the_surfaces_say_so() {
+    let d = start_daemon().await;
+    let mut ws = connect(d.addr).await;
+
+    ws.send(WsMessage::Text(encode_frame(&Message::new(0, msg::HELLO))))
+        .await
+        .unwrap();
+    let hello = next_frame(&mut ws).await;
+    assert_eq!(hello.get("quota"), Some("0"), "0 means unlimited");
+
+    let snap: serde_json::Value =
+        serde_json::from_str(&http_get(d.addr, "/api/quota").await).unwrap();
+    assert!(
+        snap["limit"].is_null(),
+        "unlimited must be null, not 0: {snap}"
+    );
+    assert!(snap["remaining"].is_null());
+    assert!(snap["resets_in_secs"].is_null());
+}
+
+#[tokio::test]
 async fn the_control_page_is_served() {
     let d = start_daemon().await;
     let (status, body) = http_get_raw(d.addr, "/").await;
     assert_eq!(status, 200);
     assert!(body.contains("Riptide"));
     assert!(body.contains("/api/jobs"));
+    assert!(
+        body.contains("/api/quota"),
+        "the control page should show the download budget too"
+    );
 }
 
 // ---------------------------------------------------------------------------

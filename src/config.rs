@@ -24,6 +24,11 @@ pub struct Config {
     pub per_server_connections: usize,
     /// Global ceiling across all jobs, bytes/second ("Maximum download speed").
     pub speed_limit: Option<u64>,
+    /// IDM's "Download limits": total bytes allowed per window, across all jobs.
+    /// `None` or `Some(0)` is unlimited.
+    pub quota_bytes: Option<u64>,
+    /// Length of the quota window, in seconds. Default is one hour.
+    pub quota_window_secs: u64,
     pub proxy: Option<String>,
     pub user_agent: String,
     pub download_dir: PathBuf,
@@ -52,6 +57,8 @@ impl Default for Config {
             // jobs hitting one CDN do not look like an attack.
             per_server_connections: 16,
             speed_limit: None,
+            quota_bytes: None,
+            quota_window_secs: 3600,
             proxy: None,
             user_agent: DEFAULT_UA.to_string(),
             download_dir: home_dir().join("Downloads"),
@@ -108,6 +115,28 @@ impl Config {
     pub fn save(&self) -> std::io::Result<()> {
         let data = serde_json::to_vec_pretty(self).unwrap_or_default();
         crate::util::atomic_write(&Self::path(), &data)
+    }
+
+    /// Build the process-wide budget from this configuration.
+    pub fn quota(&self) -> crate::quota::Quota {
+        crate::quota::Quota::new(
+            self.quota_bytes,
+            std::time::Duration::from_secs(self.quota_window_secs),
+        )
+    }
+
+    /// Like [`Config::quota`], but remembered under `state_dir` so that restarting the
+    /// process resumes the window instead of handing back a full budget.
+    ///
+    /// The queue owner and every other engine use this, so crawl traffic counts against
+    /// the same budget as downloads. With no limit configured it reads nothing and writes
+    /// nothing.
+    pub fn persistent_quota(&self) -> crate::quota::Quota {
+        crate::quota::Quota::persistent(
+            self.quota_bytes,
+            std::time::Duration::from_secs(self.quota_window_secs),
+            self.state_dir.join("quota.json"),
+        )
     }
 
     /// Resolve the destination for a finished download, applying IDM-style category
@@ -204,5 +233,47 @@ mod tests {
         let back: Config = serde_json::from_str(&s).unwrap();
         assert_eq!(back.connections, 16);
         assert_eq!(back.speed_limit, Some(1234));
+    }
+
+    #[test]
+    fn the_quota_comes_from_the_config() {
+        let mut c = Config::default();
+        assert!(c.quota().is_unlimited());
+
+        c.quota_bytes = Some(500 << 20);
+        c.quota_window_secs = 7200;
+        let q = c.quota();
+        assert_eq!(q.limit_bytes(), Some(500 << 20));
+        assert_eq!(q.window(), std::time::Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn the_persistent_quota_lives_in_the_state_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Config::default();
+        c.state_dir = dir.path().to_path_buf();
+        c.quota_bytes = Some(1000);
+        c.quota_window_secs = 3600;
+
+        let q = c.persistent_quota();
+        q.charge(250).unwrap();
+        q.flush();
+
+        assert!(
+            dir.path().join("quota.json").exists(),
+            "the window should have been remembered in the state directory"
+        );
+        let again = c.persistent_quota();
+        assert_eq!(again.used(), 250);
+    }
+
+    #[test]
+    fn a_config_without_quota_keys_still_loads() {
+        // `#[serde(default)]` with a newer field: an old config file must not be rejected.
+        let json = r#"{"connections": 4, "speed_limit": null}"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(c.connections, 4);
+        assert_eq!(c.quota_bytes, None);
+        assert_eq!(c.quota_window_secs, 3600);
     }
 }

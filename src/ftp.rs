@@ -307,7 +307,6 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
     let mut reader = data;
     let mut pos = offset;
     let mut buf = vec![0u8; 1 << 16];
-    let limit = engine.local_limiter();
 
     loop {
         if engine.is_cancelled() {
@@ -326,11 +325,13 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
                 return Err(e.into());
             }
         };
+        // Charge before writing, so a spent budget never results in unaccounted bytes
+        // (and no partially-credited file) on disk.
+        engine.charge_bytes(n as u64).await?;
         sink.write_at(bytes::Bytes::copy_from_slice(&buf[..n]), pos)
             .await?;
         pos += n as u64;
         engine.job_mut().downloaded = pos;
-        limit.acquire(n as u64).await;
     }
 
     // 226 Transfer complete.

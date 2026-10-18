@@ -214,6 +214,11 @@ pub struct Job {
     pub created_ms: u64,
     pub updated_ms: u64,
     pub error: Option<String>,
+    /// Set when the job stopped because the download quota ran out. It is `Paused`, not
+    /// `Failed`, and it becomes runnable again by itself once the window refills — so
+    /// callers can tell "waiting for budget" apart from "waiting for the user".
+    #[serde(default)]
+    pub quota_paused: bool,
 }
 
 impl Job {
@@ -245,6 +250,7 @@ impl Job {
             created_ms: now,
             updated_ms: now,
             error: None,
+            quota_paused: false,
         }
     }
 
@@ -333,5 +339,36 @@ mod tests {
         assert_eq!(j.progress(), Some(25.0));
         j.downloaded = 5000;
         assert_eq!(j.progress(), Some(100.0));
+    }
+
+    #[test]
+    fn progress_is_a_percentage_not_a_fraction() {
+        // Callers format this directly as `{p:.0}%`, so a value in 0..1 would render as
+        // "0%" and a value in 0..100 scaled again would render as "1100%".
+        let mut j = Job::new(
+            "a".into(),
+            "http://x/".into(),
+            PathBuf::from("/tmp/x"),
+            JobKind::Http,
+        );
+        j.total = Some(2_000_000);
+        j.downloaded = 220_000;
+        assert_eq!(j.progress(), Some(11.0));
+    }
+
+    #[test]
+    fn a_state_file_written_before_quota_pausing_still_loads() {
+        // `quota_paused` is newer than the first release; an old record must not be
+        // rejected, it must simply default to "not paused on a quota".
+        let j = Job::new(
+            "a".into(),
+            "http://x/".into(),
+            PathBuf::from("/tmp/x"),
+            JobKind::Http,
+        );
+        let mut v = serde_json::to_value(&j).unwrap();
+        v.as_object_mut().unwrap().remove("quota_paused");
+        let back: Job = serde_json::from_value(v).unwrap();
+        assert!(!back.quota_paused);
     }
 }

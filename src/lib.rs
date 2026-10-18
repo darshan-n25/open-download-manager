@@ -7,7 +7,8 @@
 //! * a *mutable* segment table that is re-split at runtime to imitate IDM's dynamic chunk
 //!   sizing (`Change chunk size to %ld`) — see [`segment`] and [`engine::run`];
 //! * crash-safe resume state persisted next to the output file (see [`state`]);
-//! * independent global / per-file bandwidth ceilings (see [`throttle`]);
+//! * independent global / per-file bandwidth ceilings (see [`throttle`]) and a
+//!   bytes-per-window budget (IDM's "Download limits", see [`quota`]);
 //! * Basic / Digest / Bearer / NTLMv2 credential handling (see [`auth`]);
 //! * HLS and DASH manifest capture and remux (see [`media`]);
 //! * a localhost daemon that speaks a `MSG#`-framed protocol to a browser extension so the
@@ -24,6 +25,7 @@ pub mod grabber;
 pub mod job;
 pub mod media;
 pub mod net;
+pub mod quota;
 pub mod scheduler;
 pub mod segment;
 pub mod state;

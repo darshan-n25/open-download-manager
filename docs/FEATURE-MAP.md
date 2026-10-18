@@ -193,7 +193,7 @@ weak evidence but the only kind available without a disassembler here.
 | Grabber projects on a schedule, periodically | `sprojects.dat`, `Periodic synchronization` `[OBSERVED]` | **Absent** | No project concept and no recurring grabber runs. |
 | Download categories | `IDMFType.dat`, `FoldersTree` `[OBSERVED]` | **Partial** | §5. |
 | "Download All" — add every link on the page | grabber's include/exclude filters `[OBSERVED]` | **Partial** | `riptide grab --download` does this from the CLI and from the popup's page scan. |
-| **Download limits**: quotas in megabytes per hour | `Download limits`, `Download limits exceeded!` `[OBSERVED]` | **Partial** | Rate limits (bytes/second, global and per file, `Speed Limiter`, `Use Speed Limiter`, `Remember Speed Limiter settings for this file` `[OBSERVED]`) are done. A **quota over a time window** ("stop after 500 MB this hour") is **Absent**. |
+| **Download limits**: quotas in megabytes per hour | `Download limits`, `Download limits exceeded!` `[OBSERVED]` | **Done** | Two independent mechanisms, both from the binary's own vocabulary. **Rate limits** in bytes/second, global and per file (`Speed Limiter`, `Use Speed Limiter`, `Remember Speed Limiter settings for this file`). **A quota over a fixed window** — `quota_bytes` of `quota_window_secs`, e.g. "no more than 500 MB per hour" — enforced on every byte written, by one process-wide budget shared across jobs, the media remuxer, FTP, and crawls. Exhaustion **pauses** the job rather than failing it: progress is kept, the reason says how long until the window refills, and `riptide queue` continues it. The window is remembered in `state_dir/quota.json`, so a restart does not hand back a fresh budget. Two deliberate divergences: the window is a fixed span from the first byte charged rather than IDM's per-hour bucket, and a charge too large for the remaining budget is refused outright rather than partially written, so a job can pause with up to one chunk of budget unspent. |
 | Automatic antivirus checking on completion | `If you would like to run antivirus software on download completion, you should type or browse the complete path to its executable file…`, `[file]` parameter convention `[OBSERVED]` | **Absent** | Running a configured scanner with the finished path on completion. Not implemented. |
 | Proxy servers, "for example Microsoft ISA, and FTP proxy servers" | `Use &FTP Proxy` `[OBSERVED]` | **Partial** | HTTP/HTTPS/SOCKS proxies are done, including IDM's compact mode strings. An **FTP proxy** (proxying the FTP control connection) is **Absent**; FTP goes direct. |
 | Auth: Basic, **Negotiate, NTLM, and Kerberos** | `AcquireCredentialsHandleA`, SSPI `[OBSERVED]` | **Partial** | §3: Kerberos absent, NTLMv2 unverified. |
@@ -213,6 +213,7 @@ download engine:
 2. **Periodic file synchronization** and **scheduled grabber projects** — a whole
    "keep this mirror fresh" mode that Riptide has no answer for.
 3. **Download quotas over a time window**, as opposed to instantaneous rate limits.
+   *Now implemented* — see the "Download limits" row above.
 4. **Offline site archiving with link rewriting**, as opposed to link harvesting.
 
 Everything else on the list is either implemented, deliberately refused, or UI that a

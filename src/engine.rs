@@ -7,7 +7,8 @@
 //!   IDM's `ChLst` + `Change chunk size to %ld`;
 //! * per-connection timeout/retry/restart with backoff, standing in for IDM's
 //!   `Connection restarted because of timeout (1)|(2)`;
-//! * independent global and per-file bandwidth ceilings;
+//! * independent global and per-file bandwidth ceilings, plus a process-wide
+//!   bytes-per-window budget;
 //! * direct positional writes, so there is no end-of-download assembly pass.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -29,6 +30,7 @@ use crate::config::Config;
 use crate::error::{Result, RiptideError};
 use crate::job::{Job, JobKind, JobState, Segment, SegmentState};
 use crate::net::{NetClient, ServerLimits};
+use crate::quota::Quota;
 use crate::segment as segplan;
 use crate::storage::Sink;
 use crate::throttle::RateLimiter;
@@ -128,6 +130,11 @@ struct RunState {
     done_bytes: AtomicU64,
     failed: AtomicBool,
     error: Mutex<Option<String>>,
+    /// Set when the run must stop for a reason that is *not* a segment failure. Today the
+    /// only cause is a spent download quota. It is deliberately separate from `failed`:
+    /// the segments keep their progress, because the job must stay resumable and will run
+    /// again once the window refills.
+    stop: Mutex<Option<crate::quota::QuotaExhausted>>,
     notify: Notify,
 }
 
@@ -140,8 +147,30 @@ impl RunState {
             done_bytes: AtomicU64::new(0),
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
+            stop: Mutex::new(None),
             notify: Notify::new(),
         })
+    }
+
+    /// Ask every worker to stand down without failing anything.
+    fn stop(&self, why: crate::quota::QuotaExhausted) {
+        let mut s = self.stop.lock().unwrap_or_else(|p| p.into_inner());
+        if s.is_none() {
+            *s = Some(why);
+        }
+        drop(s);
+        self.notify.notify_waiters();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    fn stop_reason(&self) -> Option<crate::quota::QuotaExhausted> {
+        *self.stop.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn handles(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Arc<SegHandle>>> {
@@ -274,6 +303,7 @@ struct Shared {
     global: Arc<RateLimiter>,
     local: Arc<RateLimiter>,
     servers: Arc<ServerLimits>,
+    quota: Arc<Quota>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -284,6 +314,18 @@ impl Shared {
             rb = rb.header("Authorization", a);
         }
         rb
+    }
+
+    /// Account for `n` bytes before they are written.
+    ///
+    /// The quota is tested first because it is cheap, synchronous, and a spent budget
+    /// should fail the transfer at once rather than after waiting for bandwidth the
+    /// process is not allowed to use.
+    async fn charge(&self, n: u64) -> Result<()> {
+        self.quota.charge(n)?;
+        self.global.acquire(n).await;
+        self.local.acquire(n).await;
+        Ok(())
     }
 }
 
@@ -296,6 +338,9 @@ pub struct Engine {
     /// Simultaneous connections allowed to any one host, shared with every other job in the
     /// process ("Max. connections number for a server").
     servers: Arc<ServerLimits>,
+    /// Bytes-per-window budget, shared with every other job in the process ("Download
+    /// limits"). Never per job: the whole point is that the *machine* has a budget.
+    quota: Arc<Quota>,
     cancel: Arc<AtomicBool>,
     progress: Option<ProgressFn>,
     /// Negotiated Digest state, reused across requests that share a nonce.
@@ -303,30 +348,42 @@ pub struct Engine {
     auth_override: Option<String>,
 }
 
+/// Process-wide ceilings shared by every job.
+///
+/// Built once by the [`Scheduler`](crate::scheduler::Scheduler) and handed to each
+/// [`Engine`], so "Maximum download speed", "Max. connections number for a server" and
+/// "Download limits" are properties of the process rather than of one download. Every
+/// field is optional: an `Engine` built without them derives them from its own `Config`
+/// (which is what `probe` and `grab` do), so even a one-off crawl is charged against the
+/// same budget as the queue.
+#[derive(Clone, Default)]
+pub struct SharedLimits {
+    pub global: Option<Arc<RateLimiter>>,
+    pub servers: Option<Arc<ServerLimits>>,
+    pub quota: Option<Arc<Quota>>,
+}
+
 impl Engine {
     pub fn new(cfg: Config, job: Job) -> Result<Self> {
-        Self::with_limits(cfg, job, None, None)
+        Self::with_shared(cfg, job, SharedLimits::default())
     }
 
-    pub fn with_global(cfg: Config, job: Job, global: Option<Arc<RateLimiter>>) -> Result<Self> {
-        Self::with_limits(cfg, job, global, None)
-    }
-
-    pub fn with_limits(
-        cfg: Config,
-        job: Job,
-        global: Option<Arc<RateLimiter>>,
-        servers: Option<Arc<ServerLimits>>,
-    ) -> Result<Self> {
+    pub fn with_shared(cfg: Config, job: Job, limits: SharedLimits) -> Result<Self> {
         let client = Arc::new(NetClient::build(
             &job.ctx,
             &cfg.user_agent,
             Duration::from_secs(cfg.connect_timeout_secs),
         )?);
-        let global = global.unwrap_or_else(|| Arc::new(RateLimiter::new(cfg.speed_limit)));
+        let global = limits
+            .global
+            .unwrap_or_else(|| Arc::new(RateLimiter::new(cfg.speed_limit)));
         let local = Arc::new(RateLimiter::new(job.speed_limit));
-        let servers =
-            servers.unwrap_or_else(|| Arc::new(ServerLimits::new(cfg.per_server_connections)));
+        let servers = limits
+            .servers
+            .unwrap_or_else(|| Arc::new(ServerLimits::new(cfg.per_server_connections)));
+        let quota = limits
+            .quota
+            .unwrap_or_else(|| Arc::new(cfg.persistent_quota()));
         Ok(Engine {
             cfg,
             job,
@@ -334,6 +391,7 @@ impl Engine {
             global,
             local,
             servers,
+            quota,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: None,
             digest: None,
@@ -359,6 +417,7 @@ impl Engine {
             global: self.global.clone(),
             local: self.local.clone(),
             servers: self.servers.clone(),
+            quota: self.quota.clone(),
             cancel: self.cancel.clone(),
         }
     }
@@ -380,9 +439,16 @@ impl Engine {
         self.cancel.load(Ordering::SeqCst)
     }
 
-    /// This job's private bandwidth ceiling (IDM's "Maximum download speed for one file").
-    pub fn local_limiter(&self) -> Arc<RateLimiter> {
-        self.local.clone()
+    /// Account for `n` bytes against every ceiling and the process budget.
+    ///
+    /// Exposed for the FTP path, whose transfer loop owns its own socket and so cannot
+    /// use [`Fetcher`]. Returns the quota error when the window's budget is spent, which
+    /// leaves the job resumable.
+    pub async fn charge_bytes(&self, n: u64) -> Result<()> {
+        self.quota.charge(n)?;
+        self.global.acquire(n).await;
+        self.local.acquire(n).await;
+        Ok(())
     }
 
     pub fn on_progress(&mut self, f: ProgressFn) {
@@ -665,15 +731,18 @@ impl Engine {
             Ok(()) => {
                 self.job.state = JobState::Done;
                 self.job.error = None;
+                self.job.quota_paused = false;
                 self.job.touch();
                 Ok(())
             }
             Err(e) => {
-                self.job.state = if self.cancel.load(Ordering::SeqCst) {
+                let quota = matches!(e, RiptideError::QuotaExhausted(_));
+                self.job.state = if self.cancel.load(Ordering::SeqCst) || quota {
                     JobState::Paused
                 } else {
                     JobState::Failed
                 };
+                self.job.quota_paused = quota;
                 self.job.error = Some(e.to_string());
                 self.job.touch();
                 Err(e)
@@ -703,6 +772,7 @@ impl Engine {
             global: self.global.clone(),
             local: self.local.clone(),
             servers: self.servers.clone(),
+            quota: self.quota.clone(),
             cancel: self.cancel.clone(),
         }
     }
@@ -777,6 +847,12 @@ impl Engine {
         self.job.downloaded = st.total_done();
         st.done_bytes.store(self.job.downloaded, Ordering::SeqCst);
 
+        // A spent budget outranks everything else here: the job is neither failed nor
+        // finished, it is simply waiting for the window to refill.
+        if let Some(q) = st.stop_reason() {
+            self.emit_progress();
+            return Err(RiptideError::QuotaExhausted(q));
+        }
         if let Some(msg) = st.error_message() {
             self.emit_progress();
             return Err(RiptideError::other(msg));
@@ -878,11 +954,10 @@ impl Engine {
                             continue;
                         }
                         let n = chunk.len() as u64;
+                        shared.charge(n).await?;
                         sink.write_at(chunk, offset).await?;
                         offset += n;
                         self.job.downloaded = offset;
-                        shared.global.acquire(n).await;
-                        shared.local.acquire(n).await;
                     }
                 }
             }
@@ -993,6 +1068,7 @@ pub struct Fetcher {
     global: Arc<RateLimiter>,
     local: Arc<RateLimiter>,
     servers: Arc<ServerLimits>,
+    quota: Arc<Quota>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -1009,6 +1085,14 @@ impl Fetcher {
     /// which is what makes "Max. connections number for a server" mean simultaneous sockets.
     async fn permit(&self, url: &str) -> Option<OwnedSemaphorePermit> {
         self.servers.acquire(url).await
+    }
+
+    /// Account for `n` bytes before they are written; see [`Shared::charge`].
+    async fn charge(&self, n: u64) -> Result<()> {
+        self.quota.charge(n)?;
+        self.global.acquire(n).await;
+        self.local.acquire(n).await;
+        Ok(())
     }
 
     pub async fn to_bytes(&self, url: &str, max: u64) -> Result<Vec<u8>> {
@@ -1036,6 +1120,7 @@ impl Fetcher {
                     "resource {url} exceeds {max} bytes"
                 )));
             }
+            self.charge(chunk.len() as u64).await?;
             buf.extend_from_slice(&chunk);
         }
         Ok(buf)
@@ -1068,10 +1153,9 @@ impl Fetcher {
                 Ok(Some(Ok(chunk))) => {
                     use tokio::io::AsyncWriteExt;
                     let n = chunk.len() as u64;
+                    self.charge(n).await?;
                     file.write_all(&chunk).await?;
                     written += n;
-                    self.global.acquire(n).await;
-                    self.local.acquire(n).await;
                 }
             }
         }
@@ -1147,7 +1231,7 @@ pub fn parse_content_range_total(v: &str) -> Option<u64> {
 /// Longest allowed idle gap in the middle of a segment before we call it closed.
 async fn worker_loop(st: Arc<RunState>, shared: Arc<Shared>, sink: Arc<Sink>) {
     loop {
-        if shared.cancel.load(Ordering::SeqCst) || st.any_failed() {
+        if shared.cancel.load(Ordering::SeqCst) || st.any_failed() || st.is_stopped() {
             return;
         }
         if let Some(h) = st.claim() {
@@ -1174,7 +1258,7 @@ async fn transfer_segment(
 ) {
     let mut attempt = 0u32;
     loop {
-        if shared.cancel.load(Ordering::SeqCst) || st.any_failed() {
+        if shared.cancel.load(Ordering::SeqCst) || st.any_failed() || st.is_stopped() {
             return;
         }
         let cursor = h.cursor();
@@ -1198,6 +1282,13 @@ async fn transfer_segment(
             }
             Err(RiptideError::NoRangeSupport) => {
                 st.fail("server stopped honouring byte ranges");
+                return;
+            }
+            Err(RiptideError::QuotaExhausted(q)) => {
+                // A spent budget is not a segment failure. Stop the whole run and leave
+                // every segment's progress intact, so the job resumes where it left off
+                // once the window refills.
+                st.stop(q);
                 return;
             }
             Err(e) => {
@@ -1318,11 +1409,10 @@ async fn stream_range(
                 } else {
                     bytes::Bytes::copy_from_slice(&chunk[..take])
                 };
+                shared.charge(take as u64).await?;
                 sink.write_at(piece, pos).await?;
                 pos += take as u64;
                 h.done.store(pos - h.start, Ordering::SeqCst);
-                shared.global.acquire(take as u64).await;
-                shared.local.acquire(take as u64).await;
                 st_progress_hint(shared, h, pos, live_end);
 
                 if pos > live_end {
