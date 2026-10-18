@@ -107,11 +107,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JobStore::open(dir.path()).unwrap();
 
-        let mut a = Job::new("aaa".into(), "http://x/a".into(), dir.path().join("a"), JobKind::Http);
+        let mut a = Job::new(
+            "aaa".into(),
+            "http://x/a".into(),
+            dir.path().join("a"),
+            JobKind::Http,
+        );
         a.total = Some(100);
         a.downloaded = 40;
         a.state = JobState::Done;
-        let mut b = Job::new("bbb".into(), "http://x/b".into(), dir.path().join("b"), JobKind::Hls);
+        let mut b = Job::new(
+            "bbb".into(),
+            "http://x/b".into(),
+            dir.path().join("b"),
+            JobKind::Hls,
+        );
         b.state = JobState::Paused;
 
         store.save(&a).unwrap();
@@ -146,7 +156,12 @@ mod tests {
     fn corrupt_files_do_not_break_listing() {
         let dir = tempfile::tempdir().unwrap();
         let store = JobStore::open(dir.path()).unwrap();
-        let good = Job::new("ok".into(), "http://x/".into(), dir.path().join("x"), JobKind::Http);
+        let good = Job::new(
+            "ok".into(),
+            "http://x/".into(),
+            dir.path().join("x"),
+            JobKind::Http,
+        );
         store.save(&good).unwrap();
         std::fs::write(dir.path().join("broken.json"), b"{ not json").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), b"hi").unwrap();

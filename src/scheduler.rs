@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::engine::{Engine, ProgressFn};
 use crate::error::Result;
 use crate::job::{Job, JobState};
+use crate::net::ServerLimits;
 use crate::state::JobStore;
 use crate::throttle::RateLimiter;
 
@@ -23,6 +24,9 @@ pub struct Scheduler {
     pub store: JobStore,
     /// Shared across every job, so "Maximum download speed" really is a global ceiling.
     pub global: Arc<RateLimiter>,
+    /// Shared across every job, so "Max. connections number for a server" is enforced
+    /// process-wide rather than per job.
+    pub servers: Arc<ServerLimits>,
     slots: Arc<Semaphore>,
     /// Raised on Ctrl-C. Every in-flight engine watches this and stops cleanly, leaving a
     /// resumable partial file rather than a truncated one.
@@ -33,11 +37,13 @@ impl Scheduler {
     pub fn new(cfg: Config) -> Result<Self> {
         let store = JobStore::open(cfg.state_dir.clone())?;
         let global = Arc::new(RateLimiter::new(cfg.speed_limit));
+        let servers = Arc::new(ServerLimits::new(cfg.per_server_connections));
         let slots = Arc::new(Semaphore::new(cfg.max_concurrent_jobs.max(1)));
         Ok(Scheduler {
             cfg,
             store,
             global,
+            servers,
             slots,
             shutdown: None,
         })
@@ -58,7 +64,12 @@ impl Scheduler {
         job.touch();
         self.store.save(&job)?;
 
-        let mut engine = Engine::with_global(self.cfg.clone(), job, Some(self.global.clone()))?;
+        let mut engine = Engine::with_limits(
+            self.cfg.clone(),
+            job,
+            Some(self.global.clone()),
+            Some(self.servers.clone()),
+        )?;
         if let Some(p) = progress {
             engine.on_progress(p);
         }
@@ -145,10 +156,7 @@ impl Scheduler {
                 }
             }
             let this = Arc::new(self.clone_shallow());
-            handles.push((
-                job.id.clone(),
-                this.clone().spawn(job),
-            ));
+            handles.push((job.id.clone(), this.clone().spawn(job)));
         }
 
         let mut out = Vec::with_capacity(handles.len());
@@ -170,6 +178,7 @@ impl Scheduler {
             cfg: self.cfg.clone(),
             store: self.store.clone(),
             global: self.global.clone(),
+            servers: self.servers.clone(),
             slots: self.slots.clone(),
             shutdown: self.shutdown.clone(),
         }
@@ -182,6 +191,8 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    // Fixtures here are built field-by-field from `Default::default()`.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
     use crate::job::JobKind;
 

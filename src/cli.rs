@@ -333,21 +333,6 @@ pub async fn run(cli: Cli) -> Result<()> {
 // Download
 // ---------------------------------------------------------------------------
 
-/// Guess the transfer kind from the URL, before any network traffic.
-pub fn guess_kind(url: &str) -> JobKind {
-    let lower = url.to_ascii_lowercase();
-    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
-    if lower.starts_with("ftp://") || lower.starts_with("ftps://") {
-        JobKind::Ftp
-    } else if path.contains(".m3u8") {
-        JobKind::Hls
-    } else if path.contains(".mpd") {
-        JobKind::Dash
-    } else {
-        JobKind::Http
-    }
-}
-
 fn build_ctx(net: &NetOpts, cfg: &Config) -> Result<crate::job::RequestContext> {
     let mut ctx = crate::job::RequestContext {
         user_agent: net.user_agent.clone(),
@@ -366,17 +351,26 @@ fn build_ctx(net: &NetOpts, cfg: &Config) -> Result<crate::job::RequestContext> 
         })?);
     }
     for h in &net.headers {
-        let (k, v) = h.split_once(':').ok_or_else(|| {
-            RiptideError::other(format!("--header {h:?} must be 'Name: value'"))
-        })?;
-        ctx.headers.push((k.trim().to_string(), v.trim().to_string()));
+        let (k, v) = h
+            .split_once(':')
+            .ok_or_else(|| RiptideError::other(format!("--header {h:?} must be 'Name: value'")))?;
+        ctx.headers
+            .push((k.trim().to_string(), v.trim().to_string()));
     }
     Ok(ctx)
 }
 
 /// Build a [`Job`] from a URL plus the command line.
-fn build_job(cfg: &Config, url: &str, args: &DownloadArgs, explicit: Option<PathBuf>) -> Result<Job> {
-    let kind = args.kind.map(JobKind::from).unwrap_or_else(|| guess_kind(url));
+fn build_job(
+    cfg: &Config,
+    url: &str,
+    args: &DownloadArgs,
+    explicit: Option<PathBuf>,
+) -> Result<Job> {
+    let kind = args
+        .kind
+        .map(JobKind::from)
+        .unwrap_or_else(|| JobKind::guess(url));
 
     // For media jobs the output must be settled now: a `.m3u8` extension would be wrong
     // once the segments are muxed into one file.
@@ -625,8 +619,8 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
     ctx.insecure = args.net.insecure || cfg.insecure;
     let mut scratch = scratch;
     scratch.ctx = ctx;
-    if args.net.connections.is_some() {
-        scratch.connections = args.net.connections.unwrap();
+    if let Some(c) = args.net.connections {
+        scratch.connections = c;
     }
 
     let engine = Engine::new(cfg.clone(), scratch)?;
@@ -650,7 +644,10 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
     }
 
     if !args.download {
-        eprintln!("{} link(s) found; add --download to fetch them", targets.len());
+        eprintln!(
+            "{} link(s) found; add --download to fetch them",
+            targets.len()
+        );
         return Ok(());
     }
 
@@ -679,14 +676,15 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
             no_queue: true,
         };
         let kind = match t.kind {
-            TargetKind::Manifest => guess_kind(&t.url),
+            TargetKind::Manifest => JobKind::guess(&t.url),
             _ => JobKind::Http,
         };
         // With `--output-dir` every link is named after its own URL; otherwise the engine
         // derives the name from the response headers, which is more accurate.
-        let explicit = args.output_dir.as_ref().and_then(|d| {
-            util::filename_from_url(&t.url).map(|name| d.join(name))
-        });
+        let explicit = args
+            .output_dir
+            .as_ref()
+            .and_then(|d| util::filename_from_url(&t.url).map(|name| d.join(name)));
         let mut job = build_job(&cfg, &t.url, &args_for_job, explicit)?;
         job.kind = kind;
         sched.store.save(&job)?;
@@ -739,12 +737,16 @@ async fn cmd_daemon(args: DaemonArgs) -> Result<()> {
 
 async fn cmd_probe(args: ProbeArgs) -> Result<()> {
     let cfg = Config::load();
-    let kind = guess_kind(&args.url);
+    let kind = JobKind::guess(&args.url);
     let job = Job::new(
         "probe".into(),
         args.url.clone(),
         cfg.download_dir.join(".probe"),
-        if kind == JobKind::Ftp { JobKind::Ftp } else { JobKind::Http },
+        if kind == JobKind::Ftp {
+            JobKind::Ftp
+        } else {
+            JobKind::Http
+        },
     );
     let mut job = job;
     job.ctx = build_ctx(&args.net, &cfg)?;
@@ -848,11 +850,14 @@ fn cmd_list(args: ListArgs) -> Result<()> {
     }
 
     println!(
-        "{:<10} {:<9} {:>10} {:>7}  {}",
-        "ID", "STATE", "SIZE", "DONE", "NAME"
+        "{:<10} {:<9} {:>10} {:>7}  NAME",
+        "ID", "STATE", "SIZE", "DONE"
     );
     for j in &jobs {
-        let pct = j.progress().map(|p| format!("{:.0}%", p * 100.0)).unwrap_or_default();
+        let pct = j
+            .progress()
+            .map(|p| format!("{:.0}%", p * 100.0))
+            .unwrap_or_default();
         println!(
             "{:<10} {:<9} {:>10} {:>7}  {}",
             j.id,
@@ -1005,21 +1010,14 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // Fixtures here are built field-by-field from `Default::default()`.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
     use clap::CommandFactory;
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn kind_is_guessed_from_the_url() {
-        assert_eq!(guess_kind("https://h/a/file.iso"), JobKind::Http);
-        assert_eq!(guess_kind("https://h/live/master.m3u8?t=1"), JobKind::Hls);
-        assert_eq!(guess_kind("https://h/dash/manifest.mpd"), JobKind::Dash);
-        assert_eq!(guess_kind("ftp://h/pub/x.iso"), JobKind::Ftp);
-        assert_eq!(guess_kind("http://h/video.M3U8"), JobKind::Hls);
     }
 
     #[test]

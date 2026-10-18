@@ -199,7 +199,9 @@ fn remux_ts(ffmpeg: &Path, track: &Path, out: &Path) -> Result<u64> {
     if status.success() && out.exists() {
         return Ok(std::fs::metadata(out)?.len());
     }
-    Err(RiptideError::other("ffmpeg could not remux the MPEG-TS stream"))
+    Err(RiptideError::other(
+        "ffmpeg could not remux the MPEG-TS stream",
+    ))
 }
 
 /// Sniff whether a byte block looks like an ISO-BMFF (MP4) file.
@@ -209,7 +211,7 @@ pub fn looks_like_mp4(header: &[u8]) -> bool {
 
 /// Sniff whether a byte block looks like an MPEG-TS packet.
 pub fn looks_like_ts(header: &[u8]) -> bool {
-    header.len() >= 1 && header[0] == 0x47
+    !header.is_empty() && header[0] == 0x47
 }
 
 /// Detect the container of an already-downloaded track, which is more reliable than
@@ -306,7 +308,10 @@ mod tests {
         // Either a real ffmpeg existed (unlikely with PATH emptied) or we fell back.
         if let Ok(n) = result {
             let ts = out.with_extension("ts");
-            assert!(ts.exists() || out.exists(), "some output must exist (n={n})");
+            assert!(
+                ts.exists() || out.exists(),
+                "some output must exist (n={n})"
+            );
         }
     }
 

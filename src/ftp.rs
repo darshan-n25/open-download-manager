@@ -39,11 +39,7 @@ pub fn parse_ftp_url(raw: &str) -> Result<FtpUrl> {
                 "FTPS (FTP over TLS) is not implemented; use plain ftp:// for now".into(),
             ))
         }
-        other => {
-            return Err(RiptideError::other(format!(
-                "{other}:// is not an FTP URL"
-            )))
-        }
+        other => return Err(RiptideError::other(format!("{other}:// is not an FTP URL"))),
     }
     let host = u
         .host_str()
@@ -66,12 +62,22 @@ pub fn parse_ftp_url(raw: &str) -> Result<FtpUrl> {
                 .to_string()
         })
         // The conventional anonymous password is an email address.
-        .unwrap_or_else(|| if u.username().is_empty() { "anonymous@".to_string() } else { String::new() });
+        .unwrap_or_else(|| {
+            if u.username().is_empty() {
+                "anonymous@".to_string()
+            } else {
+                String::new()
+            }
+        });
 
     let path = percent_encoding::percent_decode_str(u.path())
         .decode_utf8_lossy()
         .to_string();
-    let path = if path.is_empty() { "/".to_string() } else { path };
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    };
 
     Ok(FtpUrl {
         host,
@@ -123,15 +129,16 @@ pub fn parse_pasv(reply: &str) -> Result<String> {
 
 /// Parse `213 12345` (SIZE) or `213-...` replies into the first number found.
 pub fn parse_size_reply(reply: &str) -> Option<u64> {
-    reply
-        .lines()
-        .find_map(|l| l.trim().split_whitespace().nth(1).and_then(|n| n.parse::<u64>().ok()))
+    reply.lines().find_map(|l| {
+        l.split_whitespace()
+            .nth(1)
+            .and_then(|n| n.parse::<u64>().ok())
+    })
 }
 
 /// Parse the offset out of the argument to `REST` / the reply to `REST`.
 pub fn parse_rest_reply(reply: &str) -> Option<u64> {
     reply
-        .trim()
         .split_whitespace()
         .filter_map(|t| t.parse::<u64>().ok())
         .next_back()
@@ -319,7 +326,8 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
                 return Err(e.into());
             }
         };
-        sink.write_at(bytes::Bytes::copy_from_slice(&buf[..n]), pos).await?;
+        sink.write_at(bytes::Bytes::copy_from_slice(&buf[..n]), pos)
+            .await?;
         pos += n as u64;
         engine.job_mut().downloaded = pos;
         limit.acquire(n as u64).await;
@@ -367,7 +375,9 @@ async fn open_data_connection(ctrl: &mut Control, timeout: Duration) -> Result<T
     let addr = parse_pasv(&msg)?;
     let stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
         .await
-        .map_err(|_| RiptideError::other(format!("timed out connecting to FTP data port {addr}")))??;
+        .map_err(|_| {
+            RiptideError::other(format!("timed out connecting to FTP data port {addr}"))
+        })??;
     Ok(stream)
 }
 

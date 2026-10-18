@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Riptide</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="mark">≫</span>
+        <span>Riptide</span>
+      </div>
+      <span id="status" class="pill pill-off">offline</span>
+    </header>
+
+    <p id="endpoint" class="muted small"></p>
+
+    <section id="offline-hint" class="card hidden">
+      <strong>The daemon is not running.</strong>
+      <p class="small muted">Start it on the machine you want the files saved to:</p>
+      <code class="block">riptide daemon</code>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <h2>This page</h2>
+        <button id="scan" class="ghost" type="button">Scan</button>
+      </div>
+      <p id="scan-note" class="small muted">Scan for video, audio and downloadable links.</p>
+      <ul id="media" class="media"></ul>
+      <div class="row right">
+        <button id="send-selected" class="primary" type="button" disabled>Send to Riptide</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Add a URL</h2>
+      <div class="row">
+        <input id="manual-url" type="url" placeholder="https://example.com/file.iso" />
+        <button id="manual-add" class="primary" type="button">Add</button>
+      </div>
+      <p id="manual-note" class="small muted"></p>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <h2>Queue</h2>
+        <button id="refresh" class="ghost" type="button">Refresh</button>
+      </div>
+      <p id="queue-summary" class="small muted">—</p>
+      <ul id="jobs" class="jobs"></ul>
+    </section>
+
+    <details class="card" id="options">
+      <summary>Settings</summary>
+
+      <label class="check">
+        <input id="set-intercept" type="checkbox" />
+        <span>Take over browser downloads</span>
+      </label>
+
+      <label class="field">
+        <span>Connections per file</span>
+        <input id="set-connections" type="number" min="1" max="32" />
+      </label>
+
+      <label class="field">
+        <span>Speed limit (e.g. 2M, empty = none)</span>
+        <input id="set-speed" type="text" placeholder="unlimited" />
+      </label>
+
+      <label class="field">
+        <span>Video quality (best / worst / 720)</span>
+        <input id="set-quality" type="text" placeholder="best" />
+      </label>
+
+      <label class="field">
+        <span>Save into (empty = daemon default)</span>
+        <input id="set-output" type="text" placeholder="/home/me/Downloads" />
+      </label>
+
+      <label class="check">
+        <input id="set-cookies" type="checkbox" />
+        <span>Forward browser cookies</span>
+      </label>
+
+      <label class="check">
+        <input id="set-referer" type="checkbox" />
+        <span>Forward the page URL as Referer</span>
+      </label>
+
+      <label class="check">
+        <input id="set-notify" type="checkbox" />
+        <span>Show a notification for each queued download</span>
+      </label>
+
+      <label class="field">
+        <span>Only these hosts (comma separated, empty = all)</span>
+        <input id="set-allow" type="text" placeholder="example.com, *.cdn.example.com" />
+      </label>
+
+      <label class="field">
+        <span>Never these hosts</span>
+        <input id="set-deny" type="text" placeholder="internet-banking.example" />
+      </label>
+
+      <label class="field">
+        <span>Proxy</span>
+        <input id="set-proxy" type="text" placeholder="socks5://127.0.0.1:9050" />
+      </label>
+
+      <label class="field">
+        <span>Credentials</span>
+        <input id="set-auth" type="text" placeholder="user:pass or ntlm:user:pass:domain" />
+      </label>
+
+      <label class="field">
+        <span>Extra headers, one per line</span>
+        <textarea id="set-headers" rows="3" placeholder="X-Api-Key: abc"></textarea>
+      </label>
+
+      <p id="settings-note" class="small muted"></p>
+    </details>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

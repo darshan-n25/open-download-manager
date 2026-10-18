@@ -22,13 +22,13 @@ use reqwest::header::{
     IF_RANGE, LAST_MODIFIED, WWW_AUTHENTICATE,
 };
 use reqwest::{Method, StatusCode};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit};
 
 use crate::auth::{self, AuthKind, DigestSession};
 use crate::config::Config;
 use crate::error::{Result, RiptideError};
 use crate::job::{Job, JobKind, JobState, Segment, SegmentState};
-use crate::net::NetClient;
+use crate::net::{NetClient, ServerLimits};
 use crate::segment as segplan;
 use crate::storage::Sink;
 use crate::throttle::RateLimiter;
@@ -273,6 +273,7 @@ struct Shared {
     min_chunk: u64,
     global: Arc<RateLimiter>,
     local: Arc<RateLimiter>,
+    servers: Arc<ServerLimits>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -292,6 +293,9 @@ pub struct Engine {
     client: Arc<NetClient>,
     global: Arc<RateLimiter>,
     local: Arc<RateLimiter>,
+    /// Simultaneous connections allowed to any one host, shared with every other job in the
+    /// process ("Max. connections number for a server").
+    servers: Arc<ServerLimits>,
     cancel: Arc<AtomicBool>,
     progress: Option<ProgressFn>,
     /// Negotiated Digest state, reused across requests that share a nonce.
@@ -301,10 +305,19 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(cfg: Config, job: Job) -> Result<Self> {
-        Self::with_global(cfg, job, None)
+        Self::with_limits(cfg, job, None, None)
     }
 
     pub fn with_global(cfg: Config, job: Job, global: Option<Arc<RateLimiter>>) -> Result<Self> {
+        Self::with_limits(cfg, job, global, None)
+    }
+
+    pub fn with_limits(
+        cfg: Config,
+        job: Job,
+        global: Option<Arc<RateLimiter>>,
+        servers: Option<Arc<ServerLimits>>,
+    ) -> Result<Self> {
         let client = Arc::new(NetClient::build(
             &job.ctx,
             &cfg.user_agent,
@@ -312,12 +325,15 @@ impl Engine {
         )?);
         let global = global.unwrap_or_else(|| Arc::new(RateLimiter::new(cfg.speed_limit)));
         let local = Arc::new(RateLimiter::new(job.speed_limit));
+        let servers =
+            servers.unwrap_or_else(|| Arc::new(ServerLimits::new(cfg.per_server_connections)));
         Ok(Engine {
             cfg,
             job,
             client,
             global,
             local,
+            servers,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: None,
             digest: None,
@@ -342,6 +358,7 @@ impl Engine {
             read_timeout: Duration::from_secs(self.cfg.read_timeout_secs),
             global: self.global.clone(),
             local: self.local.clone(),
+            servers: self.servers.clone(),
             cancel: self.cancel.clone(),
         }
     }
@@ -473,19 +490,23 @@ impl Engine {
         let url = self.job.url.clone();
         let identity = [("Accept-Encoding".to_string(), "identity".to_string())];
 
+        // A probe is a real connection too; count it against the host's ceiling.
+        let _slot = self.servers.acquire(&url).await;
+
         // A HEAD is cheaper, but plenty of CDNs reject it, so fall back to a 1-byte GET.
         let mut used_get = false;
         let mut resp = self.send_authed(Method::HEAD, &url, &identity).await?;
         if resp.status().is_client_error() || resp.status() == StatusCode::METHOD_NOT_ALLOWED {
-            resp = self.send_authed(
-                Method::GET,
-                &url,
-                &[
-                    ("Accept-Encoding".to_string(), "identity".to_string()),
-                    ("Range".to_string(), "bytes=0-0".to_string()),
-                ],
-            )
-            .await?;
+            resp = self
+                .send_authed(
+                    Method::GET,
+                    &url,
+                    &[
+                        ("Accept-Encoding".to_string(), "identity".to_string()),
+                        ("Range".to_string(), "bytes=0-0".to_string()),
+                    ],
+                )
+                .await?;
             used_get = true;
         }
 
@@ -555,12 +576,17 @@ impl Engine {
         self.job.content_type = content_type.clone();
         // A 206 to a 1-byte range probe is itself proof the server honours ranges, even
         // if it forgot to advertise Accept-Ranges.
-        self.job.resumable = total.is_some() && (accept_ranges || used_get && status == StatusCode::PARTIAL_CONTENT);
+        self.job.resumable =
+            total.is_some() && (accept_ranges || used_get && status == StatusCode::PARTIAL_CONTENT);
 
         // Resolve a provisional output path now that the name is known.
         if self.job.output_provisional {
-            let ext_from_url = crate::util::filename_from_url(&self.job.url)
-                .and_then(|n| Path::new(&n).extension().and_then(|e| e.to_str()).map(String::from));
+            let ext_from_url = crate::util::filename_from_url(&self.job.url).and_then(|n| {
+                Path::new(&n)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(String::from)
+            });
             let ext_from_mime = content_type
                 .as_deref()
                 .and_then(crate::util::extension_from_mime)
@@ -579,7 +605,9 @@ impl Engine {
                     }
                     n
                 })
-                .unwrap_or_else(|| format!("download.{}", ext.clone().unwrap_or_else(|| "bin".into())));
+                .unwrap_or_else(|| {
+                    format!("download.{}", ext.clone().unwrap_or_else(|| "bin".into()))
+                });
             self.job.output = self.cfg.resolve_output(None, &name, ext.as_deref());
             self.job.output_provisional = false;
         }
@@ -661,7 +689,11 @@ impl Engine {
                 .resolved_url
                 .clone()
                 .unwrap_or_else(|| self.job.url.clone()),
-            validator: self.job.etag.clone().or_else(|| self.job.last_modified.clone()),
+            validator: self
+                .job
+                .etag
+                .clone()
+                .or_else(|| self.job.last_modified.clone()),
             auth_override: self.auth_override.clone(),
             read_timeout: Duration::from_secs(self.cfg.read_timeout_secs),
             retry_backoff: Duration::from_millis(self.cfg.retry_backoff_ms),
@@ -670,6 +702,7 @@ impl Engine {
             min_chunk: self.job.min_chunk,
             global: self.global.clone(),
             local: self.local.clone(),
+            servers: self.servers.clone(),
             cancel: self.cancel.clone(),
         }
     }
@@ -678,11 +711,20 @@ impl Engine {
     fn build_state(&self, total: u64) -> Arc<RunState> {
         let st = RunState::new();
         let resume = !self.job.segments.is_empty()
-            && self.job.segments.iter().all(|s| s.end == u64::MAX || s.end < total)
+            && self
+                .job
+                .segments
+                .iter()
+                .all(|s| s.end == u64::MAX || s.end < total)
             && self.job.segments.iter().any(|s| !s.is_complete());
 
         let handles: Vec<Arc<SegHandle>> = if resume {
-            let mut v: Vec<_> = self.job.segments.iter().map(SegHandle::from_segment).collect();
+            let mut v: Vec<_> = self
+                .job
+                .segments
+                .iter()
+                .map(SegHandle::from_segment)
+                .collect();
             v.sort_by_key(|h| h.start);
             v
         } else {
@@ -710,7 +752,7 @@ impl Engine {
 
         let st = self.build_state(total);
         let shared = Arc::new(self.shared());
-        let workers = self.job.connections.max(1).min(64);
+        let workers = self.job.connections.clamp(1, 64);
 
         let speed = self.spawn_monitor(st.clone(), total);
 
@@ -744,7 +786,9 @@ impl Engine {
             return Err(RiptideError::Cancelled);
         }
         if !st.all_done() {
-            return Err(RiptideError::other("download ended with unfinished segments"));
+            return Err(RiptideError::other(
+                "download ended with unfinished segments",
+            ));
         }
 
         self.job.downloaded = total;
@@ -773,7 +817,12 @@ impl Engine {
                 return Err(RiptideError::Cancelled);
             }
             let extra = vec![("Accept-Encoding".to_string(), "identity".to_string())];
-            let resp = match self.send_authed(Method::GET, &self.job.url.clone(), &extra).await {
+            // Held for the whole response, including the body loop below.
+            let _slot = self.servers.acquire(&self.job.url.clone()).await;
+            let resp = match self
+                .send_authed(Method::GET, &self.job.url.clone(), &extra)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     attempts += 1;
@@ -943,6 +992,7 @@ pub struct Fetcher {
     read_timeout: Duration,
     global: Arc<RateLimiter>,
     local: Arc<RateLimiter>,
+    servers: Arc<ServerLimits>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -955,7 +1005,14 @@ impl Fetcher {
         rb
     }
 
+    /// Reserve a connection slot for `url`'s host. The permit is held for the whole response,
+    /// which is what makes "Max. connections number for a server" mean simultaneous sockets.
+    async fn permit(&self, url: &str) -> Option<OwnedSemaphorePermit> {
+        self.servers.acquire(url).await
+    }
+
     pub async fn to_bytes(&self, url: &str, max: u64) -> Result<Vec<u8>> {
+        let _slot = self.permit(url).await;
         let resp = self.request(url).send().await?;
         if !resp.status().is_success() {
             return Err(RiptideError::other(format!(
@@ -975,7 +1032,9 @@ impl Fetcher {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if buf.len() as u64 + chunk.len() as u64 > max {
-                return Err(RiptideError::other(format!("resource {url} exceeds {max} bytes")));
+                return Err(RiptideError::other(format!(
+                    "resource {url} exceeds {max} bytes"
+                )));
             }
             buf.extend_from_slice(&chunk);
         }
@@ -986,6 +1045,7 @@ impl Fetcher {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(RiptideError::Cancelled);
         }
+        let _slot = self.permit(url).await;
         let resp = self.request(url).send().await?;
         if !resp.status().is_success() {
             return Err(RiptideError::other(format!(
@@ -1004,7 +1064,7 @@ impl Fetcher {
             match tokio::time::timeout(self.read_timeout, stream.next()).await {
                 Err(_) => return Err(RiptideError::other(format!("read timeout on {url}"))),
                 Ok(None) => break,
-                Ok(Some(Err(e))) => return Err(RiptideError::Http(e)),
+                Ok(Some(Err(e))) => return Err(e.into()),
                 Ok(Some(Ok(chunk))) => {
                     use tokio::io::AsyncWriteExt;
                     let n = chunk.len() as u64;
@@ -1040,6 +1100,7 @@ impl Fetcher {
             rb = rb.header("Range", format!("bytes={start}-{end}"));
         }
         rb = rb.header("Accept-Encoding", "identity");
+        let _slot = self.permit(url).await;
         let resp = rb.send().await?;
         if !resp.status().is_success() {
             return Err(RiptideError::other(format!(
@@ -1057,7 +1118,7 @@ impl Fetcher {
             match tokio::time::timeout(self.read_timeout, stream.next()).await {
                 Err(_) => return Err(RiptideError::other(format!("read timeout on {url}"))),
                 Ok(None) => break,
-                Ok(Some(Err(e))) => return Err(RiptideError::Http(e)),
+                Ok(Some(Err(e))) => return Err(e.into()),
                 Ok(Some(Ok(chunk))) => {
                     if buf.len() as u64 + chunk.len() as u64 > max {
                         return Err(RiptideError::other(format!(
@@ -1177,6 +1238,9 @@ async fn stream_range(
         rb = rb.header(IF_RANGE, v);
     }
 
+    // Hold one of this host's connection slots for as long as the response is open, so
+    // several jobs pointed at the same server cannot exceed "Max. connections for a server".
+    let _slot = shared.servers.acquire(&shared.url).await;
     let resp = rb.send().await?;
     let status = resp.status();
 
@@ -1203,8 +1267,13 @@ async fn stream_range(
         })
         .unwrap_or(start);
     if actual_start != start {
-        tracing::warn!(expected = start, actual = actual_start, "server shifted the range start");
-        h.done.store(actual_start.saturating_sub(h.start), Ordering::SeqCst);
+        tracing::warn!(
+            expected = start,
+            actual = actual_start,
+            "server shifted the range start"
+        );
+        h.done
+            .store(actual_start.saturating_sub(h.start), Ordering::SeqCst);
     }
 
     let mut pos = actual_start;
@@ -1232,7 +1301,7 @@ async fn stream_range(
             }
             Ok(Some(Err(e))) => {
                 h.done.store(pos.saturating_sub(h.start), Ordering::SeqCst);
-                return Err(RiptideError::Http(e));
+                return Err(e.into());
             }
             Ok(Some(Ok(chunk))) => {
                 if chunk.is_empty() {
@@ -1286,7 +1355,10 @@ async fn ntlm_negotiate(
     for (k, v) in extra {
         rb = rb.header(k, v);
     }
-    let resp = rb.header("Authorization", format!("NTLM {type1}")).send().await?;
+    let resp = rb
+        .header("Authorization", format!("NTLM {type1}"))
+        .send()
+        .await?;
     let challenge_header = resp
         .headers()
         .get(WWW_AUTHENTICATE)
@@ -1306,6 +1378,8 @@ async fn ntlm_negotiate(
 
 #[cfg(test)]
 mod tests {
+    // Fixtures here are built field-by-field from `Default::default()`.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
 
     #[test]
@@ -1319,7 +1393,11 @@ mod tests {
     fn run_state_claim_and_split() {
         let st = RunState::new();
         let segs = segplan::plan(8 << 20, 2, 1 << 10);
-        st.add(segs.iter().map(|s| SegHandle::new(s.id, s.start, s.end)).collect());
+        st.add(
+            segs.iter()
+                .map(|s| SegHandle::new(s.id, s.start, s.end))
+                .collect(),
+        );
         st.next_id.store(2, Ordering::SeqCst);
 
         let a = st.claim().expect("one");

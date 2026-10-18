@@ -82,7 +82,7 @@ pub async fn fetch_and_mux(engine: &Engine, spec: &MediaSpec, out: &Path) -> Res
     }
 
     let fetcher = engine.fetcher();
-    let concurrency = engine.job().connections.max(1).min(16);
+    let concurrency = engine.job().connections.clamp(1, 16);
 
     let video = fetch_track(&fetcher, spec, &dir.join("v"), concurrency, &counter).await?;
     let output = if let Some(audio) = &spec.audio {
@@ -98,13 +98,12 @@ pub async fn fetch_and_mux(engine: &Engine, spec: &MediaSpec, out: &Path) -> Res
     // plan, so clear them out.
     let _ = tokio::fs::remove_dir_all(&dir).await;
 
-    match progress {
-        Some(cb) => cb(crate::engine::ProgressSample {
+    if let Some(cb) = progress {
+        cb(crate::engine::ProgressSample {
             downloaded: output,
             total: Some(output),
             speed_bps: 0.0,
-        }),
-        None => {}
+        })
     }
     Ok(output)
 }
@@ -241,7 +240,9 @@ pub fn decrypt_aes128_cbc(
     use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 
     if key.len() != 16 {
-        return Err(RiptideError::Manifest("AES-128 key must be 16 bytes".into()));
+        return Err(RiptideError::Manifest(
+            "AES-128 key must be 16 bytes".into(),
+        ));
     }
     let mut iv_bytes = [0u8; 16];
     match iv {

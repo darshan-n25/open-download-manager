@@ -364,7 +364,9 @@ MSG#<msgId>#<type>#<fieldA>#<fieldB>[,<key>=<value>...][;]
 ```js
 S(this, 2, 5, 0, [112, 91, Xa?1028:1031, 0, 16845059, clientId, 15, manifestVersion], {...})
 ```
-- `16845059 == 0x01010D03` — a packed version constant.
+- `16845059 == 0x01010903` — a packed version constant. (Read the decimal literally; an
+  earlier draft of this report mis-transcribed it as `0x01010D03`, which is `16846083`. The
+  shipped extension's own handshake is `MSG#…,version=16845059,…`.)
 - The extension also parses its own version string `v<major>.<minor>b<build>` into a 32-bit
   integer and gates feature use on thresholds (e.g. `ua < 103430656`, `ua < 103431424`),
   negotiating capabilities with the backend. `[INFERRED]` this is how old IDM builds stay
@@ -578,6 +580,32 @@ IDM preconfigures these, which is why "download through Tor" is a one-click opti
 5. **Silent navigation replacement** via `declarativeNetRequest` redirects.
 6. **Renderer-process hooks via injected XHR/fetch patching** with per-site rule tables —
    these break every time a site changes and are a constant maintenance treadmill.
+
+---
+
+## 8b. Feature strings the engine analysis would have missed `[OBSERVED]`
+
+A pass over the extracted strings (`ascii.txt` / `wide.txt`) against Tonec's advertised
+feature list turns up whole features that no amount of reading the download engine would
+reveal, because they are not in the engine. Recorded here as evidence; the Riptide status for
+each is in `docs/FEATURE-MAP.md` §12.
+
+| Feature | Strings |
+| --- | --- |
+| **MMS protocol** — genuinely implemented | `mms://`, `StImmMsg`, `mmsPacketSize`, `mmsIndex`, `send mms cmd`, `MMSCn:ProcRpl`, `Unk err in MMSCn:ProcWR`, `Unkerr in MMSC:SetCmpl`, `Live broacast flag is set in mms header!` (`MMSCn` = MMS connection class) |
+| **Download quotas** (as distinct from rate limits) | `Download limits`, `Download limits exceeded!` |
+| **Speed limiter** (the rate-limiting UI) | `Speed Limiter`, `Use Speed Limiter`, `Speed Limiter settings`, `Always turn on Speed Limiter on IDM startup`, `Remember Speed Limiter settings for this file`, `Show "Speed Limiter" tab`, `Connections and Limits` |
+| **Periodic file synchronization** | `Periodic synchronization` (UTF-16) |
+| **Scheduler power/dial-up actions** | `Shut down`, `Shut down now`, `Hang up modem`, `Hang up now`, `Internet Download Manager has finished queue processing. According to scheduler settings IDM is going to hang up your modem.` |
+| **Antivirus scan on completion** | `If you would like to run antivirus software on download completion, you should type or browse the complete path to its executable file. If IDM knows about necessary parameters for a given executable file name, it will set them automatically.` plus the `[file]` placeholder convention |
+| **Offline site archiving with link rewriting** | `Complete start page with all pictures, styles, and scripts for offline browsing`, `Convert the links in downloaded html files to the local files for offline browsing` |
+| **FTP proxy** | `Use &FTP Proxy` |
+
+The antivirus string doubles as an incidental confirmation of the merge-based completion
+described in §2.4: *"IDM has received \"Access Denied\" error while assembling file parts… In
+order to assemble this file, you will need to reboot your computer, select the file in IDM, and
+press on resume button."* That is IDM telling the user to work around a failed final assembly —
+the behaviour Riptide avoids by writing each range at its final offset and renaming.
 
 ---
 

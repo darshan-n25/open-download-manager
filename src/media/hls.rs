@@ -104,9 +104,7 @@ fn attrs(s: &str) -> Vec<(String, String)> {
 }
 
 fn attr<'a>(list: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    list.iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
+    list.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
 fn parse_resolution(v: &str) -> (Option<u32>, Option<u32>) {
@@ -119,7 +117,7 @@ fn parse_resolution(v: &str) -> (Option<u32>, Option<u32>) {
 fn parse_iv(v: &str) -> Option<Vec<u8>> {
     let hex_part = v.trim().trim_start_matches("0x").trim_start_matches("0X");
     let clean: String = hex_part.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if clean.len() % 2 != 0 || clean.is_empty() {
+    if !clean.len().is_multiple_of(2) || clean.is_empty() {
         return None;
     }
     hex::decode(clean).ok().filter(|b| b.len() == 16)
@@ -159,7 +157,8 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist> {
                     name: attr(&a, "NAME").map(|s| s.to_string()),
                     language: attr(&a, "LANGUAGE").map(|s| s.to_string()),
                     uri: attr(&a, "URI").map(|s| s.to_string()),
-                    is_default: attr(&a, "DEFAULT").map(|v| v.eq_ignore_ascii_case("YES")) == Some(true),
+                    is_default: attr(&a, "DEFAULT").map(|v| v.eq_ignore_ascii_case("YES"))
+                        == Some(true),
                 });
             }
             continue;
@@ -203,7 +202,9 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist> {
             } else {
                 key = Some(MediaKey {
                     method,
-                    uri: attr(&a, "URI").map(|u| resolve_url(base, u)).unwrap_or_default(),
+                    uri: attr(&a, "URI")
+                        .map(|u| resolve_url(base, u))
+                        .unwrap_or_default(),
                     iv: attr(&a, "IV").and_then(parse_iv),
                     key: None,
                 });
@@ -276,9 +277,14 @@ fn resolve_url(base: &Url, rel: &str) -> String {
 }
 
 /// Pick a rendition. `preference` is `best` (default), `worst`, or a height like `720`.
-pub fn select_variant<'a>(variants: &'a [Variant], preference: Option<&str>) -> Result<&'a Variant> {
+pub fn select_variant<'a>(
+    variants: &'a [Variant],
+    preference: Option<&str>,
+) -> Result<&'a Variant> {
     if variants.is_empty() {
-        return Err(RiptideError::Manifest("no variants in master playlist".into()));
+        return Err(RiptideError::Manifest(
+            "no variants in master playlist".into(),
+        ));
     }
     let pref = preference.unwrap_or("best").trim().to_ascii_lowercase();
 
@@ -292,7 +298,8 @@ pub fn select_variant<'a>(variants: &'a [Variant], preference: Option<&str>) -> 
     }
     if let Ok(want_h) = pref.parse::<u32>() {
         // Closest available whose height does not exceed the request, else the smallest.
-        let mut candidates: Vec<&Variant> = variants.iter().filter(|v| v.height.is_some()).collect();
+        let mut candidates: Vec<&Variant> =
+            variants.iter().filter(|v| v.height.is_some()).collect();
         if !candidates.is_empty() {
             candidates.sort_by_key(|v| v.height.unwrap());
             let exact = candidates
@@ -310,10 +317,19 @@ pub fn detect_container(segments: &[MediaSegmentRef]) -> String {
     let mut ts = 0usize;
     let mut mp4 = 0usize;
     for s in segments {
-        let path = s.url.split('?').next().unwrap_or(&s.url).to_ascii_lowercase();
+        let path = s
+            .url
+            .split('?')
+            .next()
+            .unwrap_or(&s.url)
+            .to_ascii_lowercase();
         if path.ends_with(".ts") || path.ends_with(".tsv") {
             ts += 1;
-        } else if path.ends_with(".m4s") || path.ends_with(".mp4") || path.ends_with(".m4a") || path.ends_with(".cmfv") {
+        } else if path.ends_with(".m4s")
+            || path.ends_with(".mp4")
+            || path.ends_with(".m4a")
+            || path.ends_with(".cmfv")
+        {
             mp4 += 1;
         }
     }
@@ -327,11 +343,7 @@ pub fn detect_container(segments: &[MediaSegmentRef]) -> String {
 }
 
 /// Turn a resolved media playlist into the flat plan the muxer consumes.
-fn build_spec(
-    manifest_url: &str,
-    variant: Option<&Variant>,
-    playlist: MediaPlaylist,
-) -> MediaSpec {
+fn build_spec(manifest_url: &str, variant: Option<&Variant>, playlist: MediaPlaylist) -> MediaSpec {
     let container = detect_container(&playlist.segments);
     MediaSpec {
         manifest_url: manifest_url.to_string(),
@@ -408,14 +420,14 @@ pub async fn resolve(engine: &mut Engine) -> Result<MediaSpec> {
                     .filter(|r| &r.group_id == g && r.uri.is_some())
                     .collect();
                 candidates.sort_by_key(|r| !r.is_default);
-                candidates
-                    .first()
-                    .and_then(|r| r.uri.as_ref())
-                    .map(|u| base.join(u).map(|x| x.to_string()).unwrap_or_else(|_| u.clone()))
+                candidates.first().and_then(|r| r.uri.as_ref()).map(|u| {
+                    base.join(u)
+                        .map(|x| x.to_string())
+                        .unwrap_or_else(|_| u.clone())
+                })
             });
 
-            let (_, media) =
-                Box::pin(load_media(engine, chosen.url.as_str(), pref, 0)).await?;
+            let (_, media) = Box::pin(load_media(engine, chosen.url.as_str(), pref, 0)).await?;
             (Some(chosen), media, audio_url)
         }
     };
@@ -462,13 +474,18 @@ mod tests {
 1080/index.m3u8
 ";
         let p = parse(text, &base()).unwrap();
-        let Playlist::Master(m) = p else { panic!("expected master") };
+        let Playlist::Master(m) = p else {
+            panic!("expected master")
+        };
         assert_eq!(m.variants.len(), 2);
         assert_eq!(m.audio.len(), 1);
         assert!(m.audio[0].is_default);
         assert_eq!(m.variants[1].height, Some(1080));
         assert_eq!(m.variants[1].audio_group.as_deref(), Some("aud"));
-        assert_eq!(m.variants[0].url.as_str(), "https://cdn.test/hls/360/index.m3u8");
+        assert_eq!(
+            m.variants[0].url.as_str(),
+            "https://cdn.test/hls/360/index.m3u8"
+        );
         assert_eq!(m.variants[0].label(), "640x360");
     }
 
@@ -488,7 +505,9 @@ seg.mp4
 #EXT-X-ENDLIST
 ";
         let p = parse(text, &base()).unwrap();
-        let Playlist::Media(m) = p else { panic!("expected media") };
+        let Playlist::Media(m) = p else {
+            panic!("expected media")
+        };
         assert_eq!(m.segments.len(), 2);
         assert_eq!(m.init_url.as_deref(), Some("https://cdn.test/hls/init.mp4"));
         assert_eq!(m.segments[0].byte_range, Some((0, 999)));
@@ -497,7 +516,10 @@ seg.mp4
         assert!(m.end_list);
         let key = m.key.unwrap();
         assert_eq!(key.method, "AES-128");
-        assert_eq!(key.iv.as_deref().map(hex::encode), Some("0123456789abcdef0123456789abcdef".to_string()));
+        assert_eq!(
+            key.iv.as_deref().map(hex::encode),
+            Some("0123456789abcdef0123456789abcdef".to_string())
+        );
         assert_eq!(m.segments[0].duration, Some(6.0));
     }
 
@@ -512,7 +534,9 @@ a.ts
 #EXTINF:1,
 b.ts
 ";
-        let Playlist::Media(m) = parse(text, &base()).unwrap() else { panic!() };
+        let Playlist::Media(m) = parse(text, &base()).unwrap() else {
+            panic!()
+        };
         assert!(m.key.is_none());
         assert_eq!(m.segments.len(), 2);
     }
@@ -528,13 +552,33 @@ b.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
 c.m3u8
 ";
-        let Playlist::Master(m) = parse(text, &base()).unwrap() else { panic!() };
-        assert_eq!(select_variant(&m.variants, None).unwrap().height, Some(1080));
-        assert_eq!(select_variant(&m.variants, Some("best")).unwrap().height, Some(1080));
-        assert_eq!(select_variant(&m.variants, Some("worst")).unwrap().height, Some(360));
-        assert_eq!(select_variant(&m.variants, Some("720")).unwrap().height, Some(720));
-        assert_eq!(select_variant(&m.variants, Some("800")).unwrap().height, Some(720));
-        assert_eq!(select_variant(&m.variants, Some("100")).unwrap().height, Some(360));
+        let Playlist::Master(m) = parse(text, &base()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            select_variant(&m.variants, None).unwrap().height,
+            Some(1080)
+        );
+        assert_eq!(
+            select_variant(&m.variants, Some("best")).unwrap().height,
+            Some(1080)
+        );
+        assert_eq!(
+            select_variant(&m.variants, Some("worst")).unwrap().height,
+            Some(360)
+        );
+        assert_eq!(
+            select_variant(&m.variants, Some("720")).unwrap().height,
+            Some(720)
+        );
+        assert_eq!(
+            select_variant(&m.variants, Some("800")).unwrap().height,
+            Some(720)
+        );
+        assert_eq!(
+            select_variant(&m.variants, Some("100")).unwrap().height,
+            Some(360)
+        );
     }
 
     #[test]

@@ -8,8 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE, REFERER};
 use reqwest::cookie::Jar;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE, REFERER};
 
 use super::proxy::{parse_proxy, ProxySpec};
 use crate::error::{Result, RiptideError};
@@ -85,10 +85,10 @@ impl NetClient {
                         };
                         for p in &proxies {
                             match reqwest::Proxy::all(p) {
-                                Ok(proxy) => {
-                                    builder = builder.proxy(proxy.no_proxy(no.clone()))
+                                Ok(proxy) => builder = builder.proxy(proxy.no_proxy(no.clone())),
+                                Err(e) => {
+                                    tracing::warn!(proxy = %p, error = %e, "ignoring bad proxy")
                                 }
-                                Err(e) => tracing::warn!(proxy = %p, error = %e, "ignoring bad proxy"),
                             }
                         }
                     }
@@ -177,6 +177,8 @@ pub fn range_headers(start: u64, end: u64) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    // Fixtures here are built field-by-field from `Default::default()`.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
 
     #[test]

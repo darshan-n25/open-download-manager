@@ -125,9 +125,7 @@ pub fn parse_type2(msg: &[u8]) -> Option<Type2> {
     };
     let target_name = slice_field(12).unwrap_or_default();
     let target_info = slice_field(40).unwrap_or_default();
-    let version = msg
-        .get(48..56)
-        .and_then(|s| <[u8; 8]>::try_from(s).ok());
+    let version = msg.get(48..56).and_then(|s| <[u8; 8]>::try_from(s).ok());
 
     Some(Type2 {
         flags,
@@ -139,13 +137,7 @@ pub fn parse_type2(msg: &[u8]) -> Option<Type2> {
 }
 
 /// Build the Type 3 (AUTHENTICATE) message using NTLMv2 responses.
-pub fn type3(
-    t2: &Type2,
-    user: &str,
-    domain: &str,
-    password: &str,
-    workstation: &str,
-) -> Vec<u8> {
+pub fn type3(t2: &Type2, user: &str, domain: &str, password: &str, workstation: &str) -> Vec<u8> {
     // A fresh client challenge is what makes each NTLMv2 response unique.
     let client_challenge: [u8; 8] = rand::random();
 
@@ -160,7 +152,7 @@ pub fn type3(
     blob.extend_from_slice(&client_challenge); // ClientChallenge
     blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved
     blob.extend_from_slice(&t2.target_info); // TargetInfo (AV pairs)
-    // Terminator AV pair, if the server did not already include one.
+                                             // Terminator AV pair, if the server did not already include one.
     if !t2.target_info.ends_with(&[0, 0, 0, 0]) {
         blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
     }
@@ -267,10 +259,7 @@ mod tests {
             hex::encode(nt_hash("password")),
             "8846f7eaee8fb117ad06bdd830b7586c"
         );
-        assert_eq!(
-            hex::encode(nt_hash("")),
-            "31d6cfe0d16ae931b73c59d7e0c089c0"
-        );
+        assert_eq!(hex::encode(nt_hash("")), "31d6cfe0d16ae931b73c59d7e0c089c0");
     }
 
     #[test]
@@ -287,7 +276,10 @@ mod tests {
         let m = type1("DOMAIN", "WORKSTATION");
         assert_eq!(&m[0..8], b"NTLMSSP\0");
         assert_eq!(u32::from_le_bytes(m[8..12].try_into().unwrap()), 1);
-        assert_eq!(m.len(), 32 + utf16le("DOMAIN").len() + utf16le("WORKSTATION").len());
+        assert_eq!(
+            m.len(),
+            32 + utf16le("DOMAIN").len() + utf16le("WORKSTATION").len()
+        );
     }
 
     #[test]
@@ -304,7 +296,7 @@ mod tests {
         t2.extend_from_slice(&FLAGS.to_le_bytes());
         t2.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // server challenge
         t2.extend_from_slice(&[0u8; 8]); // reserved
-        // TargetInfo field
+                                         // TargetInfo field
         t2.extend_from_slice(&(target_info.len() as u16).to_le_bytes());
         t2.extend_from_slice(&(target_info.len() as u16).to_le_bytes());
         t2.extend_from_slice(&48u32.to_le_bytes());
@@ -320,7 +312,14 @@ mod tests {
         assert_eq!(u16::from_le_bytes(m3[12..14].try_into().unwrap()), 24);
         let nt_len = u16::from_le_bytes(m3[20..22].try_into().unwrap()) as usize;
         assert!(nt_len >= 16 + 32);
-        assert_eq!(m3.len(), 64 + 24 + nt_len + utf16le("DOMAIN").len() + utf16le("user").len() + utf16le("WS").len());
+        assert_eq!(
+            m3.len(),
+            64 + 24
+                + nt_len
+                + utf16le("DOMAIN").len()
+                + utf16le("user").len()
+                + utf16le("WS").len()
+        );
     }
 
     #[test]

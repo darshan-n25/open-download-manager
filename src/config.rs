@@ -19,6 +19,9 @@ pub struct Config {
     pub min_chunk: u64,
     /// "Number of retries for each file if downloading failed".
     pub max_retries: u32,
+    /// "Max. connections number for a server": simultaneous connections to any one host,
+    /// shared across every job. 0 disables the ceiling.
+    pub per_server_connections: usize,
     /// Global ceiling across all jobs, bytes/second ("Maximum download speed").
     pub speed_limit: Option<u64>,
     pub proxy: Option<String>,
@@ -45,6 +48,9 @@ impl Default for Config {
             connections: 8,
             min_chunk: DEFAULT_MIN_CHUNK,
             max_retries: 5,
+            // Roomy enough that a single job is never clipped, tight enough that several
+            // jobs hitting one CDN do not look like an attack.
+            per_server_connections: 16,
             speed_limit: None,
             proxy: None,
             user_agent: DEFAULT_UA.to_string(),
@@ -150,6 +156,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    // Fixtures here are built field-by-field from `Default::default()`.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
 
     #[test]

@@ -64,7 +64,11 @@ impl AuthSpec {
         }
     }
 
-    pub fn ntlm(user: impl Into<String>, pass: impl Into<String>, domain: impl Into<String>) -> Self {
+    pub fn ntlm(
+        user: impl Into<String>,
+        pass: impl Into<String>,
+        domain: impl Into<String>,
+    ) -> Self {
         AuthSpec {
             kind: AuthKind::Ntlm,
             username: Some(user.into()),
@@ -104,9 +108,15 @@ impl AuthSpec {
         match self.kind {
             AuthKind::Basic => Some((
                 "Authorization".into(),
-                format!("Basic {}", base64_encode(format!("{}:{}", self.user(), self.pass()).as_bytes())),
+                format!(
+                    "Basic {}",
+                    base64_encode(format!("{}:{}", self.user(), self.pass()).as_bytes())
+                ),
             )),
-            AuthKind::Bearer => Some(("Authorization".into(), format!("Bearer {}", self.token.as_deref().unwrap_or("")))),
+            AuthKind::Bearer => Some((
+                "Authorization".into(),
+                format!("Bearer {}", self.token.as_deref().unwrap_or("")),
+            )),
             AuthKind::Digest | AuthKind::Ntlm => None,
         }
     }
@@ -134,7 +144,12 @@ pub fn parse_auth_spec(s: &str) -> Option<AuthSpec> {
         return None;
     }
     let (kind, rest) = match s.split_once(':') {
-        Some((k, r)) if matches!(k.to_ascii_lowercase().as_str(), "basic" | "digest" | "bearer" | "ntlm") => {
+        Some((k, r))
+            if matches!(
+                k.to_ascii_lowercase().as_str(),
+                "basic" | "digest" | "bearer" | "ntlm"
+            ) =>
+        {
             (k.to_ascii_lowercase(), r)
         }
         _ => ("basic".to_string(), s),
@@ -325,21 +340,21 @@ pub fn digest_authorization(
     let sess = algo.ends_with("-SESS");
     let qop = pick_qop(chal.qop.as_deref());
 
-    let mut ha1 = hash_hex(&algo, format!("{}:{}:{}", user, chal.realm, pass).as_bytes());
+    let mut ha1 = hash_hex(
+        &algo,
+        format!("{}:{}:{}", user, chal.realm, pass).as_bytes(),
+    );
     if sess {
-        ha1 = hash_hex(&algo, format!("{}:{}:{}", ha1, chal.nonce, session.cnonce).as_bytes());
+        ha1 = hash_hex(
+            &algo,
+            format!("{}:{}:{}", ha1, chal.nonce, session.cnonce).as_bytes(),
+        );
     }
 
     let ha2 = match qop {
         Some(q) if q.eq_ignore_ascii_case("auth-int") => hash_hex(
             &algo,
-            format!(
-                "{}:{}:{}",
-                method,
-                uri,
-                hash_hex(&algo, entity_body)
-            )
-            .as_bytes(),
+            format!("{}:{}:{}", method, uri, hash_hex(&algo, entity_body)).as_bytes(),
         ),
         _ => hash_hex(&algo, format!("{}:{}", method, uri).as_bytes()),
     };
@@ -423,7 +438,8 @@ mod tests {
 
     #[test]
     fn challenge_parsing_handles_quoted_commas() {
-        let h = r#"Digest realm="a,b", nonce="xyz", qop="auth,auth-int", algorithm=MD5, opaque="op""#;
+        let h =
+            r#"Digest realm="a,b", nonce="xyz", qop="auth,auth-int", algorithm=MD5, opaque="op""#;
         let c = parse_digest_challenge(h).unwrap();
         assert_eq!(c.realm, "a,b");
         assert_eq!(c.nonce, "xyz");
@@ -458,7 +474,10 @@ mod tests {
             &mut s,
             b"",
         );
-        assert!(hdr.contains("response=\"8ca523f5e9506fed4657c9700eebdbec\""), "{hdr}");
+        assert!(
+            hdr.contains("response=\"8ca523f5e9506fed4657c9700eebdbec\""),
+            "{hdr}"
+        );
         assert!(hdr.contains("nc=00000001"));
         assert!(hdr.contains("qop=auth"));
     }

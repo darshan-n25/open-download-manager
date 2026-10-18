@@ -153,6 +153,9 @@ mod tests {
     fn repeated_splitting_still_tiles() {
         let mut segs = plan(1 << 22, 2, 1 << 10);
         let mut next_id = segs.len() as u64;
+        // Clippy would rather this were an `enumerate`, but the counter must survive across
+        // iterations while the index is recomputed each time.
+        #[allow(clippy::explicit_counter_loop)]
         for _ in 0..5 {
             // Split the biggest one each time.
             let idx = segs

@@ -22,17 +22,14 @@ pub const DEFAULT_MAX_PAGES: usize = 200;
 /// the extension list IDM exposes in its UI filter.
 pub const DOWNLOADABLE_EXTENSIONS: &[&str] = &[
     // video
-    "mp4", "m4v", "mkv", "webm", "avi", "mov", "wmv", "flv", "mpg", "mpeg", "ts", "tsv",
-    "3gp", "ogv", "rmvb", "asf",
-    // streaming manifests
-    "m3u8", "mpd", "f4m", "ism",
-    // audio
+    "mp4", "m4v", "mkv", "webm", "avi", "mov", "wmv", "flv", "mpg", "mpeg", "ts", "tsv", "3gp",
+    "ogv", "rmvb", "asf", // streaming manifests
+    "m3u8", "mpd", "f4m", "ism", // audio
     "mp3", "m4a", "aac", "flac", "wav", "wma", "ogg", "opus",
     // archives and disk images
     "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "img", "dmg",
     // documents and programs
-    "pdf", "epub", "mobi", "exe", "msi", "apk", "deb", "rpm", "appimage", "torrent", "srt",
-    "vtt",
+    "pdf", "epub", "mobi", "exe", "msi", "apk", "deb", "rpm", "appimage", "torrent", "srt", "vtt",
 ];
 
 /// Substrings that almost always mean "advert or analytics beacon", filtered out unless the
@@ -128,7 +125,10 @@ pub fn is_downloadable(u: &str) -> bool {
 }
 
 pub fn is_manifest(u: &str) -> bool {
-    matches!(extension_of(u).as_deref(), Some("m3u8" | "mpd" | "f4m" | "ism"))
+    matches!(
+        extension_of(u).as_deref(),
+        Some("m3u8" | "mpd" | "f4m" | "ism")
+    )
 }
 
 fn is_noise(u: &str) -> bool {
@@ -167,7 +167,9 @@ pub fn extract_urls(body: &str, base: &Url) -> Vec<String> {
         }
     };
 
-    if let Ok(re) = Regex::new(r#"(?i)(?:href|src|data-src|data-original|poster|content)\s*=\s*["']([^"']+)["']"#) {
+    if let Ok(re) = Regex::new(
+        r#"(?i)(?:href|src|data-src|data-original|poster|content)\s*=\s*["']([^"']+)["']"#,
+    ) {
         for c in re.captures_iter(body) {
             push(&c[1], &mut out, &mut seen);
         }
@@ -183,7 +185,7 @@ pub fn extract_urls(body: &str, base: &Url) -> Vec<String> {
     // Bare absolute URLs in scripts, JSON blobs and manifests.
     if let Ok(re) = Regex::new(r#"https?://[^\s"'<>\\)]+"#) {
         for m in re.find_iter(body) {
-            let raw = m.as_str().trim_end_matches(|c: char| c == ',' || c == ';' || c == '.');
+            let raw = m.as_str().trim_end_matches([',', ';', '.']);
             push(raw, &mut out, &mut seen);
         }
     }
@@ -192,7 +194,7 @@ pub fn extract_urls(body: &str, base: &Url) -> Vec<String> {
     if let Ok(re) = Regex::new(r#"(?i)srcset\s*=\s*["']([^"']+)["']"#) {
         for c in re.captures_iter(body) {
             for part in c[1].split(',') {
-                let url = part.trim().split_whitespace().next().unwrap_or("");
+                let url = part.split_whitespace().next().unwrap_or("");
                 push(url, &mut out, &mut seen);
             }
         }
@@ -202,7 +204,11 @@ pub fn extract_urls(body: &str, base: &Url) -> Vec<String> {
 }
 
 /// Apply the include/exclude filters and the noise filter.
-pub fn filter_urls(urls: Vec<String>, cfg: &GrabberConfig, start_host: Option<&str>) -> Vec<String> {
+pub fn filter_urls(
+    urls: Vec<String>,
+    cfg: &GrabberConfig,
+    start_host: Option<&str>,
+) -> Vec<String> {
     let includes: Vec<Regex> = cfg
         .include
         .iter()
@@ -221,7 +227,10 @@ pub fn filter_urls(urls: Vec<String>, cfg: &GrabberConfig, start_host: Option<&s
             }
             if let Some(host) = start_host {
                 if cfg.same_host {
-                    match Url::parse(u).ok().and_then(|x| x.host_str().map(|h| h.to_string())) {
+                    match Url::parse(u)
+                        .ok()
+                        .and_then(|x| x.host_str().map(|h| h.to_string()))
+                    {
                         Some(h) if h == host => {}
                         _ => return false,
                     }
@@ -246,11 +255,15 @@ fn classify(u: &str) -> Option<TargetKind> {
         return Some(TargetKind::File);
     }
     let path = Url::parse(u).ok().map(|x| x.path().to_ascii_lowercase())?;
-    // Treat extension-less and .html/.htm/.php paths as crawlable documents.
+    // A page: a directory-ish path, a classic document extension, or something with no
+    // extension at all (plenty of sites serve HTML from `/watch/abc123`).
     let last = path.rsplit('/').next().unwrap_or("");
-    if last.is_empty() || last.ends_with(".html") || last.ends_with(".htm") || last.ends_with(".php") {
-        Some(TargetKind::Page)
-    } else if extension_of(u).is_none() {
+    let looks_like_page = last.is_empty()
+        || last.ends_with(".html")
+        || last.ends_with(".htm")
+        || last.ends_with(".php")
+        || extension_of(u).is_none();
+    if looks_like_page {
         Some(TargetKind::Page)
     } else {
         None
@@ -332,6 +345,8 @@ pub async fn crawl(fetcher: &Fetcher, start: &str, cfg: &GrabberConfig) -> Resul
 
 #[cfg(test)]
 mod tests {
+    // Fixtures here are built field-by-field from `Default::default()`.
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
 
     fn base() -> Url {
@@ -394,7 +409,10 @@ mod tests {
 
     #[test]
     fn extension_parsing_ignores_queries() {
-        assert_eq!(extension_of("https://x/a.MP4?token=1").as_deref(), Some("mp4"));
+        assert_eq!(
+            extension_of("https://x/a.MP4?token=1").as_deref(),
+            Some("mp4")
+        );
         assert_eq!(extension_of("https://x/a"), None);
         assert_eq!(extension_of("https://x/a.verylongextension"), None);
     }
@@ -443,7 +461,9 @@ mod tests {
 
     #[test]
     fn downloadable_list_covers_idm_vocabulary() {
-        for e in ["mp4", "m3u8", "mpd", "ts", "zip", "rar", "torrent", "exe", "apk"] {
+        for e in [
+            "mp4", "m3u8", "mpd", "ts", "zip", "rar", "torrent", "exe", "apk",
+        ] {
             assert!(
                 DOWNLOADABLE_EXTENSIONS.contains(&e),
                 "{e} should be considered downloadable"

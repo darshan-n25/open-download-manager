@@ -24,6 +24,24 @@ impl JobKind {
             JobKind::Grabber => "grabber",
         }
     }
+
+    /// Infer the transfer kind from a URL alone, before any network traffic.
+    ///
+    /// The CLI and the daemon both use this so that a `.m3u8` handed over by the browser
+    /// extension is captured as HLS rather than fetched as an opaque byte stream.
+    pub fn guess(url: &str) -> JobKind {
+        let lower = url.to_ascii_lowercase();
+        let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+        if lower.starts_with("ftp://") || lower.starts_with("ftps://") {
+            JobKind::Ftp
+        } else if path.contains(".m3u8") {
+            JobKind::Hls
+        } else if path.contains(".mpd") {
+            JobKind::Dash
+        } else {
+            JobKind::Http
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,6 +291,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_transfer_kind_is_guessed_from_the_url() {
+        assert_eq!(JobKind::guess("https://h/a/file.iso"), JobKind::Http);
+        assert_eq!(
+            JobKind::guess("https://h/live/master.m3u8?t=1"),
+            JobKind::Hls
+        );
+        assert_eq!(JobKind::guess("https://h/dash/manifest.mpd"), JobKind::Dash);
+        assert_eq!(JobKind::guess("ftp://h/pub/x.iso"), JobKind::Ftp);
+        assert_eq!(JobKind::guess("ftps://h/pub/x.iso"), JobKind::Ftp);
+        assert_eq!(JobKind::guess("http://h/video.M3U8"), JobKind::Hls);
+        // A query string must not be mistaken for the path.
+        assert_eq!(
+            JobKind::guess("https://h/get?id=1&name=x.mp4"),
+            JobKind::Http
+        );
+    }
+
+    #[test]
     fn segment_cursor_and_remaining() {
         let mut s = Segment::new(1, 100, 199);
         assert_eq!(s.cursor(), 100);
@@ -285,7 +321,12 @@ mod tests {
 
     #[test]
     fn progress_is_bounded() {
-        let mut j = Job::new("a".into(), "http://x/".into(), PathBuf::from("/tmp/x"), JobKind::Http);
+        let mut j = Job::new(
+            "a".into(),
+            "http://x/".into(),
+            PathBuf::from("/tmp/x"),
+            JobKind::Http,
+        );
         assert!(j.progress().is_none());
         j.total = Some(1000);
         j.downloaded = 250;

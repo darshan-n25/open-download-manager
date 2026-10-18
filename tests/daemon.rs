@@ -3,6 +3,10 @@
 //! Covers the two surfaces the browser extension and scripts use: the `MSG#` WebSocket
 //! protocol on `plugin.v3.internetdownloadmanager.com`, and the plain JSON HTTP API.
 
+// Building a test fixture field-by-field from `Default::default()` is clearer than a
+// 12-argument literal.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -61,11 +65,9 @@ async fn the_extension_handshake_negotiates_the_expected_subprotocol() {
     );
 
     // HELLO -> HELLO_ACK, carrying the packed protocol version.
-    ws.send(WsMessage::Text(
-        encode_frame(&Message::new(0, msg::HELLO)).into(),
-    ))
-    .await
-    .unwrap();
+    ws.send(WsMessage::Text(encode_frame(&Message::new(0, msg::HELLO))))
+        .await
+        .unwrap();
 
     let reply = next_frame(&mut ws).await;
     assert_eq!(reply.mtype, msg::HELLO_ACK);
@@ -83,24 +85,22 @@ async fn ping_status_and_unknown_opcodes_behave() {
     let d = start_daemon().await;
     let mut ws = connect(d.addr).await;
 
-    ws.send(WsMessage::Text(encode_frame(&Message::new(5, msg::PING)).into()))
+    ws.send(WsMessage::Text(encode_frame(&Message::new(5, msg::PING))))
         .await
         .unwrap();
     let pong = next_frame(&mut ws).await;
     assert_eq!(pong.mtype, msg::PONG);
     assert_eq!(pong.id, 5);
 
-    ws.send(WsMessage::Text(
-        encode_frame(&Message::new(6, msg::STATUS)).into(),
-    ))
-    .await
-    .unwrap();
+    ws.send(WsMessage::Text(encode_frame(&Message::new(6, msg::STATUS))))
+        .await
+        .unwrap();
     let status = next_frame(&mut ws).await;
     assert_eq!(status.mtype, msg::STATUS_ACK);
     assert_eq!(status.get("total"), Some("0"));
     assert_eq!(status.get("active"), Some("0"));
 
-    ws.send(WsMessage::Text(encode_frame(&Message::new(7, 4242)).into()))
+    ws.send(WsMessage::Text(encode_frame(&Message::new(7, 4242))))
         .await
         .unwrap();
     let err = next_frame(&mut ws).await;
@@ -121,13 +121,14 @@ async fn add_queues_a_job_and_reports_its_id() {
         .with("referer", "http://host/page")
         .with("cookie", "session=abc;other=1")
         .with("user_agent", "TestAgent/1.0");
-    ws.send(WsMessage::Text(encode_frame(&add).into()))
-        .await
-        .unwrap();
+    ws.send(WsMessage::Text(encode_frame(&add))).await.unwrap();
 
     let ack = next_frame(&mut ws).await;
     assert_eq!(ack.mtype, msg::ADD_ACK);
-    let id = ack.get("id").expect("ADD_ACK carries the job id").to_string();
+    let id = ack
+        .get("id")
+        .expect("ADD_ACK carries the job id")
+        .to_string();
     assert!(!id.is_empty());
 
     // The job must be visible through the HTTP API too, with its captured request context.
@@ -148,9 +149,9 @@ async fn add_without_a_url_is_rejected_with_an_error_frame() {
     let d = start_daemon().await;
     let mut ws = connect(d.addr).await;
 
-    ws.send(WsMessage::Text(
-        encode_frame(&Message::new(9, msg::ADD).with("bogus", "1")).into(),
-    ))
+    ws.send(WsMessage::Text(encode_frame(
+        &Message::new(9, msg::ADD).with("bogus", "1"),
+    )))
     .await
     .unwrap();
 
@@ -170,7 +171,7 @@ async fn several_frames_in_one_websocket_message_are_all_handled() {
         encode_frame(&Message::new(1, msg::PING)),
         encode_frame(&Message::new(2, msg::PING))
     );
-    ws.send(WsMessage::Text(batched.into())).await.unwrap();
+    ws.send(WsMessage::Text(batched)).await.unwrap();
 
     let a = next_frame(&mut ws).await;
     let b = next_frame(&mut ws).await;
@@ -234,9 +235,9 @@ async fn the_control_page_is_served() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn connect(addr: std::net::SocketAddr) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<TcpStream>,
-> {
+async fn connect(
+    addr: std::net::SocketAddr,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>> {
     let mut req = ws_url(addr).into_client_request().unwrap();
     req.headers_mut().insert(
         "sec-websocket-protocol",

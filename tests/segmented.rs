@@ -5,6 +5,10 @@
 //! produce a corrupt file, that the partial data is reused on the next run, and that a
 //! server without range support still yields correct bytes in single-stream mode.
 
+// Test fixtures are built field-by-field from `Default::default()`, which reads better
+// than a fourteen-field struct literal.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -28,6 +32,8 @@ struct TestServer {
     ranges: Arc<Mutex<Vec<(usize, usize)>>>,
     bytes_served: Arc<AtomicU64>,
     requests: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
     truncate: Arc<AtomicUsize>,
     support_ranges: Arc<AtomicBool>,
 }
@@ -40,18 +46,16 @@ impl TestServer {
     async fn start_with(routes: Vec<(String, Vec<u8>)>) -> Arc<TestServer> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let routes: Arc<HashMap<String, Arc<Vec<u8>>>> = Arc::new(
-            routes
-                .into_iter()
-                .map(|(k, v)| (k, Arc::new(v)))
-                .collect(),
-        );
+        let routes: Arc<HashMap<String, Arc<Vec<u8>>>> =
+            Arc::new(routes.into_iter().map(|(k, v)| (k, Arc::new(v))).collect());
         let srv = Arc::new(TestServer {
             addr,
             routes: routes.clone(),
             ranges: Arc::new(Mutex::new(Vec::new())),
             bytes_served: Arc::new(AtomicU64::new(0)),
             requests: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            peak_in_flight: Arc::new(AtomicUsize::new(0)),
             truncate: Arc::new(AtomicUsize::new(NO_TRUNCATE)),
             support_ranges: Arc::new(AtomicBool::new(true)),
         });
@@ -64,7 +68,18 @@ impl TestServer {
                     Err(_) => break,
                 };
                 let s2 = s.clone();
-                tokio::spawn(async move { serve(sock, s2).await });
+                tokio::spawn(async move {
+                    let mut sock = sock;
+                    // Every response here ends with `Connection: close`, so one accepted
+                    // connection is one in-flight request. The socket is held open until
+                    // after the count is decremented, so the client cannot observe EOF and
+                    // start a replacement while this one is still counted.
+                    let now = s2.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    s2.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+                    serve(&mut sock, s2.clone()).await;
+                    s2.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    drop(sock);
+                });
             }
         });
         srv
@@ -90,9 +105,15 @@ impl TestServer {
         self.requests.load(Ordering::SeqCst)
     }
 
+    /// The most responses that were ever open at the same time.
+    fn peak_in_flight(&self) -> usize {
+        self.peak_in_flight.load(Ordering::SeqCst)
+    }
+
     /// Make range responses deliver only `n` bytes before closing — a flaky-server simulation.
     fn truncate_at(&self, n: Option<usize>) {
-        self.truncate.store(n.unwrap_or(NO_TRUNCATE), Ordering::SeqCst);
+        self.truncate
+            .store(n.unwrap_or(NO_TRUNCATE), Ordering::SeqCst);
     }
 
     fn ignore_ranges(&self) {
@@ -127,7 +148,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-async fn serve(mut sock: TcpStream, srv: Arc<TestServer>) {
+async fn serve(sock: &mut TcpStream, srv: Arc<TestServer>) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -175,7 +196,11 @@ async fn serve(mut sock: TcpStream, srv: Arc<TestServer>) {
     let supports = srv.support_ranges.load(Ordering::SeqCst);
 
     if method == "HEAD" {
-        let ranges_hdr = if supports { "Accept-Ranges: bytes\r\n" } else { "" };
+        let ranges_hdr = if supports {
+            "Accept-Ranges: bytes\r\n"
+        } else {
+            ""
+        };
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
              Content-Length: {total}\r\n{ranges_hdr}ETag: \"Riptide-Test-ETag\"\r\n\
@@ -204,7 +229,11 @@ async fn serve(mut sock: TcpStream, srv: Arc<TestServer>) {
         None => ("HTTP/1.1 200 OK\r\n".to_string(), &body[..], None),
     };
 
-    let ranges_hdr = if supports { "Accept-Ranges: bytes\r\n" } else { "" };
+    let ranges_hdr = if supports {
+        "Accept-Ranges: bytes\r\n"
+    } else {
+        ""
+    };
     let mut resp = status_line;
     resp.push_str("Content-Type: application/octet-stream\r\n");
     resp.push_str(&format!("Content-Length: {}\r\n", slice.len()));
@@ -245,7 +274,12 @@ fn test_config(state_dir: &Path, download_dir: &Path) -> Config {
 }
 
 fn make_job(url: &str, output: &Path, connections: usize, retries: u32) -> Job {
-    let mut job = Job::new("test".into(), url.to_string(), output.to_path_buf(), JobKind::Http);
+    let mut job = Job::new(
+        "test".into(),
+        url.to_string(),
+        output.to_path_buf(),
+        JobKind::Http,
+    );
     job.connections = connections;
     job.min_chunk = 4096;
     job.max_retries = retries;
@@ -327,7 +361,6 @@ async fn a_truncating_server_fails_cleanly_then_the_next_run_resumes() {
     let dir = tempfile::tempdir().unwrap();
     let data = body_of(2 << 20);
     let srv = TestServer::start(data.clone()).await;
-
     let cfg = test_config(&dir.path().join("state"), &dir.path().join("dl"));
     let out = dir.path().join("dl/file.bin");
     let sched = Scheduler::new(cfg).unwrap();
@@ -338,7 +371,10 @@ async fn a_truncating_server_fails_cleanly_then_the_next_run_resumes() {
     let id = job.id.clone();
 
     let first = sched.execute(job).await;
-    assert!(first.is_err(), "a truncating server must not report success");
+    assert!(
+        first.is_err(),
+        "a truncating server must not report success"
+    );
     let stored = sched.store.load(&id).unwrap();
     assert_eq!(stored.state, JobState::Failed);
     assert!(stored.error.is_some());
@@ -359,7 +395,11 @@ async fn a_truncating_server_fails_cleanly_then_the_next_run_resumes() {
     let resumed = sched.store.load(&id).unwrap();
     let finished = sched.execute(resumed).await.unwrap();
     assert_eq!(finished.state, JobState::Done);
-    assert_eq!(std::fs::read(&out).unwrap(), data, "resumed bytes must be correct");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        data,
+        "resumed bytes must be correct"
+    );
 
     let after = srv.bytes_served();
     assert!(
@@ -467,7 +507,10 @@ async fn the_grabber_finds_media_links_and_skips_trackers() {
         ("/movie.mp4".to_string(), body_of(1024)),
         ("/archive.zip".to_string(), body_of(2048)),
         ("/notes.txt".to_string(), b"notes".to_vec()),
-        ("/nested/page.html".to_string(), b"<a href=\"/deep.mp4\">x</a>".to_vec()),
+        (
+            "/nested/page.html".to_string(),
+            b"<a href=\"/deep.mp4\">x</a>".to_vec(),
+        ),
         ("/deep.mp4".to_string(), body_of(512)),
     ])
     .await;
@@ -496,8 +539,14 @@ async fn the_grabber_finds_media_links_and_skips_trackers() {
     .unwrap();
 
     let urls: Vec<&str> = shallow.iter().map(|t| t.url.as_str()).collect();
-    assert!(urls.contains(&srv.url("/movie.mp4").as_str()), "saw {urls:?}");
-    assert!(urls.contains(&srv.url("/archive.zip").as_str()), "saw {urls:?}");
+    assert!(
+        urls.contains(&srv.url("/movie.mp4").as_str()),
+        "saw {urls:?}"
+    );
+    assert!(
+        urls.contains(&srv.url("/archive.zip").as_str()),
+        "saw {urls:?}"
+    );
     assert!(
         !urls.iter().any(|u| u.contains("google-analytics")),
         "trackers must be filtered: {urls:?}"
@@ -527,5 +576,38 @@ async fn the_grabber_finds_media_links_and_skips_trackers() {
     assert!(
         deep_urls.contains(&srv.url("/deep.mp4").as_str()),
         "depth 1 should follow into the nested page: {deep_urls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_per_server_ceiling_caps_parallelism_within_one_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = body_of(2 << 20);
+    let srv = TestServer::start(data.clone()).await;
+
+    let mut cfg = test_config(&dir.path().join("state"), &dir.path().join("dl"));
+    // Ask for eight connections, but let the host accept only two at a time.
+    cfg.per_server_connections = 2;
+    let out = dir.path().join("dl/file.bin");
+    let sched = Scheduler::new(cfg).unwrap();
+    let job = make_job(&srv.file_url(), &out, 8, 3);
+
+    let finished = sched.execute(job).await.unwrap();
+    assert_eq!(finished.state, JobState::Done);
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+
+    let peak = srv.peak_in_flight();
+    assert!(
+        peak <= 2,
+        "the server saw {peak} simultaneous connections; the ceiling was 2"
+    );
+    assert!(
+        srv.requests() >= 4,
+        "the ceiling should throttle requests, not remove them (saw {})",
+        srv.requests()
+    );
+    assert!(
+        peak >= 2,
+        "both allowed slots should be used, so the transfer stays parallel (peak {peak})"
     );
 }

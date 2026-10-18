@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Riptide Integration",
+  "version": "0.1.0",
+  "description": "Hands downloads to the Riptide daemon: parallel connections, resume, HLS/DASH capture.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "downloads",
+    "contextMenus",
+    "storage",
+    "notifications",
+    "cookies",
+    "scripting",
+    "activeTab",
+    "alarms"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Riptide"
+  },
+  "options_ui": {
+    "page": "popup.html#options",
+    "open_in_tab": true
+  }
+}

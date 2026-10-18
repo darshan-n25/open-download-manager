@@ -52,7 +52,7 @@ pub fn sanitize_filename(s: &str) -> String {
 /// Derive a filename from a URL path, percent-decoding as IDM does.
 pub fn filename_from_url(url: &str) -> Option<String> {
     let u = url::Url::parse(url).ok()?;
-    let last = u.path_segments()?.last()?;
+    let last = u.path_segments()?.next_back()?;
     if last.is_empty() {
         return None;
     }
@@ -128,15 +128,27 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// MIME → canonical extension. Ported from the table shipped inside IDM's browser
 /// extension (`Aa` in background.js) and mirrored server-side by IDMFType.dat.
 pub fn extension_from_mime(mime: &str) -> Option<&'static str> {
-    let m = mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase();
+    let m = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
     Some(match m.as_str() {
-        "application/vnd.apple.mpegurl" | "application/x-mpegurl" | "audio/mpegurl"
-        | "audio/x-mpegurl" | "video/mpegurl" | "video/x-mpegurl" | "application/octet-stream-m3u8" => "m3u8",
+        "application/vnd.apple.mpegurl"
+        | "application/x-mpegurl"
+        | "audio/mpegurl"
+        | "audio/x-mpegurl"
+        | "video/mpegurl"
+        | "video/x-mpegurl"
+        | "application/octet-stream-m3u8" => "m3u8",
         "application/dash+xml" | "video/vnd.mpeg.dash.mpd" | "application/f4m+xml" => "mpd",
         "video/mp4" | "video/x-mp4" | "video/mpg4" | "video/x-mpg4" | "audio/mp4" => "mp4",
         "video/mp2t" | "audio/mp2t" => "ts",
         "video/webm" | "audio/webm" => "webm",
-        "video/x-flv" | "video/flv" | "video/x-flash-video" | "flv-application/octet-stream" => "flv",
+        "video/x-flv" | "video/flv" | "video/x-flash-video" | "flv-application/octet-stream" => {
+            "flv"
+        }
         "video/mpeg" | "video/x-mpeg" => "mpg",
         "video/x-msvideo" | "video/avi" | "video/msvideo" => "avi",
         "video/quicktime" => "mov",
@@ -172,7 +184,10 @@ pub fn extension_from_mime(mime: &str) -> Option<&'static str> {
         "image/tiff" => "tif",
         "image/vnd.microsoft.icon" | "image/x-icon" | "image/icon" => "ico",
         "text/css" => "css",
-        "text/javascript" | "application/javascript" | "application/x-javascript" | "text/x-javascript" => "js",
+        "text/javascript"
+        | "application/javascript"
+        | "application/x-javascript"
+        | "text/x-javascript" => "js",
         "text/html" => "html",
         "text/plain" => "txt",
         _ => return None,
@@ -182,14 +197,16 @@ pub fn extension_from_mime(mime: &str) -> Option<&'static str> {
 /// IDM-style download categories, used to auto-sort files into folders.
 pub fn category_for_extension(ext: &str) -> &'static str {
     match ext.to_ascii_lowercase().as_str() {
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "mpg" | "mpeg" | "m4v"
-        | "ts" | "3gp" | "ogv" | "rmvb" | "asf" => "Video",
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "mpg" | "mpeg" | "m4v" | "ts"
+        | "3gp" | "ogv" | "rmvb" | "asf" => "Video",
         "mp3" | "m4a" | "wav" | "wma" | "ogg" | "aac" | "flac" | "opus" => "Audio",
         "zip" | "rar" | "7z" | "gz" | "tar" | "bz2" | "xz" | "iso" | "img" | "z" => "Compressed",
         "exe" | "msi" | "apk" | "deb" | "rpm" | "dmg" | "appimage" => "Programs",
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "epub"
-        | "odt" | "ods" => "Documents",
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "tif" | "tiff" | "avif" => "Images",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "epub" | "odt"
+        | "ods" => "Documents",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "tif" | "tiff" | "avif" => {
+            "Images"
+        }
         "torrent" => "Torrents",
         _ => "General",
     }
@@ -248,17 +265,24 @@ mod tests {
             "report.pdf"
         );
         assert_eq!(
-            filename_from_disposition("attachment; filename*=UTF-8''%E2%82%AC%20rates.pdf").unwrap(),
+            filename_from_disposition("attachment; filename*=UTF-8''%E2%82%AC%20rates.pdf")
+                .unwrap(),
             "€ rates.pdf"
         );
     }
 
     #[test]
     fn mime_mapping_matches_idm_table() {
-        assert_eq!(extension_from_mime("application/vnd.apple.mpegurl"), Some("m3u8"));
+        assert_eq!(
+            extension_from_mime("application/vnd.apple.mpegurl"),
+            Some("m3u8")
+        );
         assert_eq!(extension_from_mime("video/mp2t"), Some("ts"));
         assert_eq!(extension_from_mime("application/dash+xml"), Some("mpd"));
-        assert_eq!(extension_from_mime("video/mp4; charset=binary"), Some("mp4"));
+        assert_eq!(
+            extension_from_mime("video/mp4; charset=binary"),
+            Some("mp4")
+        );
         assert_eq!(extension_from_mime("application/x-nonsense"), None);
     }
 

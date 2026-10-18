@@ -54,9 +54,17 @@ pub mod msg {
     pub const BYE: u32 = 10;
 }
 
-/// The packed version constant the extension sends in its handshake
-/// (`16845059 == 0x01010D03` in the shipped build).
-pub const PROTOCOL_VERSION: u64 = 0x0101_0D03;
+/// The packed version constant the shipped extension sends in its handshake.
+///
+/// Observed literally as the decimal `16845059` in `IDMGCEExt`'s bundled script
+/// (`S(this, 2, 5, 0, [112, 91, 1028:1031, 0, 16845059, clientId, 15, manifestVersion], …)`),
+/// which is `0x01010903`. Riptide accepts any version and only logs a mismatch, so a future
+/// IDM build with a bumped constant still interoperates.
+pub const PROTOCOL_VERSION: u64 = 16845059;
+
+/// Upper bound the daemon accepts for `ADD`'s `connections`. A page cannot talk the daemon
+/// into opening hundreds of sockets.
+pub const MAX_CONNECTIONS_PER_FILE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -93,12 +101,7 @@ impl Message {
 
 fn encode_component(s: &str) -> String {
     use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
-    const SET: &AsciiSet = &CONTROLS
-        .add(b',')
-        .add(b';')
-        .add(b'=')
-        .add(b'#')
-        .add(b'%');
+    const SET: &AsciiSet = &CONTROLS.add(b',').add(b';').add(b'=').add(b'#').add(b'%');
     utf8_percent_encode(s, SET).to_string()
 }
 
@@ -201,11 +204,14 @@ pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
         .ok_or_else(|| RiptideError::other("ADD message has no url"))?
         .to_string();
 
+    // An explicit `kind` wins; otherwise infer it from the URL, so a `.m3u8` handed over by
+    // the browser extension is captured as HLS instead of fetched as an opaque stream.
     let kind = match m.get("kind").unwrap_or("") {
         "hls" => JobKind::Hls,
         "dash" => JobKind::Dash,
         "ftp" => JobKind::Ftp,
-        _ => JobKind::Http,
+        "http" => JobKind::Http,
+        _ => JobKind::guess(&url),
     };
 
     let id = crate::util::gen_id();
@@ -218,7 +224,8 @@ pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
     job.connections = m
         .get("connections")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(cfg.connections);
+        .unwrap_or(cfg.connections)
+        .clamp(1, MAX_CONNECTIONS_PER_FILE);
     // Accepts both a raw byte count and the `2M` shorthand the CLI uses.
     job.speed_limit = m.get("speed_limit").and_then(crate::util::parse_size);
     job.quality = m.get("quality").map(|s| s.to_string());
@@ -236,7 +243,8 @@ pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
     if let Some(extra) = m.get("headers_extra") {
         for line in extra.split('\n') {
             if let Some((k, v)) = line.split_once(':') {
-                ctx.headers.push((k.trim().to_string(), v.trim().to_string()));
+                ctx.headers
+                    .push((k.trim().to_string(), v.trim().to_string()));
             }
         }
     }
@@ -246,7 +254,7 @@ pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
 
 async fn respond(ws: &mut WsStream<'_>, m: Message) -> Result<()> {
     let text = encode_frame(&m);
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(text))
         .await
         .map_err(|e| RiptideError::other(format!("websocket send failed: {e}")))?;
     Ok(())
@@ -254,37 +262,45 @@ async fn respond(ws: &mut WsStream<'_>, m: Message) -> Result<()> {
 
 type WsStream<'a> = tokio_tungstenite::WebSocketStream<&'a mut TcpStream>;
 
-async fn handle_ws(stream: &mut TcpStream, sched: Arc<Scheduler>, peer: std::net::SocketAddr) -> Result<()> {
+async fn handle_ws(
+    stream: &mut TcpStream,
+    sched: Arc<Scheduler>,
+    peer: std::net::SocketAddr,
+) -> Result<()> {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-    let mut ws = tokio_tungstenite::accept_hdr_async(&mut *stream, |req: &Request, mut resp: Response| {
-        let requested = req
-            .headers()
-            .get("sec-websocket-protocol")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let chosen = requested
-            .split(',')
-            .map(|s| s.trim())
-            .find(|p| *p == WS_PROTOCOL)
-            .unwrap_or(WS_PROTOCOL);
-        // Build a static string for the header: the value must live as long as the response.
-        let value = if chosen == WS_PROTOCOL {
-            tokio_tungstenite::tungstenite::http::HeaderValue::from_static(WS_PROTOCOL)
-        } else {
-            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(chosen)
-                .unwrap_or_else(|_| tokio_tungstenite::tungstenite::http::HeaderValue::from_static(WS_PROTOCOL))
-        };
-        resp.headers_mut().insert("sec-websocket-protocol", value);
-        Ok(resp)
-    })
-    .await
-    .map_err(|e| RiptideError::other(format!("websocket handshake failed: {e}")))?;
+    // The handshake callback's error type (`Response<Option<String>>`, from tungstenite) is
+    // a fixed part of the library's signature and is never produced here.
+    #[allow(clippy::result_large_err)]
+    let mut ws =
+        tokio_tungstenite::accept_hdr_async(&mut *stream, |req: &Request, mut resp: Response| {
+            let requested = req
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let chosen = requested
+                .split(',')
+                .map(|s| s.trim())
+                .find(|p| *p == WS_PROTOCOL)
+                .unwrap_or(WS_PROTOCOL);
+            // Build a static string for the header: the value must live as long as the response.
+            let value = if chosen == WS_PROTOCOL {
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_static(WS_PROTOCOL)
+            } else {
+                tokio_tungstenite::tungstenite::http::HeaderValue::from_str(chosen).unwrap_or_else(
+                    |_| tokio_tungstenite::tungstenite::http::HeaderValue::from_static(WS_PROTOCOL),
+                )
+            };
+            resp.headers_mut().insert("sec-websocket-protocol", value);
+            Ok(resp)
+        })
+        .await
+        .map_err(|e| RiptideError::other(format!("websocket handshake failed: {e}")))?;
 
     tracing::info!(%peer, protocol = WS_PROTOCOL, "extension connected");
 
     let mut buffer = String::new();
-    let mut next_id: u64 = 0;
 
     while let Some(incoming) = ws.next().await {
         let incoming = match incoming {
@@ -309,14 +325,27 @@ async fn handle_ws(stream: &mut TcpStream, sched: Arc<Scheduler>, peer: std::net
         buffer = tail;
 
         for frame in frames {
-            next_id += 1;
             match frame.mtype {
                 msg::HELLO => {
+                    // Tolerant on purpose: a mismatch is worth knowing about, but not worth
+                    // refusing to download over.
+                    let theirs = frame
+                        .get("version")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if theirs != PROTOCOL_VERSION {
+                        tracing::debug!(
+                            theirs,
+                            ours = PROTOCOL_VERSION,
+                            "extension protocol version differs; continuing"
+                        );
+                    }
                     let reply = Message::new(frame.id, msg::HELLO_ACK)
                         .with("version", PROTOCOL_VERSION.to_string())
                         .with("protocol", WS_PROTOCOL)
-                        .with("conn", "16")
-                        .with("maxconn", "32")
+                        .with("conn", sched.cfg.connections.to_string())
+                        .with("perconn", sched.cfg.per_server_connections.to_string())
+                        .with("maxconn", MAX_CONNECTIONS_PER_FILE.to_string())
                         .with("hls", "1")
                         .with("dash", "1")
                         .with("ftp", "1")
@@ -335,7 +364,9 @@ async fn handle_ws(stream: &mut TcpStream, sched: Arc<Scheduler>, peer: std::net
                         let log_id = id.clone();
                         tokio::spawn(async move {
                             match handle.await {
-                                Ok(Ok(j)) => tracing::info!(job = %j.id, "queued download finished"),
+                                Ok(Ok(j)) => {
+                                    tracing::info!(job = %j.id, "queued download finished")
+                                }
                                 Ok(Err(e)) => {
                                     tracing::warn!(job = %log_id, error = %e, "queued download failed")
                                 }
@@ -347,7 +378,7 @@ async fn handle_ws(stream: &mut TcpStream, sched: Arc<Scheduler>, peer: std::net
                         let reply = Message::new(frame.id, msg::ADD_ACK)
                             .with("id", id)
                             .with("url", url)
-                            .with("next", next_id.to_string());
+                            .with("next", (frame.id + 1).to_string());
                         respond(&mut ws, reply).await?;
                     }
                     Err(e) => {
@@ -362,7 +393,12 @@ async fn handle_ws(stream: &mut TcpStream, sched: Arc<Scheduler>, peer: std::net
                     let active = jobs.iter().filter(|j| j.state == JobState::Active).count();
                     let queued = jobs
                         .iter()
-                        .filter(|j| matches!(j.state, JobState::Queued | JobState::Scheduled | JobState::Paused))
+                        .filter(|j| {
+                            matches!(
+                                j.state,
+                                JobState::Queued | JobState::Scheduled | JobState::Paused
+                            )
+                        })
                         .count();
                     let reply = Message::new(frame.id, msg::STATUS_ACK)
                         .with("total", jobs.len().to_string())
@@ -401,7 +437,9 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            return Err(RiptideError::Protocol("connection closed before headers".into()));
+            return Err(RiptideError::Protocol(
+                "connection closed before headers".into(),
+            ));
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
@@ -452,9 +490,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 async fn write_response(
@@ -484,11 +520,16 @@ async fn handle_http(stream: &mut TcpStream, sched: Arc<Scheduler>) -> Result<()
 
     match (req.method.as_str(), path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => {
-            write_response(stream, 200, "OK", "text/html; charset=utf-8", INDEX_HTML.as_bytes()).await
+            write_response(
+                stream,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                INDEX_HTML.as_bytes(),
+            )
+            .await
         }
-        ("GET", "/health") => {
-            write_response(stream, 200, "OK", "text/plain", b"ok").await
-        }
+        ("GET", "/health") => write_response(stream, 200, "OK", "text/plain", b"ok").await,
         ("GET", "/api/jobs") => {
             let jobs = sched.store.list().unwrap_or_default();
             let json = serde_json::to_vec_pretty(&jobs).unwrap_or_else(|_| b"[]".to_vec());
@@ -532,13 +573,20 @@ async fn handle_http(stream: &mut TcpStream, sched: Arc<Scheduler>) -> Result<()
                     tokio::spawn(async move {
                         let _ = handle.await;
                     });
-                    let body = serde_json::to_vec(&serde_json::json!({ "id": id, "status": "queued" }))
-                        .unwrap_or_default();
+                    let body =
+                        serde_json::to_vec(&serde_json::json!({ "id": id, "status": "queued" }))
+                            .unwrap_or_default();
                     write_response(stream, 201, "Created", "application/json", &body).await
                 }
                 Err(e) => {
-                    write_response(stream, 400, "Bad Request", "text/plain", e.to_string().as_bytes())
-                        .await
+                    write_response(
+                        stream,
+                        400,
+                        "Bad Request",
+                        "text/plain",
+                        e.to_string().as_bytes(),
+                    )
+                    .await
                 }
             }
         }
@@ -657,9 +705,7 @@ pub async fn serve_on(listener: TcpListener, sched: Arc<Scheduler>) -> Result<()
         protocol = WS_PROTOCOL,
         "daemon listening — browser extension endpoint and JSON API"
     );
-    eprintln!(
-        "Riptide daemon listening on http://{addr}  (WebSocket subprotocol {WS_PROTOCOL})"
-    );
+    eprintln!("Riptide daemon listening on http://{addr}  (WebSocket subprotocol {WS_PROTOCOL})");
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -702,6 +748,41 @@ mod tests {
         assert!(body.contains('%'));
         let (back, _) = parse_frame(&text).unwrap();
         assert_eq!(back.get("cookie"), Some("a=1;b=2,c=3"));
+    }
+
+    /// The browser extension encodes values with `encodeURIComponent`. These are its exact
+    /// outputs (checked against Node), so the two implementations must agree byte for byte.
+    #[test]
+    fn values_encoded_the_way_encodeuricomponent_does_are_decoded_verbatim() {
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "url",
+                "https%3A%2F%2Fh%2Fa%20b%3Fx%3D1%26y%3D2%2Cz%3Bw%23f%25g",
+                "https://h/a b?x=1&y=2,z;w#f%g",
+            ),
+            (
+                "referer",
+                "https%3A%2F%2Fh%2Fp%3Fq%3Da%3Db%26r%3Dc",
+                "https://h/p?q=a=b&r=c",
+            ),
+            ("cookie", "a%3D1%3B%20b%3D2%3B%20c%3D3", "a=1; b=2; c=3"),
+            (
+                "output",
+                "%2Fhome%2Fme%2FMy%20Files%2Fx.iso",
+                "/home/me/My Files/x.iso",
+            ),
+            (
+                "headers_extra",
+                "X-Api-Key%3A%20a%2Cb%3Bc%3Dd%0AX-Other%3A%201",
+                "X-Api-Key: a,b;c=d\nX-Other: 1",
+            ),
+        ];
+        for (key, encoded, want) in cases {
+            let frame = format!("MSG#3#3#0#0,{key}={encoded};");
+            let (m, used) = parse_frame(&frame).expect(&frame);
+            assert_eq!(used, frame.len(), "{frame}");
+            assert_eq!(m.get(key), Some(want), "{frame}");
+        }
     }
 
     #[test]
@@ -770,6 +851,22 @@ mod tests {
     }
 
     #[test]
+    fn a_page_cannot_ask_for_unbounded_connections() {
+        let cfg = Config::default();
+        let ask = |n: &str| {
+            let m = Message::new(1, msg::ADD)
+                .with("url", "https://host/movie.mp4")
+                .with("connections", n);
+            job_from_message(&cfg, &m).unwrap().connections
+        };
+        assert_eq!(ask("4"), 4);
+        assert_eq!(ask("999"), MAX_CONNECTIONS_PER_FILE);
+        // Nonsense and zero fall back to something usable rather than failing.
+        assert_eq!(ask("0"), 1);
+        assert_eq!(ask("many"), cfg.connections);
+    }
+
+    #[test]
     fn add_without_url_is_rejected() {
         let cfg = Config::default();
         let m = Message::new(1, msg::ADD);
@@ -781,20 +878,34 @@ mod tests {
         let cfg = Config::default();
         let m = Message::new(1, msg::ADD).with("url", "https://host/x");
         let job = job_from_message(&cfg, &m).unwrap();
-        assert!(job.output_provisional, "the engine should name it from the response");
+        assert!(
+            job.output_provisional,
+            "the engine should name it from the response"
+        );
     }
 
     #[test]
     fn manifest_kinds_are_recognised() {
         let cfg = Config::default();
-        for (kind, want) in [
-            ("hls", JobKind::Hls),
-            ("dash", JobKind::Dash),
-            ("ftp", JobKind::Ftp),
-            ("", JobKind::Http),
+        for (kind, url, want) in [
+            ("hls", "https://h/x", JobKind::Hls),
+            ("dash", "https://h/x", JobKind::Dash),
+            ("ftp", "https://h/x", JobKind::Ftp),
+            ("http", "https://h/x.m3u8", JobKind::Http),
+            // No explicit kind, so the URL decides.
+            ("", "https://h/x", JobKind::Http),
+            ("", "https://h/live/master.m3u8", JobKind::Hls),
+            ("", "https://h/dash/manifest.mpd", JobKind::Dash),
+            ("", "ftp://h/pub/a.iso", JobKind::Ftp),
         ] {
-            let m = Message::new(1, msg::ADD).with("url", "https://h/x").with("kind", kind);
-            assert_eq!(job_from_message(&cfg, &m).unwrap().kind, want);
+            let m = Message::new(1, msg::ADD)
+                .with("url", url)
+                .with("kind", kind);
+            assert_eq!(
+                job_from_message(&cfg, &m).unwrap().kind,
+                want,
+                "{kind} {url}"
+            );
         }
     }
 

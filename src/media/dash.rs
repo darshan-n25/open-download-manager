@@ -55,7 +55,11 @@ impl Rep {
             .as_deref()
             .map(|m| m.starts_with("audio/"))
             .unwrap_or(false)
-            || self.codecs.as_deref().map(|c| c.starts_with("mp4a") || c.starts_with("opus") || c.starts_with("ac-3")) == Some(true)
+            || self
+                .codecs
+                .as_deref()
+                .map(|c| c.starts_with("mp4a") || c.starts_with("opus") || c.starts_with("ac-3"))
+                == Some(true)
     }
 
     pub fn is_video(&self) -> bool {
@@ -77,7 +81,11 @@ impl Rep {
     /// Expand this representation into concrete segment URLs.
     pub fn segments(&self) -> Result<Vec<MediaSegmentRef>> {
         if let Some(tpl) = &self.media_template {
-            let timescale = if self.timescale == 0 { 1 } else { self.timescale };
+            let timescale = if self.timescale == 0 {
+                1
+            } else {
+                self.timescale
+            };
             let mut out = Vec::new();
             let mut seq = self.start_number.max(1);
 
@@ -127,7 +135,9 @@ impl Rep {
                 )));
             };
             if dur == 0 {
-                return Err(RiptideError::Manifest("SegmentTemplate @duration is zero".into()));
+                return Err(RiptideError::Manifest(
+                    "SegmentTemplate @duration is zero".into(),
+                ));
             }
             let total_ticks = (pd * timescale as f64).ceil() as u64;
             let count = total_ticks.div_ceil(dur);
@@ -168,10 +178,18 @@ impl Rep {
 
     pub fn init_url(&self) -> Option<String> {
         if let Some(tpl) = &self.init_template {
-            let url = subst(tpl, &self.id, self.start_number.max(1), 0, self.bandwidth.unwrap_or(0));
+            let url = subst(
+                tpl,
+                &self.id,
+                self.start_number.max(1),
+                0,
+                self.bandwidth.unwrap_or(0),
+            );
             Some(join(&self.base, &url))
         } else {
-            self.segment_list_init.as_deref().map(|u| join(&self.base, u))
+            self.segment_list_init
+                .as_deref()
+                .map(|u| join(&self.base, u))
         }
     }
 }
@@ -383,8 +401,8 @@ pub fn parse_mpd(xml: &str, manifest_url: &str) -> Result<(Vec<Rep>, Option<f64>
                 let name = local_name(&e);
                 let attrs = attr_map(&e)?;
                 if name == "MPD" {
-                    mpd_duration = get(&attrs, "mediaPresentationDuration")
-                        .and_then(parse_iso_duration);
+                    mpd_duration =
+                        get(&attrs, "mediaPresentationDuration").and_then(parse_iso_duration);
                 }
                 if name == "SegmentTemplate" {
                     // A Start form may carry a SegmentTimeline child.
@@ -413,7 +431,8 @@ pub fn parse_mpd(xml: &str, manifest_url: &str) -> Result<(Vec<Rep>, Option<f64>
                     }
                     "SegmentTemplate" => {
                         if let Some(top) = stack.last_mut() {
-                            top.init_template = get(&attrs, "initialization").map(|s| s.to_string());
+                            top.init_template =
+                                get(&attrs, "initialization").map(|s| s.to_string());
                             top.media_template = get(&attrs, "media").map(|s| s.to_string());
                             top.timescale = get_u64(&attrs, "timescale");
                             top.duration = get_u64(&attrs, "duration");
@@ -422,8 +441,7 @@ pub fn parse_mpd(xml: &str, manifest_url: &str) -> Result<(Vec<Rep>, Option<f64>
                     }
                     "Initialization" => {
                         if let Some(top) = stack.last_mut() {
-                            top.segment_list_init =
-                                get(&attrs, "sourceURL").map(|s| s.to_string());
+                            top.segment_list_init = get(&attrs, "sourceURL").map(|s| s.to_string());
                         }
                     }
                     "SegmentURL" => {
@@ -442,13 +460,7 @@ pub fn parse_mpd(xml: &str, manifest_url: &str) -> Result<(Vec<Rep>, Option<f64>
                         }
                     }
                     "Representation" => {
-                        reps.push(build_rep(
-                            &stack,
-                            &attrs,
-                            None,
-                            &mpd_base,
-                            mpd_duration,
-                        ));
+                        reps.push(build_rep(&stack, &attrs, None, &mpd_base, mpd_duration));
                     }
                     "SegmentList" => {
                         if let Some(top) = stack.last_mut() {
@@ -700,10 +712,15 @@ pub async fn resolve(engine: &mut Engine) -> Result<MediaSpec> {
 
     // With no explicit mime types, fall back to whatever selects to the best resolution.
     let (video, audio) = if video_reps.is_empty() {
-        tracing::warn!("DASH manifest declares no video AdaptationSet; using the best representation");
+        tracing::warn!(
+            "DASH manifest declares no video AdaptationSet; using the best representation"
+        );
         (select(&reps, pref).cloned(), None)
     } else {
-        (select(&video_reps, pref).cloned(), select(&audio_reps, Some("best")).cloned())
+        (
+            select(&video_reps, pref).cloned(),
+            select(&audio_reps, Some("best")).cloned(),
+        )
     };
 
     let video = video.ok_or_else(|| {

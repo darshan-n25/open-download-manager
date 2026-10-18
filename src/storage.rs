@@ -30,6 +30,9 @@ impl Sink {
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
+            // Deliberately *not* truncating: an existing part file may hold bytes from a
+            // previous run, which is exactly what makes resume work.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -53,6 +56,10 @@ impl Sink {
         Ok(self.file.metadata()?.len())
     }
 
+    pub fn is_empty(&self) -> std::io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
     /// Write `buf` at absolute `offset` without disturbing any other writer.
     pub async fn write_at(&self, buf: Bytes, offset: u64) -> std::io::Result<()> {
         if buf.is_empty() {
@@ -61,7 +68,7 @@ impl Sink {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || write_all_at(&file, &buf, offset))
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
     }
 
     /// Shrink the file to exactly `len` (used when the server sent fewer bytes than the
@@ -75,7 +82,7 @@ impl Sink {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || file.sync_all())
             .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
     }
 
     /// Atomically move the completed part file onto its final name.
@@ -170,8 +177,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let part = dir.path().join("x.part");
         let sink = Sink::create(&part, Some(16)).unwrap();
-        sink.write_at(Bytes::from_static(b"hello"), 0).await.unwrap();
-        sink.write_at(Bytes::from_static(b"world"), 8).await.unwrap();
+        sink.write_at(Bytes::from_static(b"hello"), 0)
+            .await
+            .unwrap();
+        sink.write_at(Bytes::from_static(b"world"), 8)
+            .await
+            .unwrap();
         sink.sync().await.unwrap();
         assert_eq!(std::fs::read(&part).unwrap().len(), 16);
 
@@ -189,6 +200,10 @@ mod tests {
         let path = dir.path().join("p.bin");
         std::fs::write(&path, vec![7u8; 100]).unwrap();
         let sink = Sink::create(&path, Some(5)).unwrap();
-        assert_eq!(sink.len().unwrap(), 100, "must never shrink an existing part");
+        assert_eq!(
+            sink.len().unwrap(),
+            100,
+            "must never shrink an existing part"
+        );
     }
 }

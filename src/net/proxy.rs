@@ -71,7 +71,11 @@ fn normalise_url(s: &str) -> String {
 
 fn valid_scheme(s: &str) -> bool {
     matches!(
-        s.split("://").next().unwrap_or("").to_ascii_lowercase().as_str(),
+        s.split("://")
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
         "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h" | "socks"
     )
 }
@@ -118,7 +122,9 @@ pub fn parse_proxy(input: &str) -> Result<ProxySpec> {
     {
         let url = normalise_url(s);
         if !valid_scheme(&url) {
-            return Err(RiptideError::other(format!("unsupported proxy scheme: {s}")));
+            return Err(RiptideError::other(format!(
+                "unsupported proxy scheme: {s}"
+            )));
         }
         return Ok(ProxySpec::Server {
             proxies: vec![url],
@@ -129,7 +135,10 @@ pub fn parse_proxy(input: &str) -> Result<ProxySpec> {
     // Bare host:port form.
     if !s.contains(':') || s.split(':').next().unwrap_or("").parse::<u64>().is_err() {
         if let Some((host, port)) = s.rsplit_once(':') {
-            if port.parse::<u16>().is_ok() && !host.is_empty() && !host.chars().all(|c| c.is_ascii_digit()) {
+            if port.parse::<u16>().is_ok()
+                && !host.is_empty()
+                && !host.chars().all(|c| c.is_ascii_digit())
+            {
                 return Ok(ProxySpec::Server {
                     proxies: vec![format!("http://{s}")],
                     bypass: Vec::new(),
