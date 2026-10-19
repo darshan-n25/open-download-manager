@@ -50,10 +50,11 @@ impl Fixture {
         Fixture { dir, config, home }
     }
 
-    /// The daemon, with its output captured so the stop can be read back.
-    fn daemon(&self, port: u16) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_riptide"))
-            .args(["daemon", "--addr", &format!("127.0.0.1:{port}")])
+    /// Any Riptide command, with the fixture's environment — the isolation the daemon gets
+    /// belongs to every command a service manager might run in its place.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_riptide"));
+        c.args(args)
             .env("RIPTIDE_CONFIG", &self.config)
             .env("HOME", &self.home)
             .env_remove("XDG_DATA_HOME")
@@ -61,7 +62,13 @@ impl Fixture {
             .env_remove("RIPTIDE_DAEMON_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    }
+
+    /// The daemon, with its output captured so the stop can be read back.
+    fn daemon(&self, port: u16) -> Child {
+        self.command(&["daemon", "--addr", &format!("127.0.0.1:{port}")])
             .spawn()
             .expect("the test binary should be runnable")
     }
@@ -388,6 +395,63 @@ fn sigint_still_stops_the_daemon() {
 
     assert_eq!(status.code(), Some(0), "{status:?}\n{stderr}");
     assert!(stderr.contains("interrupted"), "{stderr}");
+}
+
+/// The same stop, for `riptide download` — what a one-shot job runs instead of the daemon: a
+/// Kubernetes `Job`, a `systemd` oneshot unit, a `cron` entry.
+///
+/// The exit code matters as much as it does for the daemon, and for the same reason. A unit
+/// with `Restart=on-failure` restarts when this exits non-zero, so reporting a stop the
+/// supervisor itself asked for as a failure turns a clean shutdown into a restart loop. What
+/// the job leaves behind is a resumable partial, which is the opposite of a failure.
+#[test]
+fn sigterm_stops_a_foreground_download_cleanly() {
+    let f = Fixture::new();
+    let trickle = Trickle::start(64 * 1024 * 1024);
+    let mut download = f
+        .command(&["download", &trickle.url()])
+        .spawn()
+        .expect("the test binary should be runnable");
+
+    trickle.wait_for_traffic();
+    let started = Instant::now();
+    signal(download.id(), "TERM");
+    let status = match wait_for_exit(&mut download, STOP_DEADLINE) {
+        Some(s) => s,
+        None => {
+            download.kill().ok();
+            panic!("the download ignored SIGTERM for {STOP_DEADLINE:?}");
+        }
+    };
+    let took = started.elapsed();
+    let stderr = drain(download.stderr.take());
+
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a stopped download should be a clean exit, not a failure: {status:?}\n{stderr}"
+    );
+    assert!(stderr.contains("SIGTERM"), "{stderr}");
+    assert!(
+        !stderr.contains("failed"),
+        "a stop asked for by a signal must not be reported as a failure: {stderr}"
+    );
+    assert!(took < Duration::from_secs(5), "the stop took {took:?}");
+
+    // And the job is where it was, not gone and not broken.
+    let jobs = f.list();
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the interrupted download should still be in the queue: {jobs:#?}"
+    );
+    let job = &jobs[0];
+    assert_eq!(job["state"], serde_json::json!("paused"), "{job:#?}");
+    let done = job["downloaded"].as_u64().unwrap();
+    assert!(
+        done > 0 && done < trickle.total,
+        "the download should be a partial: {job:#?}"
+    );
 }
 
 /// A stop with nothing running must not sit out the grace period.

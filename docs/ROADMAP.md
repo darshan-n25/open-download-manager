@@ -225,7 +225,7 @@ What is now true, and what is still only *intended*:
 | The Windows code **runs** | **UNVERIFIED** | The whole suite is written into `.github/workflows/ci.yml` for `windows-latest`, and has never executed: the repository has no git remote. No Windows machine, no Wine |
 | macOS, either architecture | **UNVERIFIED** | Same: `macos-latest` job written, `x86_64-apple-darwin` cross-build written, neither run. Metadata-only compilation for both Apple targets passes |
 | A static Linux binary | **OBSERVED for glibc, UNVERIFIED for musl** | `RUSTFLAGS=-C target-feature=+crt-static` + `--target x86_64-unknown-linux-gnu` gives a binary `ldd` calls `statically linked`, and `scripts/check-headless.sh` runs it with nothing else in the filesystem (item 4). The **musl** artefact — the one the image is built from — is still built only in CI, because `musl-gcc` is not installable here |
-| A container image | **UNVERIFIED** (`docker build` never ran) | The Dockerfile, the compose file and the release workflow are written and reviewed; the `image` CI job builds, runs and stops the container. Locally, `scripts/check-headless.sh` checks the claims the image makes — one file, no libc, no `/etc`, no CA bundle, SIGTERM honoured — by reproducing them in a one-file rootfs |
+| A container image | **UNVERIFIED** (`docker build` never ran) | The Dockerfile, the compose file and the release workflow are written and reviewed; the `image` CI job builds, publishes and stops the container. Locally, `scripts/check-headless.sh` checks the claims the image makes — one file, no libc, no `/etc`, no CA bundle, SIGTERM honoured — by reproducing them in a one-file rootfs |
 | The archive names are Windows-legal | **OBSERVED** | Live: a page linking `/NUL`, `/trailing.` and `/COM1.txt` mirrors to `~4eUL`, `trailing~2e`, `~43OM1.txt` with the markup rewritten to match |
 
 So the community’s loudest ask is now answered by architecture *and* by a check that runs on one
@@ -244,7 +244,7 @@ what the verification above turned up.
 | 1 | **Checksum verification** (`--checksum sha256:…`) | ✅ **shipped 2026-10-19** | The cheapest real gap; every neighbouring project lists it and the [survey](COMMUNITY-REQUESTS.md) ranks it second | Small | The temp-then-`rename` path already exists (`storage.rs`), so this is a pre-rename hook: hash the temp file, and on mismatch delete the temp and fail the job. Nothing partially-written ever becomes the output. Support at least `sha256:` and `sha512:`; make it work for `grab`, `project` and the daemon API alike |
 | 2 | **Daemon authentication** | ✅ **shipped 2026-10-19** | The daemon bound `127.0.0.1:1001` with **no** token (`src/config.rs:69`), which was the blocker on every NAS / headless / remote-control request in the survey | Small–medium | A bearer token, compared in constant time, required on every route once set; a `--token-file`/env source so it is not in the process arguments. With a token the daemon can then safely bind off-loopback — with the caveat that the transport is plain HTTP, which the daemon now says out loud |
 | 3 | **Linux + macOS + Windows support, for real** | ✅ **shipped 2026-10-19**, with the CI unrun | The single most-repeated ask; before this, only `x86_64-unknown-linux-gnu` was built and no CI existed (Part 2) | Medium | Delivered: `src/platform.rs` (layout, positional writes, reserved names), both platforms’ layouts tested from either one, seven-target compile check, `.github/workflows/ci.yml` (native `ubuntu`/`macos`/`windows` matrix + three cross checks + a static musl build proven with `ldd`), `.gitattributes` pinning LF. Unexecuted: everything that needs a second machine — this repo has no remote |
-| 4 | **Headless packaging** | ✅ **shipped 2026-10-19** | Static binaries + a container image for drop-in NAS use | Small now that 3 exists | Delivered: SIGTERM handling in the daemon (it had none — `docker stop` killed it mid-write), `deploy/Dockerfile` (Alpine build stage → `scratch`, with `HOME=/data` so state cannot land outside the volume), `deploy/compose.yaml`, `.github/workflows/release.yml` (static musl / aarch64 / macOS ×2 / Windows archives attached to a GitHub Release, plus a multi-arch image pushed to GHCR), an `image` job in CI that builds the image, runs it and stops it, and `scripts/check-headless.sh`, which checks the same claims here by running a static binary inside a **one-file rootfs**. Unexecuted: `docker build` and `docker stop` themselves (no container runtime on this machine) |
+| 4 | **Headless packaging** | ✅ **shipped 2026-10-19, audited** | Static binaries + a container image for drop-in NAS use | Small now that 3 exists | Delivered: SIGTERM handling in the daemon (it had none — `docker stop` killed it mid-write), a signal stop reported as a clean exit by `download`/`grab`/`queue` too rather than as a failure with exit 1 (found by auditing the item afterwards), `deploy/Dockerfile` (Alpine build stage → `scratch`, with `HOME=/data` so state cannot land outside the volume, and a `readelf` static check rather than Alpine's `ldd`), `.dockerignore`, `deploy/compose.yaml`, `.github/workflows/release.yml` (static musl / aarch64 / macOS ×2 / Windows archives attached to a GitHub Release, plus a multi-arch image pushed to GHCR), an `image` job in CI that builds the image, publishes and probes it and then stops it with SIGTERM, and `scripts/check-headless.sh`, which checks the same claims here by running a static binary inside a **one-file rootfs**. Unexecuted: `docker build` and `docker stop` themselves (no container runtime on this machine) |
 | 5 | **BitTorrent as a sibling binary** | planned | The most-requested feature in the whole ecosystem, and IDM lacks it too (verified: no BitTorrent protocol strings in `IDMan.exe`) | Large | A **separate** binary (`riptide-bt`) that shares the queue, state store, quota and scheduler with the HTTP engine — explicitly **not** a mode inside it. Different wire protocol, different peer model, different failure modes; folding it into the HTTP engine would put both at risk |
 | 6 | **MPEG-TS remux hardening** | ✅ **shipped 2026-10-19** | Found during this verification: a *present but broken* ffmpeg fails the job instead of falling back (§Claim 2) | Small | On any ffmpeg failure in `publish_single`/`mux`, fall back to the same keep-`.ts` copy used when ffmpeg is absent, and say so in the warning. Keep the raw track in every case |
 | 7 | **Verify the TS path against a working ffmpeg** | ◐ **partly covered 2026-10-19** | The path has still never run end to end; the available build crashes on MPEG-TS input | Small | Either a working ffmpeg on the test host, or an `#[ignore]`d test gated on `find_ffmpeg()` plus a real TS fixture, so a host with a good ffmpeg covers it and a host without does not silently skip |
@@ -412,10 +412,11 @@ hoping is not enough.
 `node --test`, and an `x86_64-apple-darwin` cross-build from the arm64 macOS runner), `cross`
 (`cargo check --all-targets` for musl, aarch64-linux-gnu and windows-gnu, each with `CC_<target>`
 and a linker set), `static` (a release musl binary, `file`d, `ldd`ed to prove it is static, run
-once, uploaded), `image` (item 4: build the Dockerfile, run the container, probe `/health`, stop
-it with SIGTERM and assert the exit code is 0, then run `scripts/check-headless.sh`), and
-`portability` (the script above). `.gitattributes` pins checkouts to LF so a Windows clone is
-byte-identical.
+once, uploaded), `image` (item 4: build the Dockerfile, publish its port the way the compose file
+does, serve `/health` and `/` from the container, stop it with SIGTERM, and assert the exit code
+is 0 *and* that the log names the signal and the finished shutdown, then run
+`scripts/check-headless.sh`), and `portability` (the script above). `.gitattributes` pins
+checkouts to LF so a Windows clone is byte-identical.
 
 The honest caveat, repeated because it is the whole point: **that workflow has never run.** This
 repository has no remote. Everything above that is tagged OBSERVED was run here; the workflow is
@@ -478,9 +479,12 @@ with no token; reaching it from the network means changing the publish rule **an
 aarch64-glibc Linux, both macOS architectures, Windows MSVC; proves each Linux archive is static
 with `ldd` before it is published; attaches the archives to a GitHub Release with generated
 notes; and builds a multi-arch image to `ghcr.io`. The `image` job in `ci.yml` builds the
-Dockerfile on every commit, runs the container, probes `/health`, and stops it with `docker stop`
-— then asserts the container's exit code is 0, which is the one thing a `scratch` image cannot be
-inspected for after the fact.
+Dockerfile on every commit, starts the container with the port published the way the compose
+file publishes it, checks that `/health` **and** the control page answer, and stops it with
+`docker stop` — then asserts that the exit code is 0 and that the log names both the signal and
+the completed shutdown. The log assertions are what make it a test of *this* behaviour rather
+than of the container having exited: a scratch image can be inspected afterwards only through
+its exit code and its output.
 
 **What was checked, and how, on a machine with no container runtime.** `scripts/check-headless.sh`
 builds a fully static binary (`crt-static`, glibc) and runs it inside a rootfs that contains
@@ -538,6 +542,50 @@ Unit-level, `src/scheduler.rs` gained two: an idle scheduler reports idle immedi
 scheduler with a unit of work registers a waiter that is woken by the work ending rather than by
 the deadline — with the notification raised in a way that would be missed if the waiter were
 registered after the count was read.
+
+#### Audited afterwards, and what the audit changed
+
+Re-reading the item against its own claim — "a stop is a clean exit, not a failure" — turned up
+three things, all fixed before moving on.
+
+1. **A signalled job was still counted as a failure by the commands that are not the daemon.**
+   `cmd_download`, `cmd_grab` and `cmd_queue` each matched `Ok(Err(e))` and incremented their
+   `failed` counter, so `riptide download` and `riptide grab --download` printed `failed:
+   cancelled` and **exited 1**, and `riptide queue` printed `1 job(s) failed`. Nothing was lost —
+   the engine had already recorded the job as `Paused` — but the exit code is what a supervisor
+   reads, and `Restart=on-failure` restarts on it. A one-shot download under `systemd`, `cron` or
+   a Kubernetes `Job` would therefore restart the unit on every stop it had asked for itself.
+   The three commands now classify a job by what the engine *stored* (`Paused`, and not for
+   quota) rather than by the fact that it returned an error, report it as `stopped`, keep it out
+   of the failure count, and exit 0. `queue`'s requirement — "paused by the quota" — already
+   worked this way; the rule was simply not applied to cancellation. A fourth test in
+   `tests/shutdown.rs` sends SIGTERM to a foreground `riptide download`, which is the shape a
+   one-shot job has, and asserts the exit code, the absence of the word `failed`, and that the
+   job is a resumable partial.
+
+2. **The Dockerfile's static check was `ldd`.** `RUN ldd target/release/riptide | grep -qE 'not
+   a dynamic executable|statically linked'` was written from glibc's wording. The build stage is
+   Alpine, whose `ldd` is a separate program with its own wording for a static binary, and the
+   check is a guard on a `scratch` image: if it passes for the wrong reason the image ships an
+   entrypoint that cannot start, and if it fails for the wrong reason the build is red for no
+   reason. It is now `readelf --program-headers`, where the question is whether a `PT_INTERP`
+   segment exists — the same answer from any libc, and `binutils` is now named in `apk add`
+   rather than assumed to arrive with `gcc`.
+
+3. **There was no `.dockerignore`.** The build context is the repository root and the Dockerfile
+   compiles in the image, so nothing but `Cargo.toml`, `Cargo.lock` and `src/` is read — but
+   without that file `docker build .` sends the whole working tree to the daemon first, and on a
+   developer's machine `target/` alone is several gigabytes. CI never noticed because a fresh
+   checkout has no `target/`. Docker does not read `.gitignore`, so the two are separate files
+   and say so.
+
+Also corrected in the documents rather than the code: the daemon's SIGTERM handler is not merely
+convenient in a container, it is the **only** reason `docker stop` works there. A container's
+PID 1 has default-action signals discarded — the kernel does not deliver them to init in a PID
+namespace — so before this change `docker stop` would have been ignored and the container
+SIGKILLed when the timeout expired, not merely killed mid-write as the first draft of these
+notes said. That is the difference between a five-second stop that saves a queue and a ten-second
+timeout followed by a kill.
 
 ### Item 6 — what shipped
 
@@ -814,7 +862,20 @@ ldd target/x86_64-unknown-linux-gnu/release/riptide
 cargo test --test shutdown
 #   sigterm_stops_the_daemon_cleanly_mid_download ... ok
 #   sigint_still_stops_the_daemon ... ok
+#   sigterm_stops_a_foreground_download_cleanly ... ok
 #   a_stop_with_an_idle_queue_is_immediate ... ok
+
+# By hand, the same thing for the commands a one-shot job runs: a stop is a stop, not a failure
+# and not exit 1. Both leave the job `paused` and resumable.
+python3 tests/origin.py 8099 /tmp/big-root --slow &      # a range-capable, slow origin
+riptide download http://127.0.0.1:8099/big.bin & kill -TERM %1
+#   …: stopped — resume with `riptide queue`
+#   1 download(s) stopped before finishing; run `riptide queue` to resume
+#   exit 0        (it used to print `failed: cancelled` and exit 1)
+riptide queue & kill -TERM %1
+#   big.bin: stopped
+#   1 job(s) stopped before finishing; run `riptide queue` again to resume
+#   exit 0        (it used to print `1 job(s) failed`)
 
 # The two halves of the drain mechanism, at unit level.
 cargo test scheduler::

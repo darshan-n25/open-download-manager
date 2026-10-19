@@ -157,7 +157,7 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | GUI with per-download properties | **Refused/Partial** | CLI + a small HTML control page on the daemon (`GET /`) | No desktop GUI. The daemon also serves a JSON API so a GUI could be written against it later. |
 | Windows shell integration (context menu, IE plugin) | **Absent** | — | Deliberately no OS integration: the CLI, the extension and the daemon’s HTTP API are the interfaces. |
 | Runs only on Windows | **Done, and wider** | `src/platform.rs` | Linux, macOS and Windows from one codebase: per-platform config/state/download directories, one shared positional-write path, and archive names that are valid on Windows too. Compiled for seven targets from one machine; the native Windows/macOS test runs exist in CI and have not executed (no remote). |
-| Headless operation, for a NAS or a server `[ABSENT]` — IDM has no daemon and no headless mode; the nearest thing is a scheduler that can shut the machine down when the queue drains | **Done** | `deploy/Dockerfile`, `deploy/compose.yaml`, `riptide daemon`, `project tick` | A `scratch` image holding one static binary: no libc, no shell, no package manager, no CA bundle. `docker stop` (SIGTERM) is handled — jobs stop at a chunk boundary, record themselves `paused`, and the process exits 0 — where before this it had no shutdown path at all and died mid-write. The interface is the JSON API and the optional extension, not a GUI. See [README §Headless](../README.md#headless-and-containers). |
+| Headless operation, for a NAS or a server `[ABSENT]` — IDM has no daemon and no headless mode; the nearest thing is a scheduler that can shut the machine down when the queue drains | **Done** | `deploy/Dockerfile`, `deploy/compose.yaml`, `riptide daemon`, `project tick` | A `scratch` image holding one static binary: no libc, no shell, no package manager, no CA bundle. `docker stop` (SIGTERM) is handled — jobs stop at a chunk boundary, record themselves `paused`, and the process exits 0 — where before this it had no shutdown path at all and died mid-write; in a container the handler is load-bearing, because a PID-namespace init has default-action signals discarded. `download`, `grab --download` and `queue` treat the same signal the same way, so a `Restart=on-failure` unit does not restart on a stop it asked for. The interface is the JSON API and the optional extension, not a GUI. See [README §Headless](../README.md#headless-and-containers). |
 | `.torrent` downloads | **Done** (as a file) | nothing special needed | IDM contains **no** BitTorrent protocol strings (0 hits); it only downloads the `.torrent` file. Riptide matches that. |
 | Torrent/BitTorrent client | **Absent — and so is IDM's** | — | Recorded here because it is the most common misconception about IDM. |
 
@@ -174,8 +174,12 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
   handed back to the browser on failure.
 - **A deployment shape that is one file.** The daemon stops cleanly on SIGTERM — the signal a
   service manager sends — so it can be a container or a unit rather than a thing in a terminal.
-  IDM is a Windows GUI program with no headless mode and, as far as the binary shows, no service
-  mode either.
+  As a container's PID 1 that handler is not a courtesy: a default-action signal is not delivered
+  to init in a PID namespace, so without it `docker stop` would be ignored until the timeout
+  expired and SIGKILL arrived. The same rule holds for `riptide download`, `grab --download` and
+  `queue`, which a one-shot job runs instead of the daemon: they leave the job `paused`, report it
+  as stopped rather than failed, and exit 0. IDM is a Windows GUI program with no headless mode
+  and, as far as the binary shows, no service mode either.
 - **Cross-platform.** IDM is Windows-only.
 
 ## 12. IDM's own feature list, checked line by line
@@ -244,7 +248,7 @@ gaps; the third is answered by construction.
 
 ## 13. What "tested" means here
 
-`cargo test` runs 336 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 15
+`cargo test` runs 337 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 15
 more against the extension's framing. The distinction that matters in this document:
 
 - **Unit tests** prove an algorithm in isolation (parsers, KDFs, the segment table, the
@@ -260,10 +264,12 @@ more against the extension's framing. The distinction that matters in this docum
   executed: this repository has no remote.
 - **Protocol tests** (`tests/daemon.rs`) drive the daemon over a real WebSocket and its JSON API.
 - **Signal tests** (`tests/shutdown.rs`) start the *built binary* as a process, start a
-  dribbling origin behind it, and send it a real SIGTERM (and SIGINT, as a control). What they
-  assert is a property of the process, not of a function: exit **0** with a line naming the
-  signal, a job left on disk as `paused` with some bytes but not all of them, and no waiting at
-  all when the queue is idle.
+  dribbling origin behind it, and send it a real SIGTERM (and SIGINT, as a control) — to the
+  daemon, and to a foreground `riptide download`, which is what a one-shot job runs instead.
+  What they assert is a property of the process, not of a function: exit **0** with a line
+  naming the signal, a job left on disk as `paused` with some bytes but not all of them, no
+  waiting at all when the queue is idle, and no report of a **failure** for a stop that was
+  asked for.
 - **End-to-end tests** (`tests/segmented.rs`, `tests/projects.rs`, `tests/archive.rs`,
   `tests/checksum.rs`) stand up
   real HTTP servers that really do byte ranges and conditional requests, and check the bytes on
@@ -306,7 +312,9 @@ more against the extension's framing. The distinction that matters in this docum
   exiting **0** and leaving the job `paused` at 2070976 of 12582912 bytes). What that cannot
   check is the image itself: there is no `docker`, `podman`, `buildah` or `containerd` on this
   machine, so `docker build` and `docker stop` are written into CI and have never run — and the
-  static binary it checks is glibc, not the musl one the Dockerfile produces.
+  static binary it checks is glibc, not the musl one the Dockerfile produces. The Dockerfile's
+  own static check is `readelf` for that reason: "is there a `PT_INTERP` segment" is answered the
+  same way by any libc, where Alpine's `ldd` wording could not be compared against this host's.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
 Windows host, a PAC file, an FTPS server, a Windows or macOS machine (the Windows-only branches

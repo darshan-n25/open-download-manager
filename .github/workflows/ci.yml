@@ -184,19 +184,48 @@ jobs:
 
       - name: Run it, then stop it the way Docker does
         run: |
-          docker run --detach --name riptide --network host riptide:ci
+          # Published the way the compose file publishes it, rather than with `--network
+          # host`: this is the path a user takes, and the daemon still binds 0.0.0.0 inside
+          # the container, which is the part the image is responsible for.
+          docker run --detach --name riptide --publish 127.0.0.1:1001:1001 riptide:ci
+
+          # Wait for it, then check the whole router and not just the route that proves
+          # liveness: `/` is the control page a person opens.
+          up=no
           for _ in $(seq 1 60); do
-            curl -sf http://127.0.0.1:1001/health && break
+            if curl -sf -o /dev/null http://127.0.0.1:1001/health; then up=yes; break; fi
             sleep 0.5
           done
-          curl -sf http://127.0.0.1:1001/health
-          echo
+          if [ "$up" != yes ]; then
+            echo "::error::the daemon never answered /health"
+            docker logs riptide
+            exit 1
+          fi
+          curl -sf -o /dev/null http://127.0.0.1:1001/ || {
+            echo "::error::the control page did not answer"
+            docker logs riptide
+            exit 1
+          }
+          echo "serving: /health and / both 200"
+
           # `docker stop` sends SIGTERM and allows ten seconds. The container should exit 0
-          # rather than 143: a process killed by the signal has no exit code at all.
+          # rather than 137 (SIGKILL after the timeout) or 143: a process killed by the
+          # signal has no exit code at all. As PID 1 the daemon would have the signal
+          # *discarded* if it had no handler — a default-action signal is not delivered to
+          # init in a PID namespace — so this also proves the handler is installed.
           docker stop --time 15 riptide
           code=$(docker inspect --format '{{.State.ExitCode}}' riptide)
-          docker logs riptide
+          logs=$(docker logs riptide 2>&1)
+          printf '%s\n' "$logs"
           test "$code" = 0 || { echo "::error::the container exited $code, not 0"; exit 1; }
+          case "$logs" in
+            *SIGTERM*) ;;
+            *) echo "::error::the daemon did not report the signal that stopped it"; exit 1 ;;
+          esac
+          case "$logs" in
+            *stopped*) ;;
+            *) echo "::error::the daemon did not finish its shutdown"; exit 1 ;;
+          esac
 
       - uses: dtolnay/rust-toolchain@stable
 

@@ -73,7 +73,7 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 336 tests: unit + protocol + end-to-end
+cargo test         # 337 tests: unit + protocol + end-to-end
 ```
 
 On Windows the binary is the same program; only the directory it keeps its files in changes.
@@ -158,10 +158,24 @@ requires it on every route, `/health` and the control page included.
 **Stopping is a signal, not a kill.** `docker stop`, `systemctl stop` and `kubectl delete` all
 send SIGTERM. Riptide handles it: running jobs stop at the next chunk boundary, record themselves
 as `paused` with the bytes they do have, and the process exits **0** instead of dying by signal
-(which is what an orchestrator reports as a crash). The stop waits up to five seconds for that
-saving and then reports by name anything still going, so a wedged connection cannot hold
-`docker stop` open until it escalates. `stop_grace_period` / `TimeoutStopSec` should therefore
-exceed five seconds — the compose file sets fifteen.
+(which is what an orchestrator reports as a crash). In a container that handler is not a nicety
+but the whole mechanism: a container's PID 1 has signals with default actions *discarded* — the
+kernel does not deliver them to init in a PID namespace — so without a handler `docker stop`
+would send SIGTERM, have it ignored, wait out its timeout and then SIGKILL.
+
+The same rule applies to the commands a one-shot job runs instead of the daemon. `riptide
+download`, `riptide grab --download` and `riptide queue` all handle the signal, leave the job
+`paused`, and exit **0**: a unit with `Restart=on-failure` must not be restarted for a stop it
+asked for itself. They report the affected jobs as `stopped`, never as `failed` — a failure is a
+404 or a checksum mismatch, and the message says which it is.
+
+The stop waits up to five seconds for that saving and then reports by name anything still going,
+so a wedged connection cannot hold `docker stop` open until it escalates. `stop_grace_period` /
+`TimeoutStopSec` should therefore exceed five seconds — the compose file sets fifteen. A
+[crawling project](#recurring-projects) is the one thing that can still be cut short: it stops at
+the file boundary it has reached, and because a file is only published by an atomic rename and
+the validators are written at the end of a run, an interrupted crawl re-fetches what it had not
+finished rather than mistaking a truncated file for a current one.
 
 ```ini
 # ~/.config/systemd/user/riptide.service
@@ -198,12 +212,14 @@ daemon's address. Nothing else about the daemon changes in a container — `cron
 **What has and has not been executed.** There is no container runtime on the machine this was
 written on — no `docker`, `podman`, `buildah` or `containerd` — so `docker build` has never run
 here, and neither has `docker stop`. Two things stand in: the `image` job in
-`.github/workflows/ci.yml` builds the Dockerfile, runs the container and stops it with SIGTERM
-(then asserts the exit code is 0), and
-[`scripts/check-headless.sh`](scripts/check-headless.sh) checks the same claims on the host at
-hand, by building the same kind of binary — a fully static one — and running it inside a rootfs
-that holds exactly what the image holds, one file, with an unprivileged user namespace standing
-in for the chroot. It is what the claims above rest on:
+`.github/workflows/ci.yml` builds the Dockerfile, publishes its port the way the compose file
+does, checks that `/health` and the control page answer, stops the container with SIGTERM, and
+asserts three things about the result — the exit code is 0, and the log names both the signal
+and the completed shutdown. The byte-level claims are checked on the host at hand by
+[`scripts/check-headless.sh`](scripts/check-headless.sh), which builds the same kind of binary —
+a fully static one — and runs it inside a rootfs that holds exactly what the image holds, one
+file, with an unprivileged user namespace standing in for the chroot. It is what the claims
+above rest on:
 
 ```
 $ ./scripts/check-headless.sh
@@ -555,10 +571,17 @@ and ranks what to build next. The ranking, in short:
    never done: `docker stop` and `systemctl stop` used to kill it mid-write. It now stops at a
    chunk boundary, waits up to five seconds for running jobs to save themselves as `paused`, and
    exits 0. Around that: a `scratch` image with no libc, shell or CA bundle
-   ([`deploy/Dockerfile`](deploy/Dockerfile)), a compose file that publishes on host loopback
+   ([`deploy/Dockerfile`](deploy/Dockerfile)), a `.dockerignore` so the three-gigabyte
+   `target/` never enters the build context, a compose file that publishes on host loopback
    unless you also set a token, a release workflow that attaches static musl / glibc / macOS /
-   Windows archives and pushes the image to GHCR, and a CI job that builds the image, runs it and
-   stops it. See [Headless and containers](#headless-and-containers).
+   Windows archives and pushes the image to GHCR, and a CI job that builds the image, serves
+   `/health` and `/` from it, stops it with SIGTERM and checks both the exit code and the log.
+   Auditing the item afterwards turned up two things it had not covered, both fixed here: a
+   stop asked for by a signal was still reported as a **failure** by `riptide download`,
+   `riptide grab --download` and `riptide queue` — the first two exited 1 as well, so a unit
+   with `Restart=on-failure` would restart on a stop it had asked for itself — and the
+   Dockerfile's static check used Alpine's `ldd`, whose output for a static binary is not
+   glibc's. See [Headless and containers](#headless-and-containers).
 
 **Still to build, in the order the roadmap ranks them:**
 
@@ -654,6 +677,13 @@ against this implementation (§12 there). The short version:
   container runtime at all. The `image` job in CI and `scripts/check-headless.sh` are what stand
   in for it — the latter runs a *glibc* static build rather than the musl one the Dockerfile
   produces, which is the same claim (no interpreter, no shared libraries) from a different libc.
+  For the same reason the Dockerfile's own static check is `readelf` — the interpreter segment is
+  present or it is not, whatever the libc — rather than Alpine's `ldd`, whose wording for a static
+  binary differs from glibc's and cannot be compared against anything on this host.
+- **The crawl in a stop is cut at the grace deadline, not at a file boundary.** For a [site
+  project](#recurring-projects) the daemon exits after five seconds wherever the crawl has got to;
+  the files already renamed are kept and the run's validators are not written, so the next run
+  re-fetches what is missing instead of believing a truncated file.
 - **Nothing is remuxed inside the image.** `ffmpeg` is not installed, so an MPEG-TS capture keeps
   the raw `.ts` there. Bake `ffmpeg` into a derived image if you need the remux.
 - **No healthcheck, and no shell to write one in.** Probing `/health` is the orchestrator's job.
@@ -774,19 +804,21 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 336 tests
+cargo test                              # Rust: 337 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 15 tests
 ./scripts/check-portability.sh          # the platform module, for all 7 targets
 ./scripts/check-headless.sh             # the static binary alone in a one-file rootfs
 ```
 
-336 Rust tests: 268 unit tests across every module, 17 daemon-protocol tests driving a real
+337 Rust tests: 268 unit tests across every module, 17 daemon-protocol tests driving a real
 WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
 which really does byte ranges, 6 that stand up a mock `Negotiate` server, 6 that verify
 checksums end-to-end against a real HTTP server, 17 that stand up a server which really
 honours `If-None-Match` and `Range`, 10 that archive a small site and then read their own
-output back to check that every rewritten reference resolves, and 3 that start the released
-**binary**, send it a real signal, and check what it does about it.
+output back to check that every rewritten reference resolves, and 4 that start the released
+**binary**, send it a real signal, and check what it does about it — three to the daemon
+(SIGTERM mid-download, SIGINT, an idle stop that must not wait) and one to a foreground
+`riptide download`.
 
 The end-to-end ones assert that
 
@@ -863,9 +895,12 @@ binary, send it **SIGTERM** (and, as a control, SIGINT) while a trickling origin
 and assert that the process exits **0** with a line saying what stopped it — a signal death has
 no exit code, which is what an orchestrator reports as a crash — that the interrupted job is on
 disk as `paused` with some bytes but not all of them, and that an idle daemon stops *immediately*
-rather than sitting out its five-second grace. The unit tests around them pin the two halves of
-that: an idle scheduler reports idle at once, and a scheduler with work registers a waiter that is
-woken by the work ending rather than by the deadline.
+rather than sitting out its five-second grace. One of the four signals a foreground `riptide
+download` instead of the daemon, which is the shape a one-shot job has, and asserts additionally
+that nothing in the output calls the stop a failure: that command used to exit 1 for it, so a
+`Restart=on-failure` unit would have restarted on every stop it asked for itself. The unit tests
+around them pin the two halves of that: an idle scheduler reports idle at once, and a scheduler
+with work registers a waiter that is woken by the work ending rather than by the deadline.
 
 A third group is about the *other* platform. The layout resolver is fed a literal environment
 so the Windows answers — `%LOCALAPPDATA%` for state, `%APPDATA%` for config, `%HOMEDRIVE%` joined

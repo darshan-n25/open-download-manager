@@ -17,9 +17,9 @@
 FROM rust:1-alpine AS build
 
 # `ring` (through rustls) compiles C and assembly, so the build needs a C compiler and the
-# musl headers. Nothing else: no pkg-config, no OpenSSL, because TLS is rustls and its trust
-# roots are compiled in.
-RUN apk add --no-cache musl-dev gcc make
+# musl headers; `binutils` is for the `readelf` check below. Nothing else: no pkg-config, no
+# OpenSSL, because TLS is rustls and its trust roots are compiled in.
+RUN apk add --no-cache musl-dev gcc make binutils
 
 WORKDIR /src
 
@@ -32,9 +32,16 @@ COPY src ./src
 # the registry has today. `tests/` is deliberately absent: nothing here runs them.
 RUN cargo build --release --locked --bin riptide
 
-# Fail the build rather than publish an image whose entrypoint cannot start. `ldd` on a
-# static binary says there is no interpreter to find.
-RUN ldd target/release/riptide 2>&1 | grep -qE 'not a dynamic executable|statically linked'
+# Fail the build rather than publish an image whose entrypoint cannot start. The runtime
+# stage is `scratch`, which has no loader at all, so a binary carrying a `PT_INTERP` segment
+# would be unrunnable: `readelf` says whether one is there. It is checked with `readelf`
+# rather than the more familiar `ldd` because Alpine's `ldd` is a separate program whose
+# wording on a static binary is not glibc's, and a check that looks for the wrong words
+# passes — or fails — for the wrong reason.
+RUN if readelf --program-headers target/release/riptide | grep -q INTERP; then \
+      echo "riptide needs a dynamic loader, which a scratch image does not have" >&2; \
+      exit 1; \
+    fi
 RUN target/release/riptide --version
 
 # -- runtime -----------------------------------------------------------------

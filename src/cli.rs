@@ -686,12 +686,14 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
     let mut handles = Vec::new();
     for job in jobs {
         let label = job.display_name();
+        let id = job.id.clone();
         let reporter = reporter(label.clone(), quiet);
-        handles.push((label, sched.spawn_with(job, reporter)));
+        handles.push((id, label, sched.spawn_with(job, reporter)));
     }
 
     let mut failed = 0usize;
-    for (label, h) in handles {
+    let mut stopped = 0usize;
+    for (id, label, h) in handles {
         match h.await {
             Ok(Ok(job)) => {
                 if quiet {
@@ -701,8 +703,15 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
                 }
             }
             Ok(Err(e)) => {
-                failed += 1;
-                eprintln!("{}: failed: {e}", label);
+                // A stop asked for by a signal is not a failure: the process did what it
+                // was told and left a resumable partial, so it exits 0.
+                if stopped_not_failed(&sched, &id) {
+                    stopped += 1;
+                    eprintln!("{}: stopped — resume with `riptide queue`", label);
+                } else {
+                    failed += 1;
+                    eprintln!("{}: failed: {e}", label);
+                }
             }
             Err(e) => {
                 failed += 1;
@@ -712,12 +721,31 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
     }
     signals.abort();
 
+    if stopped > 0 && !quiet {
+        eprintln!("{stopped} download(s) stopped before finishing; run `riptide queue` to resume");
+    }
     if failed > 0 {
         return Err(RiptideError::other(format!(
             "{failed} of the requested downloads did not complete"
         )));
     }
     Ok(())
+}
+
+/// Whether a job that came back with an error was *stopped* rather than broken.
+///
+/// The engine records a signalled job as `Paused` — the part file is intact and `riptide
+/// queue` resumes it — and a real error as `Failed`. Counting the first as a failure is what
+/// makes a supervisor's own `SIGTERM` look like a crash to the supervisor: a `systemd` unit
+/// with `Restart=on-failure`, or a Kubernetes job, would restart or page on a stop it asked
+/// for itself. The stored record is the authority, and the engine has already written it by
+/// the time the handle resolves.
+fn stopped_not_failed(sched: &Scheduler, id: &str) -> bool {
+    sched
+        .store
+        .load(id)
+        .map(|j| j.state == JobState::Paused && !j.quota_paused)
+        .unwrap_or(false)
 }
 
 /// Set `stop` when the process is asked to quit — Ctrl-C always, and on Unix a SIGTERM too.
@@ -1010,16 +1038,27 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
         job.kind = kind;
         sched.store.save(&job)?;
         let label = job.display_name();
-        handles.push((label.clone(), sched.spawn_with(job, reporter(label, quiet))));
+        let id = job.id.clone();
+        handles.push((
+            id,
+            label.clone(),
+            sched.spawn_with(job, reporter(label, quiet)),
+        ));
     }
 
     let mut failed = 0usize;
-    for (label, h) in handles {
+    let mut stopped = 0usize;
+    for (id, label, h) in handles {
         match h.await {
             Ok(Ok(job)) => println!("{} → {}", label, job.output.display()),
             Ok(Err(e)) => {
-                failed += 1;
-                eprintln!("{label}: failed: {e}");
+                if stopped_not_failed(&sched, &id) {
+                    stopped += 1;
+                    eprintln!("{label}: stopped");
+                } else {
+                    failed += 1;
+                    eprintln!("{label}: failed: {e}");
+                }
             }
             Err(e) => {
                 failed += 1;
@@ -1028,6 +1067,9 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
         }
     }
     signals.abort();
+    if stopped > 0 {
+        eprintln!("{stopped} download(s) stopped before finishing; run `riptide queue` to resume");
+    }
     if failed > 0 {
         return Err(RiptideError::other(format!("{failed} download(s) failed")));
     }
@@ -1330,6 +1372,7 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
 
     let mut failed = 0usize;
     let mut quota_paused = 0usize;
+    let mut stopped = 0usize;
     for (id, label, h) in handles {
         let outcome = h.await;
         // The engine persists the outcome before the handle resolves, so the stored job is
@@ -1339,6 +1382,7 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
             .load(&id)
             .map(|j| j.quota_paused)
             .unwrap_or(false);
+        let was_stopped = stopped_not_failed(&sched, &id);
         match outcome {
             Ok(Ok(job)) => println!("{} → {}", label, job.output.display()),
             Ok(Err(e)) => {
@@ -1346,6 +1390,10 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
                     // Paused, not failed: it resumes on its own in a later window.
                     quota_paused += 1;
                     eprintln!("{label}: paused — {e}");
+                } else if was_stopped {
+                    // Asked to stop by a signal; the bytes already fetched are kept.
+                    stopped += 1;
+                    eprintln!("{label}: stopped");
                 } else {
                     failed += 1;
                     eprintln!("{label}: failed: {e}");
@@ -1361,6 +1409,9 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
 
     if sched.quota.limit_bytes().is_some() {
         println!("download quota: {}", sched.quota.describe());
+    }
+    if stopped > 0 {
+        println!("{stopped} job(s) stopped before finishing; run `riptide queue` again to resume");
     }
     if quota_paused > 0 {
         println!(
