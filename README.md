@@ -291,7 +291,7 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 
 | Ask | Where it comes from | Riptide |
 | --- | --- | --- |
-| Run on macOS/Linux/Android at all | IDM's own FAQ confirms Windows-only; the loudest theme in Linux/macOS threads | Answered by construction: native binaries, no Wine |
+| Run on macOS/Linux at all | IDM's own FAQ confirms Windows-only; the loudest theme in Linux/macOS threads | Native binaries, no Wine — but only Linux is built and tested today; see the [roadmap](docs/ROADMAP.md) |
 | Browser integration that survives browser policy | Chrome disabling IDM's MV2 extension; IDM's own "keep the extension enabled" advice | Loopback daemon is the integration; the extension is a thin MV3 client, and `curl` can do everything it can |
 | Never lose media again, and say so honestly when it cannot | The video panel is the reason people stay; protected streams and YouTube changes are the top failures | HLS/DASH capture and muxing; no DRM circumvention and no per-site signature layer, by design |
 | Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
@@ -300,6 +300,26 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 | Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick`; **no daemon auth yet** |
 | No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
 | Offline copies of sites | IDM advertises it; the strings are in the binary | `grab --archive`, `site --archive` |
+
+## Roadmap
+
+[`docs/ROADMAP.md`](docs/ROADMAP.md) re-checks the four limitations this project has carried
+and ranks what to build next. The ranking, in short:
+
+1. **Checksum verification** (`--checksum sha256:…`) — the cheapest real gap; slots into the
+   existing temp-then-`rename` path so a mismatch never becomes the output.
+2. **Daemon authentication** — a bearer token, which is the blocker on binding the daemon
+   anywhere but loopback.
+3. **Linux + macOS + Windows support for real** — the loudest ask in the ecosystem; today only
+   `x86_64-unknown-linux-gnu` is built and there is no CI.
+4. **Headless packaging** — static binaries and a container image for NAS use.
+5. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
+   the queue and state but deliberately **not** a mode of the HTTP engine.
+
+The same document records what verification changed on 2026-10-19: ffmpeg turned out to be
+installed (but crashes on MPEG-TS input, so the remux path still cannot be verified), and the
+IDM binary turned out to still be on disk and disassemblable with `objdump` — 854,785
+instructions — where the original report said no disassembler was ever available.
 
 ## How Riptide differs from IDM
 

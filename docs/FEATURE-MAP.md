@@ -260,7 +260,9 @@ more against the extension's framing. The distinction that matters in this docum
   opened from disk with the server stopped.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
-Windows host, a PAC file, an FTPS server, `ffmpeg`, an MMS source, a live HLS/DASH origin, a
+Windows host, a PAC file, an FTPS server, `ffmpeg` (a build is present on this host now, but it
+segfaults on every MPEG-TS input, so the remux path is *still* unverified — the reason changed,
+not the verdict; see [`ROADMAP.md`](ROADMAP.md)), an MMS source, a live HLS/DASH origin, a
 scheduler other than a self-written `cron`-shaped one, or a real web server other than the ones
 written for these tests. Those rows are labelled **Unverified**, **Partial**, **Absent** or
 **Refused** above and should be treated that way. The mock `Negotiate` server in

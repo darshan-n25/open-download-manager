@@ -35,6 +35,16 @@ UTF-16LE), companion-binary inspection, archive extraction of the shipped browse
   details (exact retry math, exact chunk-splitting heuristic) are inferred** and labelled as
   such. Every claim below is tagged `[OBSERVED]`, `[INFERRED]`, or `[UNKNOWN]`.
 
+> **Correction, 2026-10-19.** The first bullet above is now too broad. Instruction-level
+> disassembly *is* available on this host: GNU `objdump` reads the PE (`pei-i386`, entry
+> `0x0062e1fe`) and a full pass yields **854,785 instructions** over a `.text` of `0x27acdc`
+> bytes. What remains unavailable is **decompilation** — no Ghidra/Hopper/IDA provider is
+> configured — and any **dynamic** observation, since the target is a Windows PE and this host
+> has neither Windows nor Wine. So read the first bullet as *no decompilation*, not *no
+> disassembly*. The original analysis stands as written; a first code-level check
+> (the six call sites consuming the `.internetdownloadmanager.com/` literal at VMA `0x67defc`)
+> is recorded in [`ROADMAP.md`](ROADMAP.md) Part 1, Claim 3.
+
 **Good news:** `IDMan.exe` is **not packed or obfuscated** in the traditional sense — normal
 section layout, `HAS_DEBUG`/`HAS_LOCALS` flags set, and MSVC C++ RTTI class names present in
 plaintext. Only the *browser-extension JavaScript* is minified, and only *site names* in it
