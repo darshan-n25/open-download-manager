@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::platform::write_all_at;
+
 pub struct Sink {
     path: PathBuf,
     file: Arc<std::fs::File>,
@@ -20,8 +22,14 @@ pub struct Sink {
 
 impl Sink {
     /// Open (creating if needed) `path` and, when the final size is known, extend it to
-    /// that length up front. On Linux/macOS this is a sparse allocation, so no disk
-    /// space is consumed until bytes are actually written.
+    /// that length up front.
+    ///
+    /// On Linux and macOS that is a sparse allocation, so no disk space is consumed until
+    /// bytes are actually written. On Windows the length is set the same way but the
+    /// clusters are allocated, so the full size is reserved up front; the trade is the same
+    /// either way (a download that cannot fit fails immediately rather than at 99%), and the
+    /// engine never depends on the gap being free — every segment writes into its own
+    /// region.
     pub fn create(path: &Path, size: Option<u64>) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -86,6 +94,11 @@ impl Sink {
     }
 
     /// Atomically move the completed part file onto its final name.
+    ///
+    /// The handle stays open across the rename, which is fine on Unix and fine on Windows
+    /// only because Rust opens files with `FILE_SHARE_DELETE`; a `MoveFileEx` on a file that
+    /// somebody else has open *without* that sharing mode (a virus scanner, say) fails with
+    /// a sharing violation, so the error is reported rather than swallowed.
     pub fn finalize(&self, final_path: &Path) -> std::io::Result<()> {
         if let Some(parent) = final_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -94,42 +107,6 @@ impl Sink {
         }
         std::fs::rename(&self.path, final_path)
     }
-}
-
-#[cfg(unix)]
-fn write_all_at(file: &std::fs::File, buf: &[u8], mut offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    let mut written = 0usize;
-    while written < buf.len() {
-        let n = file.write_at(&buf[written..], offset)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short write",
-            ));
-        }
-        written += n;
-        offset += n as u64;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn write_all_at(file: &std::fs::File, buf: &[u8], mut offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut written = 0usize;
-    while written < buf.len() {
-        let n = file.seek_write(&buf[written..], offset)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "short write",
-            ));
-        }
-        written += n;
-        offset += n as u64;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

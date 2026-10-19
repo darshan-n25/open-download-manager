@@ -30,6 +30,16 @@ pub fn gen_id() -> String {
 }
 
 /// Strip characters that are illegal in a filename on Windows or POSIX.
+///
+/// A name that survives the character filter can still fail on Windows in two ways that are
+/// handled here, because both would otherwise be *silent*:
+///
+/// * a trailing dot or space is discarded by the filesystem, so `a.` and `a` collide;
+/// * `NUL`, `CON`, `COM1` and the rest are devices even with an extension, so a file named
+///   `NUL.txt` would take the download and throw it away.
+///
+/// The reserve name is prefixed rather than escaped: this is a human-facing filename, not a
+/// reversible mapping, and a leading `_` reads as "we had to change this".
 pub fn sanitize_filename(s: &str) -> String {
     let cleaned: String = s
         .chars()
@@ -42,11 +52,30 @@ pub fn sanitize_filename(s: &str) -> String {
     let trimmed = cleaned.trim().trim_end_matches('.').trim();
     if trimmed.is_empty() {
         "download".to_string()
-    } else if trimmed.len() > 200 {
-        trimmed[..200].to_string()
     } else {
-        trimmed.to_string()
+        let reserved = crate::platform::is_reserved_windows_name(trimmed);
+        let full = if reserved {
+            format!("_{trimmed}")
+        } else {
+            trimmed.to_string()
+        };
+        truncate_on_a_char_boundary(&full, 200)
     }
+}
+
+/// Cut `s` to at most `max` bytes without splitting a character.
+///
+/// `&s[..max]` panics when the cut lands inside a multi-byte character, which a filename
+/// that arrived percent-encoded from a header can easily do.
+fn truncate_on_a_char_boundary(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Derive a filename from a URL path, percent-decoding as IDM does.
@@ -247,6 +276,28 @@ mod tests {
     fn filenames_are_sanitised() {
         assert_eq!(sanitize_filename("a/b:c*.mp4"), "a_b_c_.mp4");
         assert_eq!(sanitize_filename(""), "download");
+        // Windows discards a trailing dot, which would make this collide with `movie.mp4`…
+        assert_eq!(sanitize_filename("movie.mp4."), "movie.mp4");
+        assert_eq!(
+            sanitize_filename("  leading and trailing  "),
+            "leading and trailing"
+        );
+        // …and `NUL` is a device, so the name has to change rather than be quietly dropped.
+        assert_eq!(sanitize_filename("NUL"), "_NUL");
+        assert_eq!(sanitize_filename("con.txt"), "_con.txt");
+        assert_eq!(sanitize_filename("com1"), "_com1");
+        // `COM10` is an ordinary file name on Windows.
+        assert_eq!(sanitize_filename("COM10"), "COM10");
+    }
+
+    #[test]
+    fn a_long_filename_is_cut_without_splitting_a_character() {
+        // 300 euro signs: cutting at byte 200 would land inside one of them and panic.
+        let name = "€".repeat(300);
+        let cut = sanitize_filename(&name);
+        assert!(cut.len() <= 200);
+        assert!(cut.chars().all(|c| c == '€'));
+        assert_eq!(cut.chars().count(), 66); // 66 * 3 bytes, the 67th would cross 200
     }
 
     #[test]

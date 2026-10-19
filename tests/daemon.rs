@@ -219,9 +219,15 @@ async fn the_http_api_creates_and_lists_jobs() {
     let health = http_get(d.addr, "/health").await;
     assert_eq!(health, "ok");
 
+    // A real destination: on Windows `/tmp/...` is not a path at all, and a test that hands
+    // the daemon one is testing the test's assumption about the filesystem.
+    let out_dir = tempfile::tempdir().unwrap();
+    let output = out_dir.path().join("api-test.bin");
+    let output_json = output.to_string_lossy().to_string();
+
     let payload = serde_json::json!({
         "url": "http://127.0.0.1:9/api.bin",
-        "output": "/tmp/riptide-api-test.bin",
+        "output": output_json,
         "connections": 5,
         "quality": "720",
         "proxy": "socks5://127.0.0.1:9150",
@@ -236,7 +242,7 @@ async fn the_http_api_creates_and_lists_jobs() {
 
     let one = http_get(d.addr, &format!("/api/jobs/{id}")).await;
     let job: serde_json::Value = serde_json::from_str(&one).unwrap();
-    assert_eq!(job["output"], "/tmp/riptide-api-test.bin");
+    assert_eq!(job["output"], output_json);
     assert_eq!(job["connections"], 5);
     assert_eq!(job["quality"], "720");
     assert_eq!(job["speed_limit"], 2097152);

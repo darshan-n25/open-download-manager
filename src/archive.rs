@@ -255,6 +255,13 @@ pub fn url_key(u: &Url) -> String {
 /// what keeps the scheme unambiguous. An empty segment (from `//`) becomes a bare `~`, and
 /// because a literal `~` is always followed by two hex digits that can never be confused
 /// with anything else.
+///
+/// Two name shapes are legal on POSIX and are not files on Windows, so they are escaped with
+/// the same `~xx` scheme: a *trailing dot*, which Windows discards (`a.` would silently
+/// become `a`, colliding with the real `a`), and a *device name* (`NUL`, `CON`, `COM1` …),
+/// which Windows resolves anywhere in a path and with any extension. Both rules apply on
+/// every platform, not just on Windows: an archive has to be the same mirror whichever
+/// machine wrote it.
 fn encode_segment(seg: &str) -> String {
     if seg.is_empty() {
         return "~".to_string();
@@ -269,11 +276,30 @@ fn encode_segment(seg: &str) -> String {
         if plain {
             out.push(c);
         } else {
-            out.push('~');
-            out.push_str(&format!("{b:02x}"));
+            escape(&mut out, b);
         }
     }
+    if out.ends_with('.') {
+        out.truncate(out.len() - 1);
+        escape(&mut out, b'.');
+    }
+    if crate::platform::is_reserved_windows_name(&out) {
+        // A device name is all ASCII, so the first byte is a whole character. Escaping it is
+        // enough to turn `NUL` into an ordinary name.
+        let first = out.as_bytes()[0];
+        let rest = out[1..].to_string();
+        out.clear();
+        escape(&mut out, first);
+        out.push_str(&rest);
+    }
     out
+}
+
+/// Append `~xx` for one byte. The escape has to be unambiguous, and it is: a literal `~` is
+/// itself always escaped, so `~` in an encoded name always introduces two hex digits.
+fn escape(out: &mut String, b: u8) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "~{b:02x}");
 }
 
 /// True for a path whose first segment is one of the reserved names.
@@ -298,6 +324,9 @@ fn is_reserved_root(path: &str) -> bool {
 /// `start_host`'s files sit at the root so that a one-site archive reads like a copy of the
 /// site. Anything else is filed under [`HOST_DIR`], because two hosts can perfectly well both
 /// have a `/index.html`.
+///
+/// Every segment is a name that can actually be created on Windows as well as on POSIX, so a
+/// mirror made on one machine is usable on the other.
 pub fn local_path(u: &Url, start_host: &str) -> PathBuf {
     let (host, path, query) = key_parts(u);
     let under_hosts = host != start_host.to_ascii_lowercase() || is_reserved_root(&path);
@@ -1448,8 +1477,30 @@ mod tests {
         assert_eq!(encode_segment(""), "~");
         // A literal `~7e` must not be readable as the escape for `~`.
         assert_ne!(encode_segment("~"), encode_segment("~7e"));
-        assert_eq!(encode_segment("..."), "...");
         assert_ne!(encode_segment(".."), "..");
+    }
+
+    #[test]
+    fn a_segment_that_windows_would_not_store_is_escaped_the_same_everywhere() {
+        // A trailing dot is dropped by Windows, so `..` must not be left as a name that
+        // becomes “” there. The escape happens on every platform, so a Linux mirror is not
+        // full of names Windows cannot represent.
+        assert_eq!(encode_segment("..."), "..~2e");
+        assert_eq!(encode_segment("a."), "a~2e");
+        assert_eq!(encode_segment("trailing. "), "trailing.~20");
+        // `NUL`, `CON`, `COM1` … are devices on Windows, with or without an extension.
+        assert_eq!(encode_segment("NUL"), "~4eUL");
+        assert_eq!(encode_segment("nul.txt"), "~6eul.txt");
+        assert_eq!(encode_segment("COM1"), "~43OM1");
+        // …but only the documented ones: `COM10` is an ordinary file.
+        assert_eq!(encode_segment("COM10"), "COM10");
+        assert_eq!(encode_segment("AUX.log"), "~41UX.log");
+        // A leading dot is not a trailing dot, and `.hidden` is a fine name on both.
+        assert_eq!(encode_segment(".hidden"), ".hidden");
+        // The escapes stay injective: no BYTE ever produces `~4e` except the device rule,
+        // because `N` is plain and a literal `~` is written `~7e`.
+        assert_ne!(encode_segment("NUL"), encode_segment("~4eUL"));
+        assert_ne!(encode_segment("a."), encode_segment("a.~2e"));
     }
 
     #[test]

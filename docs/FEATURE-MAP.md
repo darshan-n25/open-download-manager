@@ -155,7 +155,8 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | --- | --- | --- | --- |
 | `HKCU\Software\DownloadManager\*` configuration `[OBSERVED]` | **Done, different carrier** | `config.json` + `riptide config show/set/path/init` | Every setting is reachable from the CLI. |
 | GUI with per-download properties | **Refused/Partial** | CLI + a small HTML control page on the daemon (`GET /`) | No desktop GUI. The daemon also serves a JSON API so a GUI could be written against it later. |
-| Windows shell integration (context menu, IE plugin) | **Absent** | — | Linux/macOS first. |
+| Windows shell integration (context menu, IE plugin) | **Absent** | — | Deliberately no OS integration: the CLI, the extension and the daemon’s HTTP API are the interfaces. |
+| Runs only on Windows | **Done, and wider** | `src/platform.rs` | Linux, macOS and Windows from one codebase: per-platform config/state/download directories, one shared positional-write path, and archive names that are valid on Windows too. Compiled for seven targets from one machine; the native Windows/macOS test runs exist in CI and have not executed (no remote). |
 | `.torrent` downloads | **Done** (as a file) | nothing special needed | IDM contains **no** BitTorrent protocol strings (0 hits); it only downloads the `.torrent` file. Riptide matches that. |
 | Torrent/BitTorrent client | **Absent — and so is IDM's** | — | Recorded here because it is the most common misconception about IDM. |
 
@@ -238,12 +239,20 @@ gaps; the third is answered by construction.
 
 ## 13. What "tested" means here
 
-`cargo test` runs 314 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 15
+`cargo test` runs 331 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 15
 more against the extension's framing. The distinction that matters in this document:
 
 - **Unit tests** prove an algorithm in isolation (parsers, KDFs, the segment table, the
   semaphores, the JS framing, project schedule arithmetic, checksum digests against published
   vectors).
+- **Platform tests** (`src/platform.rs`) prove the same code answers correctly for *another*
+  platform: the directory layout is resolved from an environment handed in as an argument, so
+  the Windows answers — `%LOCALAPPDATA%` for state, `%APPDATA%` for config,
+  `%HOMEDRIVE%`+`%HOMEPATH%`, an empty variable, no home at all — are asserted on Linux, and the
+  positional-write retry loop is driven by a writer that accepts three bytes at a time. What this
+  does **not** prove is that the Windows code runs, which is why `.github/workflows/ci.yml` also
+  runs the whole suite natively on `windows-latest` and `macos-latest`. That workflow has not
+  executed: this repository has no remote.
 - **Protocol tests** (`tests/daemon.rs`) drive the daemon over a real WebSocket and its JSON API.
 - **End-to-end tests** (`tests/segmented.rs`, `tests/projects.rs`, `tests/archive.rs`,
   `tests/checksum.rs`) stand up
@@ -273,10 +282,19 @@ more against the extension's framing. The distinction that matters in this docum
   appeared in the listing, `--generate-token-file` produced a `0600` file the daemon accepted,
   a missing or empty source aborted startup with a message, and Node's own `WebSocket` — which
   cannot set a handshake header, exactly like a browser — was refused with no token and got a
-  real `HELLO_ACK` with `?token=`.
+  real `HELLO_ACK` with `?token=`. The platform work was checked the same way, and partly *had*
+  to be: the layout this Linux box resolves was printed with `config path`/`config show` in a
+  directory of its own, and an archive of a page linking `/NUL`, `/trailing.` and `/COM1.txt` was
+  written to `~4eUL`, `trailing~2e` and `~43OM1.txt` with the markup rewritten to match — names
+  Windows will store, in a mirror that is identical on every platform. Windows and macOS
+  themselves remain **Unverified**: the CI that runs the suite on them is written and has not
+  run, and `scripts/check-portability.sh` compiles the platform branches for seven targets
+  without executing any of them.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
-Windows host, a PAC file, an FTPS server, a *successful* `ffmpeg` MPEG-TS remux (a build is
+Windows host, a PAC file, an FTPS server, a Windows or macOS machine (the Windows-only branches
+are *compiled* for both Windows targets from Linux, never run), a *successful* `ffmpeg`
+MPEG-TS remux (a build is
 present on this host now, but it segfaults on every MPEG-TS input, so the remux path is *still*
 unverified — the reason changed, not the verdict; the failure and fallback paths, by contrast,
 are now tested against an absent, a broken, and the host's own `ffmpeg`; see

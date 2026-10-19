@@ -48,6 +48,7 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 
 | Area | What you get |
 | --- | --- |
+| Platform | Linux, macOS and Windows from one codebase; per-platform file layout, one shared positional-write path, and archive names that are valid on Windows too — see [Platform support](#platform-support) |
 | HTTP/HTTPS | Segmented ranged download, resume with `If-Range` validators, retries with backoff, redirects, cookies, custom headers, `Content-Disposition` filename handling |
 | Auth | Basic, Digest (RFC 7616), Bearer, NTLMv2 (MS-NLMP written from scratch), and Negotiate/SPNEGO (RFC 4178/4559) wrapping NTLM — real Kerberos is not implemented |
 | Proxies | `http`, `https`, `socks5`, IDM's compact `mode:value;bypass` strings, Tor presets |
@@ -71,8 +72,60 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 312 tests: unit + protocol + end-to-end
+cargo test         # 331 tests: unit + protocol + end-to-end
 ```
+
+On Windows the binary is the same program; only the directory it keeps its files in changes.
+See [Platform support](#platform-support), including how to build a static Linux binary.
+
+## Platform support
+
+Linux, macOS and Windows, from one codebase. Everything that differs between them lives in one
+file — [`src/platform.rs`](src/platform.rs): the directory layout, the positional-write binding,
+and the names Windows will not store. That is deliberate, because "does this work on X?" should
+be one file to read rather than a `cfg` in every module.
+
+| | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| Config | `$XDG_CONFIG_HOME/riptide`, else `~/.config/riptide` | same | `%APPDATA%\riptide` |
+| State: queue, quota window, projects, mirrors | `$XDG_DATA_HOME/riptide`, else `~/.local/share/riptide` | same | `%LOCALAPPDATA%\riptide` |
+| Default downloads | `~/Downloads` | `~/Downloads` | `%USERPROFILE%\Downloads` |
+| Home directory | `$HOME` | `$HOME` | `%USERPROFILE%`, else `%HOMEDRIVE%%HOMEPATH%` |
+
+State goes to `%LOCALAPPDATA%` and not `%APPDATA%` on purpose: the queue points at part files
+sitting on *this* disk, and config that roams to a machine without them is a queue of downloads
+that cannot resume. `riptide config path` and `riptide config show` print what was resolved —
+including the last resort, the working directory, if the environment names no home at all.
+
+The layout is a pure function of the environment, so the platform table above is asserted on
+whichever platform the tests happen to run on: the Windows answers are tested on Linux and vice
+versa, along with `%HOMEDRIVE%`+`%HOMEPATH%`, an empty `XDG_DATA_HOME=`, and no home at all.
+The tests are in [`src/platform.rs`](src/platform.rs).
+
+```sh
+./scripts/check-portability.sh
+ok      x86_64-unknown-linux-gnu
+ok      x86_64-unknown-linux-musl
+ok      aarch64-unknown-linux-gnu
+ok      x86_64-apple-darwin
+ok      aarch64-apple-darwin
+ok      x86_64-pc-windows-msvc
+ok      x86_64-pc-windows-gnu
+
+7 checked, 0 skipped, 0 failed
+```
+
+That script compiles the platform module for all seven targets using nothing but the prebuilt
+`std` from `rustup target add` — no cross C toolchain, no SDK — so it runs on the machine you
+are sitting at, and it is not vacuous: a deliberately broken `#[cfg(windows)]` function in that
+file fails the `x86_64-pc-windows-msvc` line while the Linux line still passes.
+
+`.github/workflows/ci.yml` is the rest of it: the whole suite natively on `ubuntu-latest`,
+`macos-latest` and `windows-latest` with clippy and rustfmt; `cargo check --all-targets` for
+`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`; a fully
+static musl binary proven static with `ldd`; and `x86_64-apple-darwin` cross-built from the arm64
+macOS runner. **That workflow has not run** — this repository has no remote yet — so the
+non-Linux jobs are written and reviewed but unexecuted. The executed evidence is Linux, below.
 
 ## Use
 
@@ -368,15 +421,21 @@ and ranks what to build next. The ranking, in short:
    `RIPTIDE_DAEMON_TOKEN` or a config path, required on every HTTP route and on the WebSocket
    handshake, compared in constant time. Off-loopback binds now carry a startup note saying what
    the token does and does not protect.
+4. **Linux + macOS + Windows support** (was item 1) — one `src/platform.rs` holding the layout,
+   the positional-write binding and the reserved names; the download-name and archive-name
+   sanitising now produces names Windows will actually store; a runtime-verified platform table
+   with tests for both platforms; a seven-target compile check that runs on one machine; and a
+   CI matrix that runs the suite natively on all three systems, cross-checks three more targets,
+   and proves the static musl build is static. See [Platform support](#platform-support) for
+   what has and has not been *executed*.
 
 **Still to build, in the order the roadmap ranks them:**
 
-1. **Linux + macOS + Windows support for real** — the loudest ask in the ecosystem; today only
-   `x86_64-unknown-linux-gnu` is built and there is no CI.
-2. **Headless packaging** — static binaries and a container image for NAS use.
-3. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
+1. **Headless packaging** — static binaries and a container image for NAS use. (The static
+   binary itself is now built and checked in CI; what remains is the image and the release.)
+2. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
    the queue and state but deliberately **not** a mode of the HTTP engine.
-4. **Finishing the MPEG-TS remux verification** — a host with a working `ffmpeg` and a real
+3. **Finishing the MPEG-TS remux verification** — a host with a working `ffmpeg` and a real
    transport-stream fixture, to prove the *successful* remux as well as the fallback.
 
 The same document records what verification changed on 2026-10-19: ffmpeg turned out to be
@@ -545,17 +604,36 @@ against this implementation (§12 there). The short version:
 - **No Windows shell integration** (IE/context-menu hooks). The CLI and the extension are the
   interfaces.
 - **No GUI, so no skins, drag-and-drop, or shutdown/hang-up-when-done scheduler actions.**
+- **Windows preallocates the whole file.** The sink sets the final length up front so a download
+  that cannot fit fails immediately rather than at 99%; on Linux and macOS that length is sparse
+  and costs nothing, while on Windows the clusters are reserved, so a 4 GB download needs 4 GB
+  free before it starts. Setting the sparse attribute is not done deliberately: it needs a
+  `DeviceIoControl` call that cannot be exercised from this project's development machine, and
+  untested unsafe filesystem code is a worse trade than reserving the space.
+- **With no home directory in the environment, both platforms fall back to `.`** — the working
+  directory — exactly as before this was made platform-aware. Nothing is written until a command
+  needs it, and `riptide config path` prints what was resolved rather than leaving you to guess.
+- **A deep archive can exceed Windows' 260-character `MAX_PATH`**, because one URL becomes one
+  nested path and `std` does not add the `\\?\` prefix for you. Shorten the archive root, or
+  enable long paths on the machine.
+- **The daemon's token file carries no mode on Windows.** `--generate-token-file` writes `0600`
+  on Unix; on Windows the file inherits the ACL of its directory (`%LOCALAPPDATA%\riptide` is
+  per-user by default), because inheriting the correct ACL beats guessing one.
+- **Completion is a `rename`,** which on Windows fails with a sharing violation if another
+  process holds the part file open *without* `FILE_SHARE_DELETE` (a virus scanner, usually).
+  Riptide's own handle is not a problem — Rust opens files with share-delete — and the failure is
+  reported with the file left exactly where it was, so a retry succeeds once the process lets go.
 - HTTP/2 is requested but **multiplexing is not exploited**: each range is still its own
   request stream, and the connection count is what drives the speedup.
 
 ## Testing
 
 ```sh
-cargo test                              # Rust: 314 tests
+cargo test                              # Rust: 331 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 15 tests
 ```
 
-314 Rust tests: 249 unit tests across every module, 17 daemon-protocol tests driving a real
+331 Rust tests: 266 unit tests across every module, 17 daemon-protocol tests driving a real
 WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
 which really does byte ranges, 6 that stand up a mock `Negotiate` server, 6 that verify
 checksums end-to-end against a real HTTP server, 17 that stand up a server which really
@@ -631,6 +709,16 @@ Two more are worth naming because they are about *refusing* rather than computin
 inference, and every malformed spec), and the **media fallback** — an MPEG-TS remux is driven
 with an `ffmpeg` that is absent, one that exits non-zero, and whatever `ffmpeg` the host
 actually has, and in every case publishing must succeed and the raw track must survive.
+
+A third group is about the *other* platform. The layout resolver is fed a literal environment
+so the Windows answers — `%LOCALAPPDATA%` for state, `%APPDATA%` for config, `%HOMEDRIVE%` joined
+to `%HOMEPATH%`, an empty `XDG_DATA_HOME=`, no home at all — are asserted on Linux; the
+positional-write retry loop is driven by a writer that accepts three bytes at a time, one that
+accepts zero (which is an error, not a spin), and one that claims more than it was given; and the
+name rules get their own cases: `NUL.txt` and `con` are devices, `COM10` is not, `movie.mp4.`
+loses its dot, and a 300-character run of multi-byte characters is cut at 200 bytes without
+splitting one. `scripts/check-portability.sh` then compiles those platform branches for the seven
+targets they will run on — from one machine, with no cross compiler.
 
 The extension's own framing is tested from Node (`extension/tests/protocol.test.mjs`),
 including the shipped IDM sample frame `MSG#0#17#1#0:9:` and a real `HELLO_ACK` captured from

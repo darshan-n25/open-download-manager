@@ -59,6 +59,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let layout = crate::platform::layout();
         Config {
             connections: 8,
             min_chunk: DEFAULT_MIN_CHUNK,
@@ -71,8 +72,8 @@ impl Default for Config {
             quota_window_secs: 3600,
             proxy: None,
             user_agent: DEFAULT_UA.to_string(),
-            download_dir: home_dir().join("Downloads"),
-            state_dir: data_dir(),
+            download_dir: layout.downloads(),
+            state_dir: layout.data,
             max_concurrent_jobs: 3,
             insecure: false,
             auto_categorize: true,
@@ -86,24 +87,14 @@ impl Default for Config {
     }
 }
 
+/// The user's home directory as this platform defines it.
+///
+/// Prefer [`crate::platform::layout`] when a whole layout is wanted; this exists because
+/// "the home directory" is occasionally all a caller needs. On Windows it is
+/// `%USERPROFILE%` (or `%HOMEDRIVE%%HOMEPATH%`), which is exactly why it is not a `HOME`
+/// lookup with a `.` fallback.
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-fn data_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(x).join("riptide");
-    }
-    home_dir().join(".local/share/riptide")
-}
-
-fn config_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(x).join("riptide");
-    }
-    home_dir().join(".config/riptide")
+    crate::platform::layout().home
 }
 
 impl Config {
@@ -112,7 +103,7 @@ impl Config {
         if let Some(p) = std::env::var_os("RIPTIDE_CONFIG") {
             return PathBuf::from(p);
         }
-        config_dir().join("config.json")
+        crate::platform::layout().config.join("config.json")
     }
 
     pub fn load() -> Self {

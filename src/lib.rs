@@ -15,7 +15,9 @@
 //!   browser stays dumb and the engine stays powerful (see [`daemon`]);
 //! * recurring projects: periodic file synchronization and scheduled site crawls
 //!   (see [`project`]);
-//! * offline site archiving that rewrites markup to work from disk (see [`archive`]).
+//! * offline site archiving that rewrites markup to work from disk (see [`archive`]);
+//! * one place for everything that differs between Linux, macOS and Windows — directories,
+//!   positional writes, reserved file names (see [`platform`]).
 
 pub mod archive;
 pub mod auth;
@@ -30,6 +32,7 @@ pub mod grabber;
 pub mod job;
 pub mod media;
 pub mod net;
+pub mod platform;
 pub mod project;
 pub mod quota;
 pub mod scheduler;

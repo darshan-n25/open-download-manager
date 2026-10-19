@@ -904,7 +904,10 @@ async function refresh(){
   const jobs=await (await fetch('/api/jobs')).json();
   document.getElementById('jobs').innerHTML=jobs.map(j=>{
     const p=j.total?Math.round(j.downloaded/j.total*100):0;
-    return `<li><b>${j.output.split('/').pop()}</b> — ${j.state}
+    // Either separator: the daemon may be running on Windows, where a `PathBuf` serialises
+    // with backslashes, and this is a browser's idea of a path, not Rust's.
+    const base=j.output.split(/[\\/]/).pop();
+    return `<li><b>${base}</b> — ${j.state}
       ${j.total?`(${p}% of ${j.total})`:''}<br><span class="muted">${j.url}</span></li>`;
   }).join('');
   const q=await (await fetch('/api/quota')).json();

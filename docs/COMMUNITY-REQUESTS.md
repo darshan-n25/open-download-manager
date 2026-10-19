@@ -50,9 +50,15 @@ What users do with that:
   use" (third-party guide, 2026) *(read in full)*. Several GitHub projects exist purely to
   automate that Wine setup.
 
-**Riptide:** answered by construction. Rust, first-party Linux/macOS/Windows binaries, no Wine,
-no filter driver — the integration point is a loopback daemon, which is a normal thing to run on
-any of the three.
+**Riptide:** answered in the code rather than in a roadmap. Rust, one codebase for
+Linux/macOS/Windows, no Wine, no filter driver — the integration point is a loopback daemon,
+which is a normal thing to run on any of the three. The platform differences are one file
+(`src/platform.rs`), the platform module is compiled for seven targets from a single machine
+(`scripts/check-portability.sh`), and `.github/workflows/ci.yml` runs the whole suite natively on
+`ubuntu-latest`, `macos-latest` and `windows-latest`. What that workflow has **not** done is run,
+because this repository has no remote — so the Linux answer is verified and the Windows and macOS
+answers are compiled and tested-as-code, not executed. The line between those two is kept explicit
+in [`ROADMAP.md`](ROADMAP.md) Part 2.
 
 ## 2. Browser integration that survives the browser changing
 

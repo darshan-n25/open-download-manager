@@ -9,9 +9,11 @@ Two things live here:
    trusted or re-run rather than taken on faith.
 2. **A ranked roadmap** for what to build next, including the requests the
    [community survey](COMMUNITY-REQUESTS.md) surfaced.
-3. **What has shipped from it.** Items 1 (checksum verification), 2 (daemon authentication) and 6
-   (MPEG-TS remux hardening) were all built on 2026-10-19; their entries in the roadmap table
-   carry a status, and a section each describes what actually landed and how it is tested.
+3. **What has shipped from it.** Items 1 (checksum verification), 2 (daemon authentication), 3
+   (Linux + macOS + Windows support) and 6 (MPEG-TS remux hardening) were all built on
+   2026-10-19; their entries in the roadmap table carry a status, and a section each describes
+   what actually landed and how it is tested. Item 3 is the one where "shipped" needs a qualifier:
+   the code and the CI exist, but the CI has not run, because this repository has no remote.
 
 Every claim here is tagged the same way the reverse-engineering report tags its own:
 `OBSERVED` (a command was run, here is its output), `INFERRED`, or `UNKNOWN`.
@@ -169,9 +171,8 @@ browser, and neither is `manifest.firefox.json` against Firefox.
 
 ## Part 2 — Platform support, in the same terms
 
-“Cross-platform” is a design property of this codebase. It is **not** yet a verified one.
-
-OBSERVED:
+“Cross-platform” was a design property of this codebase, not a verified one. **Original
+observation, 2026-10-19 (kept: this is what was true before item 3):**
 
 ```console
 $ rustup target list --installed
@@ -180,16 +181,55 @@ $ ls .github/workflows
 ls: cannot access '.github/workflows': No such file or directory
 ```
 
-- The source is genuinely platform-neutral. The **only** OS-conditional code in the whole
-  tree is `write_all_at` (`src/storage.rs:99` `#[cfg(unix)]`, `:117` `#[cfg(windows)]`) — the
+- The source was genuinely platform-neutral. The **only** OS-conditional code in the whole
+  tree was `write_all_at` (`src/storage.rs:99` `#[cfg(unix)]`, `:117` `#[cfg(windows)]`) — the
   same positioned-write routine expressed against each OS’s `FileExt`. No platform-specific
-  crate is pulled in.
-- But exactly one target is installed, there is **no CI**, and there is no packaging of any
-  kind. macOS and Windows are *intended*, never built and never run. The Windows branch of
-  `write_all_at` in particular has never executed.
+  crate was pulled in.
+- But exactly one target was installed, there was **no CI**, and there was no packaging of any
+  kind. macOS and Windows were *intended*, never built and never run. The Windows branch of
+  `write_all_at` had never executed.
 
-So the community’s loudest ask — “run on something other than Windows” — is answered by the
-architecture, not by evidence. Roadmap item 3 is what turns it into evidence.
+### Update, later the same day — after item 3
+
+OBSERVED on the authoring machine (x86_64 Linux, no passwordless package install):
+
+```console
+$ rustup target list --installed
+x86_64-unknown-linux-gnu
+x86_64-unknown-linux-musl
+aarch64-unknown-linux-gnu
+x86_64-apple-darwin
+aarch64-apple-darwin
+x86_64-pc-windows-msvc
+x86_64-pc-windows-gnu
+$ ./scripts/check-portability.sh
+ok      x86_64-unknown-linux-gnu
+ok      x86_64-unknown-linux-musl
+ok      aarch64-unknown-linux-gnu
+ok      x86_64-apple-darwin
+ok      aarch64-apple-darwin
+ok      x86_64-pc-windows-msvc
+ok      x86_64-pc-windows-gnu
+
+7 checked, 0 skipped, 0 failed
+$ ls .github/workflows
+ci.yml
+```
+
+What is now true, and what is still only *intended*:
+
+| Claim | Status | Evidence |
+| --- | --- | --- |
+| The Windows-only code compiles for Windows | **OBSERVED** | `scripts/check-portability.sh` compiles `src/platform.rs` for `x86_64-pc-windows-msvc` and `-gnu` with `rustc --emit=metadata`, which needs only the target’s prebuilt `std` — no cross C toolchain. Not vacuous: a deliberately broken `#[cfg(windows)]` function fails the Windows line while the Linux line still passes |
+| The layout is right on Windows | **OBSERVED** (on Linux) | `layout_for(spec, get)` takes the environment as an argument, so the Windows answers — `%LOCALAPPDATA%` for state, `%APPDATA%` for config, `%HOMEDRIVE%`+`%HOMEPATH%`, empty variables — are asserted by tests that run on Linux. `spec()` picks `WINDOWS` with `cfg!(windows)`, which is the one line that cannot be tested from here |
+| The Windows code **runs** | **UNVERIFIED** | The whole suite is written into `.github/workflows/ci.yml` for `windows-latest`, and has never executed: the repository has no git remote. No Windows machine, no Wine |
+| macOS, either architecture | **UNVERIFIED** | Same: `macos-latest` job written, `x86_64-apple-darwin` cross-build written, neither run. Metadata-only compilation for both Apple targets passes |
+| A static Linux binary | **UNVERIFIED** | `.github/workflows/ci.yml` builds `x86_64-unknown-linux-musl` and asserts with `ldd` that it has no dynamic interpreter. Not run here: `musl-gcc` is not installed and cannot be (no passwordless `sudo`). The *cross check itself* was run and fails where predicted — see item 3 below |
+| The archive names are Windows-legal | **OBSERVED** | Live: a page linking `/NUL`, `/trailing.` and `/COM1.txt` mirrors to `~4eUL`, `trailing~2e`, `~43OM1.txt` with the markup rewritten to match |
+
+So the community’s loudest ask is now answered by architecture *and* by a check that runs on one
+machine, with the second-machine half written down and explicitly unexecuted. That is a smaller
+gap than before, and it is stated rather than implied.
 
 ---
 
@@ -202,8 +242,8 @@ what the verification above turned up.
 | --- | --- | --- | --- | --- | --- |
 | 1 | **Checksum verification** (`--checksum sha256:…`) | ✅ **shipped 2026-10-19** | The cheapest real gap; every neighbouring project lists it and the [survey](COMMUNITY-REQUESTS.md) ranks it second | Small | The temp-then-`rename` path already exists (`storage.rs`), so this is a pre-rename hook: hash the temp file, and on mismatch delete the temp and fail the job. Nothing partially-written ever becomes the output. Support at least `sha256:` and `sha512:`; make it work for `grab`, `project` and the daemon API alike |
 | 2 | **Daemon authentication** | ✅ **shipped 2026-10-19** | The daemon bound `127.0.0.1:1001` with **no** token (`src/config.rs:69`), which was the blocker on every NAS / headless / remote-control request in the survey | Small–medium | A bearer token, compared in constant time, required on every route once set; a `--token-file`/env source so it is not in the process arguments. With a token the daemon can then safely bind off-loopback — with the caveat that the transport is plain HTTP, which the daemon now says out loud |
-| 3 | **Linux + macOS + Windows support, for real** | planned | The single most-repeated ask; today only `x86_64-unknown-linux-gnu` is built and no CI exists (Part 2) | Medium | A CI matrix (`ubuntu`, `macos`, `windows`) running `cargo test` + clippy + fmt; install the other targets; actually exercise the Windows `write_all_at` branch. Static musl builds for Linux come with item 4 |
-| 4 | **Headless packaging** | planned | Static binaries + a container image for drop-in NAS use | Small once 3 exists | Mostly build wiring, no new logic: `x86_64-unknown-linux-musl` release artefacts, a `scratch`/`distroless` image, and the daemon as the entrypoint. The extension is optional in this mode — the HTTP API is the interface |
+| 3 | **Linux + macOS + Windows support, for real** | ✅ **shipped 2026-10-19**, with the CI unrun | The single most-repeated ask; before this, only `x86_64-unknown-linux-gnu` was built and no CI existed (Part 2) | Medium | Delivered: `src/platform.rs` (layout, positional writes, reserved names), both platforms’ layouts tested from either one, seven-target compile check, `.github/workflows/ci.yml` (native `ubuntu`/`macos`/`windows` matrix + three cross checks + a static musl build proven with `ldd`), `.gitattributes` pinning LF. Unexecuted: everything that needs a second machine — this repo has no remote |
+| 4 | **Headless packaging** | ◐ **partly done 2026-10-19** | Static binaries + a container image for drop-in NAS use | Small now that 3 exists | Item 3 landed the hard half: `x86_64-unknown-linux-musl` builds in CI and is proven to have no dynamic interpreter, and the artefact is uploaded. What remains is packaging around it — a `scratch`/`distroless` image with the daemon as the entrypoint, and a release job. The extension is optional in this mode: the HTTP API is the interface |
 | 5 | **BitTorrent as a sibling binary** | planned | The most-requested feature in the whole ecosystem, and IDM lacks it too (verified: no BitTorrent protocol strings in `IDMan.exe`) | Large | A **separate** binary (`riptide-bt`) that shares the queue, state store, quota and scheduler with the HTTP engine — explicitly **not** a mode inside it. Different wire protocol, different peer model, different failure modes; folding it into the HTTP engine would put both at risk |
 | 6 | **MPEG-TS remux hardening** | ✅ **shipped 2026-10-19** | Found during this verification: a *present but broken* ffmpeg fails the job instead of falling back (§Claim 2) | Small | On any ffmpeg failure in `publish_single`/`mux`, fall back to the same keep-`.ts` copy used when ffmpeg is absent, and say so in the warning. Keep the raw track in every case |
 | 7 | **Verify the TS path against a working ffmpeg** | ◐ **partly covered 2026-10-19** | The path has still never run end to end; the available build crashes on MPEG-TS input | Small | Either a working ffmpeg on the test host, or an `#[ignore]`d test gated on `find_ffmpeg()` plus a real TS fixture, so a host with a good ffmpeg covers it and a host without does not silently skip |
@@ -298,6 +338,94 @@ then 200, the 401 body and its `WWW-Authenticate` scheme, both carriers, the ref
 the bearer header on a handshake, a web-page-shaped POST refused with nothing queued, and the
 tokenless default unchanged.
 
+### Item 3 — what shipped
+
+The item was written as “a CI matrix, the other targets, and actually exercise the Windows
+`write_all_at` branch”. The third part is the interesting one, because it is the part that cannot
+be done on this machine, so the work became: make as much of it as possible *checkable from one
+platform*, and write down plainly which part is not.
+
+**One file holds the platform differences** — `src/platform.rs`:
+
+| Difference | How it is handled |
+| --- | --- |
+| Where files live | `layout()` resolves `home`, `data` and `config` from a `Spec` per platform. Windows: `%USERPROFILE%` (else `%HOMEDRIVE%`+`%HOMEPATH%`), state in `%LOCALAPPDATA%`, config in `%APPDATA%`. POSIX: `$HOME`, `$XDG_DATA_HOME`/`$XDG_CONFIG_HOME`, else `~/.local/share` and `~/.config`. Before this, `HOME` was the only lookup and the fallback was `.` — on Windows, that put the config, the queue and every part file in whatever directory the program was started from |
+| Positional writes | `write_all_at` keeps the retry loop and calls one of two bindings: `FileExt::write_at` (Unix) or `FileExt::seek_write` (Windows). The loop is therefore tested on every platform the tests run on; only the one-line binding differs |
+| Names Windows rejects | `is_reserved_windows_name` recognises `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, with or without an extension and with the trailing dots/spaces Windows discards. `util::sanitize_filename` prefixes `_` (a download named `NUL.txt` used to write to the null device); `archive::encode_segment` escapes it as `~xx`, and escapes a *trailing dot* too, so `a.` cannot silently become `a`. Both rules apply on every platform, because a mirror has to be the same mirror wherever it was written |
+
+Also fixed on the way: `sanitize_filename` cut long names with `s[..200]`, which **panics** when
+byte 200 lands inside a multi-byte character — reachable from a percent-encoded
+`Content-Disposition` filename. It now cuts at the nearest character boundary.
+
+**Checked from one machine.** `scripts/check-portability.sh` compiles `src/platform.rs` for seven
+targets with `rustc --emit=metadata`, which resolves `std` for the target but never links — so it
+needs no cross C toolchain, no SDK and no second machine:
+
+```console
+$ ./scripts/check-portability.sh
+ok      x86_64-unknown-linux-gnu
+ok      x86_64-unknown-linux-musl
+ok      aarch64-unknown-linux-gnu
+ok      x86_64-apple-darwin
+ok      aarch64-apple-darwin
+ok      x86_64-pc-windows-msvc
+ok      x86_64-pc-windows-gnu
+
+7 checked, 0 skipped, 0 failed
+```
+
+And it is not a rubber stamp. Adding a deliberately broken Windows-only function to that file
+fails the Windows line while the Linux line still passes:
+
+```console
+$ printf '\n#[cfg(windows)]\nfn windows_only_regression() -> u32 { "not a number" }\n' >> /tmp/broken.rs
+$ rustc --edition 2021 --crate-type lib --emit=metadata --target x86_64-pc-windows-msvc \
+      --out-dir /tmp/out /tmp/broken.rs
+error[E0308]: mismatched types
+   --> /tmp/broken.rs:457:39
+    |
+457 | fn windows_only_regression() -> u32 { "not a number" }
+    |                                 ---   ^^^^^^^^^^^^^^ expected `u32`, found `&str`
+$ rustc ... --target x86_64-unknown-linux-gnu /tmp/broken.rs    # exit 0: the branch is not compiled here
+```
+
+**The whole crate for a foreign target is a different matter**, and it is why CI still matters.
+`cargo check --target x86_64-unknown-linux-musl` fails on this host, before reaching a single line
+of Riptide, inside `ring`:
+
+```console
+$ cargo check --locked --target x86_64-unknown-linux-musl
+  cargo:warning=Compiler family detection failed due to error: ToolNotFound: failed to find tool
+  "x86_64-linux-musl-gcc": No such file or directory (os error 2)
+  error occurred in cc-rs: failed to find tool "x86_64-linux-musl-gcc": No such file or directory
+```
+
+That is a real finding with a real consequence for CI: the `cc` crate looks for
+`x86_64-linux-musl-gcc`, which Debian's `musl-tools` does **not** provide — it provides
+`musl-gcc` — so the musl job sets `CC_x86_64_unknown_linux_musl=musl-gcc` and
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc` explicitly. Installing `musl-tools` and
+hoping is not enough.
+
+**CI.** `.github/workflows/ci.yml` has four jobs: `test` (the full suite on `ubuntu-latest`,
+`macos-latest`, `windows-latest`, with clippy `-D warnings` and `rustfmt --check`, the extension’s
+`node --test`, and an `x86_64-apple-darwin` cross-build from the arm64 macOS runner), `cross`
+(`cargo check --all-targets` for musl, aarch64-linux-gnu and windows-gnu, each with `CC_<target>`
+and a linker set), `static` (a release musl binary, `file`d, `ldd`ed to prove it is static, run
+once, uploaded), and `portability` (the script above). `.gitattributes` pins checkouts to LF so a
+Windows clone is byte-identical.
+
+The honest caveat, repeated because it is the whole point: **that workflow has never run.** This
+repository has no remote. Everything above that is tagged OBSERVED was run here; the workflow is
+the part that needs a second machine, and it is unexecuted rather than "tested".
+
+Evidence for the parts that did run: 15 tests in `src/platform.rs` (both platforms’ layouts,
+the split `%HOMEDRIVE%`, an empty variable, no home at all; the write loop against a
+three-bytes-a-time writer, a zero-length write, an over-long write and a real error; the device
+name table), 2 new in `src/util.rs` (device names, and a 300-character multi-byte name cut
+without splitting a character), 1 new in `src/archive.rs` (`...` → `..~2e`, `NUL` → `~4eUL`,
+`nul.txt` → `~6eul.txt`, `COM10` unchanged, and that the escapes stay injective), and a live
+archive of a page whose links are `/NUL`, `/trailing.` and `/COM1.txt`.
+
 ### Item 6 — what shipped
 
 `src/media/remux.rs` gained `keep_raw`: one fallback used by **both** failure modes, because
@@ -348,7 +476,7 @@ grep -riE "playwright|puppeteer|selenium|chromedriver|geckodriver" \
 
 # Platform support
 rustup target list --installed
-ls .github/workflows 2>/dev/null || echo "no CI"
+ls .github/workflows                    # ci.yml — written, and unrun (no remote)
 ```
 
 ## Part 5 — Reproducing items 1 and 6
@@ -451,3 +579,89 @@ ws.onerror = () => { console.log("refused"); process.exit(0); };
 ' "$TOKEN"
 # without the token: refused
 ```
+
+---
+
+## Part 7 — Reproducing item 3
+
+Everything below was run on x86_64 Linux with no cross C toolchain, no SDK and no second
+machine — which is the point: it is the part of “Windows support” that one box can check.
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Seven targets, then the check that needs no toolchain for any of them.
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-gnu \
+                 x86_64-apple-darwin aarch64-apple-darwin \
+                 x86_64-pc-windows-msvc x86_64-pc-windows-gnu
+./scripts/check-portability.sh
+#   ok      x86_64-unknown-linux-gnu
+#   ok      x86_64-unknown-linux-musl
+#   ok      aarch64-unknown-linux-gnu
+#   ok      x86_64-apple-darwin
+#   ok      aarch64-apple-darwin
+#   ok      x86_64-pc-windows-msvc
+#   ok      x86_64-pc-windows-gnu
+#   7 checked, 0 skipped, 0 failed
+
+# It has teeth: a Windows-only mistake fails the Windows line and leaves Linux alone.
+d=$(mktemp -d); cp src/platform.rs "$d/broken.rs"
+printf '\n#[cfg(windows)]\nfn windows_only_regression() -> u32 { "not a number" }\n' >> "$d/broken.rs"
+rustc --edition 2021 --crate-type lib --emit=metadata --target x86_64-pc-windows-msvc \
+      --out-dir "$d" "$d/broken.rs"        # error[E0308]: mismatched types
+rustc --edition 2021 --crate-type lib --emit=metadata --target x86_64-unknown-linux-gnu \
+      --out-dir "$d" "$d/broken.rs"        # exit 0 — the branch is not compiled here
+rm -rf "$d"
+
+# The layout is a pure function of the environment, so both platforms' answers are asserted
+# from either one. 15 + 9 + 24 tests.
+cargo test platform::        # 15
+cargo test util::            # 9
+cargo test archive::         # 24
+
+# Live: what this Linux box resolves, in a directory of its own.
+mkdir -p /tmp/rtplat/{home,data,config}
+export HOME=/tmp/rtplat/home XDG_DATA_HOME=/tmp/rtplat/data XDG_CONFIG_HOME=/tmp/rtplat/config
+riptide config path                          # /tmp/rtplat/config/riptide/config.json
+riptide config show | grep -E 'download_dir|state_dir'
+#   "download_dir": "/tmp/rtplat/home/Downloads"
+#   "state_dir": "/tmp/rtplat/data/riptide"
+
+# The last resort is unchanged, and is still the working directory.
+env -u HOME -u XDG_DATA_HOME -u XDG_CONFIG_HOME riptide config path
+#   ./.config/riptide/config.json
+
+# Live: a URL that is a device name, or that ends in a dot, becomes a name Windows can store.
+mkdir -p /tmp/rtnul/site && cd /tmp/rtnul/site
+printf '<a href="/NUL">a</a><a href="/trailing.">b</a><a href="/COM1.txt">c</a>' > index.html
+for f in NUL 'trailing.' COM1.txt; do echo "$f page" > "$f"; done
+python3 -m http.server 18132 --bind 127.0.0.1 &
+sleep 1
+riptide grab --archive -o /tmp/rtnul/mirror http://127.0.0.1:18132/index.html
+find /tmp/rtnul/mirror -mindepth 1 | sort
+#   /tmp/rtnul/mirror/~43OM1.txt
+#   /tmp/rtnul/mirror/~4eUL
+#   /tmp/rtnul/mirror/index.html
+#   /tmp/rtnul/mirror/_riptide
+#   /tmp/rtnul/mirror/_riptide/validators.json
+#   /tmp/rtnul/mirror/trailing~2e
+cat /tmp/rtnul/mirror/index.html
+#   <a href="~4eUL">a</a><a href="trailing~2e">b</a><a href="~43OM1.txt">c</a>
+kill %1
+
+# What one machine cannot do, and the exact reason. `ring` is C and assembly, so the whole
+# crate for a foreign target needs a cross C compiler that is not installable here.
+cargo check --locked --target x86_64-unknown-linux-musl
+#   cargo:warning=Compiler family detection failed due to error: ToolNotFound: failed to find
+#   tool "x86_64-linux-musl-gcc": No such file or directory (os error 2)
+#   error occurred in cc-rs: failed to find tool "x86_64-linux-musl-gcc"
+```
+
+Note the name in that last error: the `cc` crate asks for `x86_64-linux-musl-gcc`, while
+Debian's `musl-tools` installs `musl-gcc`. That is why the CI job sets
+`CC_x86_64_unknown_linux_musl` explicitly, and it is the kind of thing that would have looked
+like a flaky runner instead of a wrong assumption.
+
+What remains unexecuted is exactly what needs a Windows machine, a macOS machine, or a package
+manager with sudo: the `test` job's `windows-latest` and `macos-latest` legs, the three `cross`
+targets, and the static musl build. All four are written; none has run.
