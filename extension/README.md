@@ -43,6 +43,14 @@ riptide daemon --print-endpoint
 
 The badge stays on `!` until the daemon answers.
 
+If the daemon was started with a token — `riptide daemon --token-file PATH`, the
+`RIPTIDE_DAEMON_TOKEN` environment variable, or the `daemon_token_file` setting — put the same
+value in the popup's **Daemon token** field under *Settings*. A browser cannot set a header on a
+WebSocket handshake, so the extension sends it as `?token=…` on the socket URL and as an
+`Authorization: Bearer` header on its HTTP reads; without it the daemon answers `401` and the
+popup says so instead of claiming the daemon is offline. Changing the token drops the live socket,
+because the credential is only presented at handshake time.
+
 ## What it does
 
 - **Takes over browser downloads.** `downloads.onCreated` cancels the browser's own attempt
@@ -61,7 +69,8 @@ The extension speaks the same two channels the shipped IDM extension uses, minus
 Riptide deliberately drops.
 
 **WebSocket** `ws://127.0.0.1:1001/?cid=…&rnd=…`, subprotocol
-`plugin.v3.internetdownloadmanager.com`, handshake version `16845059` (`0x01010903`).
+`plugin.v3.internetdownloadmanager.com`, handshake version `16845059` (`0x01010903`). When the
+daemon requires a token the URL also carries `&token=…`.
 
 **Framing** (as observed in IDM's own message host):
 
@@ -100,6 +109,12 @@ IDM's; the framing, the handshake and the subprotocol string are.
 | `GET` | `/api/jobs/{id}` | one job |
 | `POST` | `/api/jobs` | `{"url": …}` plus any `ADD` key → `201` with the job |
 
+Every route requires the daemon's token when one is configured, as `Authorization: Bearer …`
+(for a script) or `?token=…` (for a browser). A `POST` must send
+`Content-Type: application/json`: browsers preflight that media type, and the daemon answers no
+preflight, which is what keeps a page on another origin from queueing downloads on a tokenless
+daemon.
+
 ## Permissions, and why
 
 | permission | reason |
@@ -123,4 +138,4 @@ configuration is touched, and no native messaging host is installed.
 | Redirects requests via `declarativeNetRequest` rules so the browser's download never starts | Cancels in `downloads.onCreated` | Reversible, visible in the downloads UI, no silent traffic rewriting |
 | Installs `IDMMsgHost.exe` as a native messaging host and trusts anything reaching its named pipe | WebSocket on loopback | No per-OS host manifest or registry key, and the peer is an actual TCP endpoint |
 | Points the browser at IDM's own proxy to capture traffic | Nothing — Riptide drives its own HTTP stack | No interception of unrelated browsing |
-| Trust is established from the peer PID | None needed; the daemon binds loopback and only accepts `ADD` | A malicious local process could queue downloads either way; this at least cannot redirect traffic |
+| Trust is established from the peer PID | Optional bearer token; loopback-only with no token | A malicious local process could queue downloads either way; this at least cannot redirect traffic. Off loopback the daemon asks for a shared secret instead of inferring an identity, and refuses a `POST` whose content type a cross-origin page could have produced |

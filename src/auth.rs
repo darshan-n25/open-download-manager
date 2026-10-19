@@ -15,6 +15,8 @@
 
 pub mod ntlm;
 pub mod spnego;
+/// The daemon's own bearer token — the server side, not a credential for a remote server.
+pub mod token;
 
 use serde::{Deserialize, Serialize};
 

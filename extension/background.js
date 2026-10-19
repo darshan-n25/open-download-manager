@@ -25,7 +25,7 @@ importScripts('./protocol.js');
 
 const api = globalThis.browser ?? globalThis.chrome;
 
-const { MSG, PROTOCOL_VERSION, WS_PROTOCOL, encodeFrame, drainFrames } =
+const { MSG, PROTOCOL_VERSION, WS_PROTOCOL, encodeFrame, drainFrames, daemonWsUrl } =
   globalThis.RiptideProtocol;
 
 // ---------------------------------------------------------------- configuration
@@ -57,6 +57,12 @@ const DEFAULTS = {
   forwardReferer: true,
   /** Optional fixed output directory on the machine running the daemon. */
   outputDir: '',
+  /**
+   * The daemon's bearer token, when it requires one (empty = it does not).
+   *
+   * It rides in the WebSocket URL because a browser cannot set a header on a handshake.
+   */
+  daemonToken: '',
   proxy: '',
   auth: '',
   /** One `Name: value` per line. */
@@ -91,12 +97,24 @@ let idleTimer = null;
 let seq = 0;
 const waiters = new Map();
 
-function daemonUrl() {
-  return `ws://${DAEMON.host}:${DAEMON.port}/?cid=riptide-ext&rnd=${Date.now()}`;
+function daemonUrl(settings) {
+  return daemonWsUrl({
+    host: DAEMON.host,
+    port: DAEMON.port,
+    cid: 'riptide-ext',
+    token: settings.daemonToken,
+    nonce: Date.now(),
+  });
 }
 
-function wsUrlForPopup() {
-  return `ws://${DAEMON.host}:${DAEMON.port}/?cid=riptide-popup&rnd=${Date.now()}`;
+function wsUrlForPopup(settings) {
+  return daemonWsUrl({
+    host: DAEMON.host,
+    port: DAEMON.port,
+    cid: 'riptide-popup',
+    token: settings.daemonToken,
+    nonce: Date.now(),
+  });
 }
 
 function rejectAll(reason) {
@@ -129,6 +147,24 @@ function onSocketClose() {
   rejectAll(new Error('the Riptide daemon closed the connection'));
 }
 
+/**
+ * Close the live socket, if there is one.
+ *
+ * Used when the daemon token changes: the credential is presented in the handshake URL, so a
+ * new value (or no value) only takes effect on a fresh connection.
+ */
+function closeSocket() {
+  const ws = socket;
+  socket = null;
+  opening = null;
+  if (!ws) return;
+  try {
+    ws.close();
+  } catch {
+    /* already gone */
+  }
+}
+
 function scheduleIdleClose() {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
@@ -144,14 +180,18 @@ function scheduleIdleClose() {
 }
 
 /** Open (or reuse) a socket and complete the HELLO handshake. */
-function openSocket() {
-  if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
+async function openSocket() {
+  if (socket && socket.readyState === WebSocket.OPEN) return socket;
   if (opening) return opening;
+
+  // Read the settings first: the daemon may require a bearer token, and a browser cannot set
+  // a header on a WebSocket handshake, so the token has to be in the URL from the start.
+  const settings = await getSettings();
 
   opening = new Promise((resolve, reject) => {
     let ws;
     try {
-      ws = new WebSocket(daemonUrl(), WS_PROTOCOL);
+      ws = new WebSocket(daemonUrl(settings), WS_PROTOCOL);
     } catch (error) {
       opening = null;
       reject(error);
@@ -460,9 +500,16 @@ api.runtime.onMessage.addListener((message, _sender, respond) => {
         case 'settings:get':
           respond({ ok: true, settings: await getSettings() });
           break;
-        case 'settings:set':
-          respond({ ok: true, settings: await setSettings(message.patch || {}) });
+        case 'settings:set': {
+          const patch = message.patch || {};
+          const settings = await setSettings(patch);
+          // A token only matters at handshake time, so a changed one has to close the live
+          // socket; otherwise the old credential would keep working until the socket went
+          // idle, and a *removed* token would be equally invisible.
+          if ('daemonToken' in patch) closeSocket();
+          respond({ ok: true, settings });
           break;
+        }
         case 'daemon:status':
           respond({ ok: true, kv: await daemonStatus() });
           break;
@@ -482,7 +529,12 @@ api.runtime.onMessage.addListener((message, _sender, respond) => {
           break;
         }
         case 'api:base':
-          respond({ ok: true, base: API_BASE });
+          respond({
+            ok: true,
+            base: API_BASE,
+            // The popup fetches the JSON API directly, so it needs the same credential.
+            token: (await getSettings()).daemonToken,
+          });
           break;
         default:
           respond({ ok: false, error: `unknown request ${message && message.kind}` });

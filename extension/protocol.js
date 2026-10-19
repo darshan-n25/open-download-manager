@@ -53,6 +53,19 @@
     }
   }
 
+  /**
+   * Build the daemon WebSocket URL.
+   *
+   * The browser cannot set a header on a WebSocket handshake, so when the daemon demands a
+   * bearer token the token has to ride in the query string. A URL can end up in a log or in
+   * shell history in a way a header does not, which is why the daemon accepts both forms and
+   * prefers the header wherever a header is possible.
+   */
+  function daemonWsUrl({ host, port, cid, token, nonce }) {
+    const base = `ws://${host}:${port}/?cid=${encodeComponent(cid)}&rnd=${nonce}`;
+    return token ? `${base}&token=${encodeComponent(token)}` : base;
+  }
+
   function encodeFrame(input) {
     const id = input.id;
     const type = input.type;
@@ -132,6 +145,7 @@
     PROTOCOL_VERSION,
     encodeComponent,
     decodeComponent,
+    daemonWsUrl,
     encodeFrame,
     parseFrame,
     drainFrames,

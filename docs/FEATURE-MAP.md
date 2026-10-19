@@ -137,12 +137,13 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | WebSocket on `127.0.0.1:1001`, subprotocol `plugin.v3.internetdownloadmanager.com` `[OBSERVED]` | **Done** | `src/daemon.rs` | Same address, same subprotocol, negotiated in the handshake. Test: `tests/daemon.rs` drives a real tungstenite client with the subprotocol and asserts the reply header. |
 | `MSG#<id>#<type>#<a>#<b>[,k=v…];` framing; the shipped sample `MSG#0#17#1#0:9:` `[OBSERVED]` | **Done** | `encode_frame`/`parse_frame` | The shipped sample is a test fixture (`the_shipped_sample_frame_parses`). Values are percent-encoded; every delimiter inside a value survives (`delimiters_inside_values_survive`). |
 | Version constant `16845059` = `0x01010903` `[OBSERVED]` | **Done** | `PROTOCOL_VERSION` | Sent in `HELLO`, echoed in `HELLO_ACK`. The daemon logs a mismatch but keeps going, so a bumped constant in a future IDM build still interoperates. |
+| Any client that can reach `127.0.0.1:1001` is trusted `[INFERRED]` | **Done, and tightened** | `src/auth/token.rs`, `handle_http`, `handle_ws` | A bearer token is optional, but absolute once configured: every HTTP route — the control page and `/health` included — and the WebSocket handshake require it. Compared as fixed-width SHA-256 digests, so neither a correct prefix nor a wrong length is observable in timing (`constant_time_compare_agrees_with_equality`). Sources in order: `--token-file`, `RIPTIDE_DAEMON_TOKEN`, the `daemon_token_file` setting; a configured source that cannot be read **aborts startup** rather than quietly disabling authentication. A browser client sends it as `?token=` because a handshake cannot carry a header; a non-browser may use `Authorization: Bearer`. A `POST` must declare `Content-Type: application/json`, so a page on another origin (whose simple requests cannot use that type without a preflight, and no CORS headers are ever sent) cannot drive a tokenless loopback daemon. |
 | Opcode numbering on the wire | **Done but Riptide's own** | `msg` module | IDM's server-side opcode enum is **not** in the shipped extension (only the dispatcher ships), so the numbers are Riptide's invention and are documented as such. Framing and handshake match; numbering is not claimed to. |
 | Native messaging host `com.tonec.idm` → `IDMMsgHost.exe` → named pipe `[OBSERVED]` | **Refused** | — | It needs a per-OS host manifest (or a Windows registry key), and it trusts any process that can reach the pipe. A loopback WebSocket needs neither. |
 | `declarativeNetRequest` redirect rules that make the browser download through IDM `[OBSERVED]` | **Refused** | `extension/background.js` | Riptide cancels in `downloads.onCreated` instead: visible in the browser's own UI, reversible, and handed back to the browser if the daemon is down. |
 | Redirecting the browser through IDM's local proxy `[OBSERVED]` | **Refused** | — | No interception of unrelated browsing and no TLS man-in-the-middle. Riptide runs its own HTTP stack. |
 | Kernel filter drivers `idmwfp*.sys`, `idmtdi*.sys` `[OBSERVED]` | **Refused** | — | Kernel code, driver signing and elevated privileges to do what a userspace client already does. |
-| Trust derived from the connecting process's PID `[INFERRED]` | **Refused** | — | A loopback daemon that accepts `ADD` from localhost is the honest version of the same trust model: a local process could queue downloads either way, but it cannot redirect traffic. |
+| Trust derived from the connecting process's PID `[INFERRED]` | **Refused** | — | A loopback daemon that accepts `ADD` from localhost is the honest version of the same trust model: a local process could queue downloads either way, but it cannot redirect traffic. Where the trust has to cross a network, the answer is a shared secret rather than a process identity — see the bearer-token row above. |
 | Cookies, `Referer` and `User-Agent` carried across to the download `[OBSERVED]` | **Done** | `extension/background.js` | `chrome.cookies.getAll({url})`, `downloads.onCreated`'s `referrer`, `navigator.userAgent`. |
 | MIME → extension table `IDMFType.dat` `[OBSERVED]` | **Partial** | `src/engine.rs` (extension chosen from `Content-Disposition`, then `Content-Type`), `src/util.rs` `category_for_extension` | A small built-in map. It does **not** read IDM's `.dat` files. |
 | HLS hand-off URL schemes (`hls2toidm://`, `idmhlstomp4v2://`, …) `[OBSERVED]` | **Absent** | — | Riptide's extension sends a normal `ADD` with the `.m3u8` URL and the daemon infers `hls`. The URL-scheme protocol exists because IDM's extension needed to launch a separate process. |
@@ -237,7 +238,7 @@ gaps; the third is answered by construction.
 
 ## 13. What "tested" means here
 
-`cargo test` runs 292 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
+`cargo test` runs 314 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 15
 more against the extension's framing. The distinction that matters in this document:
 
 - **Unit tests** prove an algorithm in isolation (parsers, KDFs, the segment table, the
@@ -265,7 +266,14 @@ more against the extension's framing. The distinction that matters in this docum
   file because the binary predated the change — a live check catching exactly the class of
   mistake it exists for. After rebuilding, a correct digest published byte-identically, a wrong
   one published nothing and left the job `failed` with the mismatch recorded, a malformed spec
-  was a `400`, and the refused combinations all exited non-zero with an explanation.
+  was a `400`, and the refused combinations all exited non-zero with an explanation. Daemon
+  authentication was checked the same way and against a *browser's* constraints rather than a
+  test client's: a real `curl` saw `401` on `/`, `/health`, `/api/jobs`, `/api/quota` and
+  `/api/projects` without the token and `200` with it, a wrong token stayed `401`, a queued job
+  appeared in the listing, `--generate-token-file` produced a `0600` file the daemon accepted,
+  a missing or empty source aborted startup with a message, and Node's own `WebSocket` — which
+  cannot set a handshake header, exactly like a browser — was refused with no token and got a
+  real `HELLO_ACK` with `?token=`.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
 Windows host, a PAC file, an FTPS server, a *successful* `ffmpeg` MPEG-TS remux (a build is
@@ -273,7 +281,9 @@ present on this host now, but it segfaults on every MPEG-TS input, so the remux 
 unverified — the reason changed, not the verdict; the failure and fallback paths, by contrast,
 are now tested against an absent, a broken, and the host's own `ffmpeg`; see
 [`ROADMAP.md`](ROADMAP.md)), an MMS source, a live HLS/DASH origin, a
-scheduler other than a self-written `cron`-shaped one, or a real web server other than the ones
+scheduler other than a self-written `cron`-shaped one, a real browser with the extension loaded
+(so the token field in `popup.html` has been exercised only by its unit-tested URL builder and
+by a Node `WebSocket` standing in for the browser's), or a real web server other than the ones
 written for these tests. Those rows are labelled **Unverified**, **Partial**, **Absent** or
 **Refused** above and should be treated that way. The mock `Negotiate` server in
 `tests/negotiate.rs` and the conditional-`GET` server in `tests/projects.rs` were written from

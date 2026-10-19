@@ -1,6 +1,6 @@
 // Tests for the extension's half of the `MSG#` protocol.
 //
-// Run with:  node --test extension/tests/
+// Run with:  node --test extension/tests/protocol.test.mjs
 //
 // These exist because the framing is implemented twice — once here, once in
 // `src/daemon.rs` — and the two must agree byte for byte. The first version of
@@ -139,4 +139,42 @@ test('encoding is exactly encodeURIComponent', () => {
   // `src/daemon.rs::values_encoded_the_way_encodeuricomponent_does_are_decoded_verbatim`.
   assert.equal(P.encodeComponent('a=1; b=2; c=3'), 'a%3D1%3B%20b%3D2%3B%20c%3D3');
   assert.equal(P.encodeComponent('/home/me/My Files/x.iso'), '%2Fhome%2Fme%2FMy%20Files%2Fx.iso');
+});
+
+test('the daemon URL carries a token only when there is one', () => {
+  const base = { host: '127.0.0.1', port: 1001, cid: 'riptide-ext', nonce: 1234 };
+
+  const bare = P.daemonWsUrl({ ...base, token: '' });
+  assert.equal(bare, 'ws://127.0.0.1:1001/?cid=riptide-ext&rnd=1234');
+  assert.ok(!bare.includes('token'), bare);
+
+  // Undefined and null behave like empty, so a settings file that predates the field works.
+  assert.equal(P.daemonWsUrl({ ...base, token: undefined }), bare);
+  assert.equal(P.daemonWsUrl({ ...base, token: null }), bare);
+
+  const withToken = P.daemonWsUrl({ ...base, token: 'abc123' });
+  assert.equal(withToken, 'ws://127.0.0.1:1001/?cid=riptide-ext&rnd=1234&token=abc123');
+});
+
+test('a token that needs encoding is encoded', () => {
+  // A hex token needs none, but nothing stops a deployment from using a passphrase, and an
+  // unencoded `&` or `#` would silently truncate the query the daemon parses.
+  const url = P.daemonWsUrl({
+    host: '10.0.0.5',
+    port: 1001,
+    cid: 'riptide-ext',
+    token: 'a&b=c #d',
+    nonce: 7,
+  });
+  assert.equal(url, 'ws://10.0.0.5:1001/?cid=riptide-ext&rnd=7&token=a%26b%3Dc%20%23d');
+
+  // And the daemon's own parser reads back exactly what was sent: percent-decode, then take
+  // the `token=` pair. (The Rust side is asserted in `src/daemon.rs::a_token_query_parameter
+  // _is_read_and_decoded`.)
+  const query = url.split('?')[1];
+  const pairs = query.split('&');
+  const value = pairs.find((p) => p.startsWith('token=')).slice('token='.length);
+  assert.equal(decodeURIComponent(value), 'a&b=c #d');
+  // Splitting on `&` must not have broken the token in two.
+  assert.equal(pairs.length, 3);
 });

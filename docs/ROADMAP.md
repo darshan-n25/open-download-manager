@@ -9,9 +9,9 @@ Two things live here:
    trusted or re-run rather than taken on faith.
 2. **A ranked roadmap** for what to build next, including the requests the
    [community survey](COMMUNITY-REQUESTS.md) surfaced.
-3. **What has shipped from it.** Items 1 (checksum verification) and 6 (MPEG-TS remux
-   hardening) were both built on 2026-10-19; their entries in the roadmap table carry a status
-   and a shared section describes what actually landed and how it is tested.
+3. **What has shipped from it.** Items 1 (checksum verification), 2 (daemon authentication) and 6
+   (MPEG-TS remux hardening) were all built on 2026-10-19; their entries in the roadmap table
+   carry a status, and a section each describes what actually landed and how it is tested.
 
 Every claim here is tagged the same way the reverse-engineering report tags its own:
 `OBSERVED` (a command was run, here is its output), `INFERRED`, or `UNKNOWN`.
@@ -201,7 +201,7 @@ what the verification above turned up.
 | # | Item | Status | Why | Cost | Notes |
 | --- | --- | --- | --- | --- | --- |
 | 1 | **Checksum verification** (`--checksum sha256:…`) | ✅ **shipped 2026-10-19** | The cheapest real gap; every neighbouring project lists it and the [survey](COMMUNITY-REQUESTS.md) ranks it second | Small | The temp-then-`rename` path already exists (`storage.rs`), so this is a pre-rename hook: hash the temp file, and on mismatch delete the temp and fail the job. Nothing partially-written ever becomes the output. Support at least `sha256:` and `sha512:`; make it work for `grab`, `project` and the daemon API alike |
-| 2 | **Daemon authentication** | planned | The daemon binds `127.0.0.1:1001` and has **no** token (`src/config.rs:69`), which is the blocker on every NAS / headless / remote-control request in the survey | Small–medium | A bearer token in `Config`, compared in constant time, required on every route once set; a `--token-file`/env source so it is not in the process arguments. With a token the daemon can then safely bind off-loopback |
+| 2 | **Daemon authentication** | ✅ **shipped 2026-10-19** | The daemon bound `127.0.0.1:1001` with **no** token (`src/config.rs:69`), which was the blocker on every NAS / headless / remote-control request in the survey | Small–medium | A bearer token, compared in constant time, required on every route once set; a `--token-file`/env source so it is not in the process arguments. With a token the daemon can then safely bind off-loopback — with the caveat that the transport is plain HTTP, which the daemon now says out loud |
 | 3 | **Linux + macOS + Windows support, for real** | planned | The single most-repeated ask; today only `x86_64-unknown-linux-gnu` is built and no CI exists (Part 2) | Medium | A CI matrix (`ubuntu`, `macos`, `windows`) running `cargo test` + clippy + fmt; install the other targets; actually exercise the Windows `write_all_at` branch. Static musl builds for Linux come with item 4 |
 | 4 | **Headless packaging** | planned | Static binaries + a container image for drop-in NAS use | Small once 3 exists | Mostly build wiring, no new logic: `x86_64-unknown-linux-musl` release artefacts, a `scratch`/`distroless` image, and the daemon as the entrypoint. The extension is optional in this mode — the HTTP API is the interface |
 | 5 | **BitTorrent as a sibling binary** | planned | The most-requested feature in the whole ecosystem, and IDM lacks it too (verified: no BitTorrent protocol strings in `IDMan.exe`) | Large | A **separate** binary (`riptide-bt`) that shares the queue, state store, quota and scheduler with the HTTP engine — explicitly **not** a mode inside it. Different wire protocol, different peer model, different failure modes; folding it into the HTTP engine would put both at risk |
@@ -243,6 +243,60 @@ post-download check:
 Evidence: 9 unit tests in `src/checksum.rs` (published vectors for all four algorithms, the
 length inference, every malformed spec, streaming a >64 KiB file, serde round-trip) plus
 `tests/checksum.rs` — 6 end-to-end tests against a real HTTP server with range support.
+
+### Item 2 — what shipped
+
+`src/auth/token.rs` holds the whole credential story: `Auth` (the token as a SHA-256 digest) and
+`load`, which resolves it from the first source that is *configured*.
+
+| Source | Precedence | Why it exists |
+| --- | --- | --- |
+| `--token-file PATH` | 1 | Per-run control. A **path**, so the secret never appears in `argv`, which `ps auxww` shows to every user on the machine |
+| `RIPTIDE_DAEMON_TOKEN` | 2 | Containers and service managers, which inject a secret without writing a file |
+| `daemon_token_file` in `config.json` | 3 | Set once with `riptide config set daemon_token_file /etc/riptide/token`; `config set … none` unsets it |
+
+Three decisions are load-bearing:
+
+- **Constant-time comparison.** Both sides are SHA-256-hashed first, so the compare is over a
+  fixed 32 bytes whatever the input length, and neither a correct *prefix* nor a wrong *length*
+  is observable in timing. `constant_time_compare_agrees_with_equality` pins the behaviour.
+- **A broken source is a startup failure.** A missing file, an empty file, or an empty variable
+  aborts with a message instead of falling through to "no token". A typo in a path is the one
+  failure mode that must never turn authentication off quietly.
+- **Enforcement covers everything.** `handle_http` checks after parsing and before routing, so
+  the control page, `/health`, `/api/jobs`, `/api/quota`, `/api/projects` and every future route
+  are covered by construction. `handle_ws` checks inside the handshake callback, before the
+  subprotocol is negotiated, so an unauthenticated client never gets a socket at all.
+
+Two carriers are accepted, because a browser cannot set a header on a WebSocket handshake:
+`Authorization: Bearer <token>`, and `?token=<token>` (percent-decoded). Either one is enough;
+they are the same secret, so a request carrying a stale copy of one alongside a valid copy of the
+other is not punished for the stale one.
+
+What the token does **not** fix is the transport: the daemon speaks plain HTTP and a plain `ws://`
+handshake, so `serve_on` now prints — and logs — a note on startup when it is bound off loopback,
+saying that the token travels in the clear and that TLS belongs in front of it. The inverse case
+gets a warning instead: off loopback with no token is a hole, and the message says so and names
+the two ways to fix it. Both texts come from `exposure_notes`, which is unit-tested rather than
+printed into a captured stream.
+
+One gap in the *default* (tokenless, loopback) configuration turned out to be worth closing in
+the same change. A page on another origin can POST to `http://127.0.0.1:1001` — the classic
+localhost-service problem — and while it cannot read the response, the download would already be
+queued. So **a POST must now declare `Content-Type: application/json`** (`is_json_request`, `415`
+otherwise). Browsers treat that media type as non-simple, so any cross-origin request carrying it
+is preflighted first; the daemon sends no CORS headers and answers no preflight, so the request
+never happens. The content types a form or a plain `fetch` *can* send are exactly the ones now
+refused. The extension is unaffected: it adds jobs over the WebSocket, not over HTTP.
+
+Evidence: 10 unit tests in `src/auth/token.rs` (exact, wrong, prefix-of and overlong tokens;
+scheme casing; the three-source precedence in both directions; every broken-source shape;
+freshness and `0600` permissions on a generated file; the constant-time compare), 4 more in
+`src/daemon.rs` (`query_param` decoding, the either-carrier rule, `exposure_notes`, and
+`is_json_request`'s accept/refuse table). `tests/daemon.rs` adds 7 protocol tests: every route 401
+then 200, the 401 body and its `WWW-Authenticate` scheme, both carriers, the refused handshake,
+the bearer header on a handshake, a web-page-shaped POST refused with nothing queued, and the
+tokenless default unchanged.
 
 ### Item 6 — what shipped
 
@@ -329,4 +383,71 @@ curl -s -X POST http://127.0.0.1:18098/api/jobs -H 'content-type: application/js
 
 # Item 6 — every kind of ffmpeg, including the broken one on this host
 cargo test --lib media::remux
+```
+
+## Part 6 — Reproducing item 2
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+# Keep the live check away from the real state and config directories.
+export XDG_DATA_HOME=/tmp/rtauth/data XDG_CONFIG_HOME=/tmp/rtauth/config
+mkdir -p /tmp/rtauth
+
+# Unit: the token, its sources, its comparison, and the exposure texts.
+cargo test --lib auth::token
+cargo test --lib daemon
+
+# Protocol: every route, the handshake, and the POST rule.
+cargo test --test daemon
+
+# A token file that cannot be read is a startup failure, not an open daemon.
+riptide daemon --addr 127.0.0.1:18123 --token-file /tmp/rtauth/absent   # exits non-zero
+
+# Live: generate a token, bind a port, and ask it things as a client would.
+riptide daemon --generate-token-file /tmp/rtauth/token
+stat -c '%a %n' /tmp/rtauth/token            # 600
+TOKEN=$(cat /tmp/rtauth/token)
+riptide daemon --addr 127.0.0.1:18123 --token-file /tmp/rtauth/token &
+sleep 1
+
+for p in / /health /api/jobs /api/quota /api/projects; do
+  curl -s -o /dev/null -w "$p %{http_code}\n" "http://127.0.0.1:18123$p"                 # all 401
+  curl -s -o /dev/null -w "$p %{http_code}\n" \
+       -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:18123$p"                       # all 200
+done
+
+# Either carrier, and a wrong token is not a token.
+curl -s -o /dev/null -w '%{http_code}\n' -H "authorization: bearer $TOKEN" http://127.0.0.1:18123/health
+curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:18123/api/quota?token=$TOKEN"
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Authorization: Bearer nope' http://127.0.0.1:18123/api/jobs
+
+# A POST a web page could send is refused: a form or plain-fetch content type, or none at all.
+curl -s -X POST -H 'content-type: text/plain' -d '{"url":"https://example.com/x"}' \
+     http://127.0.0.1:18123/api/jobs                     # 415
+curl -s -X POST -d '{"url":"https://example.com/x"}' \
+     http://127.0.0.1:18123/api/jobs                     # 415 (curl's form encoding)
+
+# Off loopback the daemon says what the token does and does not protect.
+#   warning: … no token is configured …        (no token, off loopback)
+#   note: … plain HTTP, so the token travels in the clear …
+RIPTIDE_DAEMON_TOKEN=envtok riptide daemon --addr 0.0.0.0:18124 &   # note
+```
+
+For the WebSocket half, the relevant property is that the client is a *browser*, which cannot
+set a handshake header. Node's built-in `WebSocket` has the same limitation, so it stands in for
+one: `GET`-style checks cannot reach `handle_ws` at all, and a `tokio-tungstenite` client happily
+sets headers a browser never could. A connection to `ws://127.0.0.1:18123/?cid=x&rnd=1` with no
+token is refused (no socket, `handshake rejected`), while `…&token=$TOKEN` completes the
+handshake, negotiates `plugin.v3.internetdownloadmanager.com`, and answers `HELLO` with a real
+`HELLO_ACK`. That is what was run here:
+
+```sh
+node -e '
+const url = `ws://127.0.0.1:18123/?cid=ext&rnd=1&token=${process.argv[1]}`;
+const ws = new WebSocket(url, "plugin.v3.internetdownloadmanager.com");
+ws.onopen = () => ws.send("MSG#1#1#0#0;");
+ws.onmessage = (e) => { console.log(e.data); process.exit(0); };
+ws.onerror = () => { console.log("refused"); process.exit(0); };
+' "$TOKEN"
+# without the token: refused
 ```

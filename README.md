@@ -60,6 +60,7 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Archiving | `grab --archive` (or a `site` project with `--archive`) keeps a page and everything it needs to render — stylesheets, scripts, images, fonts — rewriting the markup to local relative paths; every URL gets a path decided by the URL alone, and anything it could not hold keeps pointing at the live site |
 | Projects | Recurring work stored as one document per project: `file` keeps a URL in step with a local path using conditional requests (`304` costs no body bytes), `site` re-crawls and fetches only what changed, `site --archive` keeps an offline mirror; run by the daemon when due, or from `cron` with `project tick` |
 | Browser | MV3 extension + a loopback daemon speaking IDM's `MSG#` framing over its WebSocket subprotocol, plus a plain JSON API |
+| Daemon auth | Optional bearer token required on **every** route — the JSON API, the control page, `/health`, and the WebSocket handshake — compared in constant time. The token comes from `--token-file`, `RIPTIDE_DAEMON_TOKEN`, or the `daemon_token_file` setting, never from an argument; off-loopback binds say what is at stake |
 | CLI | `download`, `grab`, `daemon`, `probe`, `list`, `show`, `remove`, `pause`, `queue`, `project`, `config`, `state-dir` |
 
 ## Build and install
@@ -70,7 +71,7 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 292 tests: unit + protocol + end-to-end
+cargo test         # 312 tests: unit + protocol + end-to-end
 ```
 
 ## Use
@@ -258,8 +259,49 @@ curl -s http://127.0.0.1:1001/api/projects   # recurring projects and when each 
 curl -s -X POST http://127.0.0.1:1001/api/jobs \
      -H 'content-type: application/json' \
      -d '{"url":"https://example.com/big.iso","connections":16}'
-curl -s -X POST http://127.0.0.1:1001/api/projects/feed/run   # run a project now
+curl -s -X POST http://127.0.0.1:1001/api/projects/feed/run \
+     -H 'content-type: application/json'          # run a project now
 ```
+
+A POST has to declare `application/json`, including one with no body. See
+[Authentication](#authentication) for why that rule is load-bearing rather than pedantic.
+
+### Authentication
+
+By default the daemon has none, which is why it listens on `127.0.0.1` and nowhere else. To
+drive it from another machine — a NAS, a container, a second laptop — give it a token and bind
+it wider:
+
+```sh
+riptide daemon --generate-token-file ~/.config/riptide/token   # 32 random bytes, mode 0600
+riptide daemon --token-file ~/.config/riptide/token --addr 0.0.0.0:1001
+```
+
+Once a token is set **every** route needs it: the JSON API, the control page, `/health`, and the
+WebSocket handshake the extension uses.
+
+```sh
+curl -s -H "Authorization: Bearer $(cat ~/.config/riptide/token)" http://127.0.0.1:1001/api/jobs
+curl -s "http://127.0.0.1:1001/api/jobs?token=$(cat ~/.config/riptide/token)"   # same thing
+```
+
+Where the token can come from, in order of precedence:
+
+| Source | Why it exists |
+| --- | --- |
+| `--token-file PATH` | Per-run control; a *path*, so the secret is not in `argv`, which `ps` shows to every user |
+| `RIPTIDE_DAEMON_TOKEN` | Containers and service managers, which can inject a secret without a file |
+| `daemon_token_file` setting (`riptide config set daemon_token_file /etc/riptide/token`) | Set once and forgotten; `config set … none` unsets it |
+
+A configured source that cannot be read (missing file, empty file, empty variable) is a **startup
+failure**, never a quiet fall back to "no token". A misspelled path must not turn authentication
+off. The extension has a **Daemon token** field under Settings, which it sends in the WebSocket
+URL — a browser cannot set a header on a handshake.
+
+What a token does and does not buy you: the daemon speaks plain HTTP, so a token stops someone
+who can reach the port but not watch the wire. Publicly reachable means putting TLS in front of it
+(a reverse proxy, or an SSH tunnel), and the daemon says so on startup when it is bound off
+loopback.
 
 ## Architecture
 
@@ -280,13 +322,14 @@ src/
   auth.rs        Basic, Digest, Bearer; spec parsing and challenge handling
   auth/ntlm.rs   NTLMv2 (NTOWFv2, Type 1/2/3 messages) from MS-NLMP
   auth/spnego.rs SPNEGO (RFC 4178/4559): hand-rolled DER, wrapping, mechanism classification
+  auth/token.rs  the daemon's own bearer token: constant-time compare, file/env sources
   net/           client construction, TLS policy, proxy parsing and resolution
   media/         HLS resolver, MPD parser, muxing and remuxing
   grabber.rs     link extraction, filtering, crawl
   archive.rs     offline mirroring: URL→path placement, markup rewriting, asset fetching
   project.rs     recurring projects: periodic file sync, scheduled site crawls, due-time logic
   ftp.rs         passive-mode FTP with REST resume
-  daemon.rs      `MSG#` WebSocket service + JSON HTTP API + project ticker
+  daemon.rs      `MSG#` WebSocket service + JSON HTTP API + bearer-token gate + project ticker
 extension/       MV3 browser integration (background, popup, options)
 tests/           end-to-end tests against servers that really do byte ranges, conditional requests and SPNEGO, plus daemon protocol tests and an archive suite that reads its own output back
 ```
@@ -304,7 +347,7 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 | Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
 | BitTorrent and magnet links | The single most-cited reason to keep a second app installed | Deliberately absent — a second engine, not a mode of this one |
 | Checksum verification | Listed as a headline feature by neighbouring projects | `--checksum sha256:…`, verified before the rename |
-| Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick`; **no daemon auth yet** |
+| Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick` + an optional bearer token on every route |
 | No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
 | Offline copies of sites | IDM advertises it; the strings are in the binary | `grab --archive`, `site --archive` |
 
@@ -321,17 +364,19 @@ and ranks what to build next. The ranking, in short:
    `POST /api/jobs`.
 2. **MPEG-TS remux hardening** (was item 6) — a failing `ffmpeg` now falls back to keeping the
    raw `.ts`, where before only a *missing* `ffmpeg` did.
+3. **Daemon authentication** (was item 2) — a bearer token from `--token-file`,
+   `RIPTIDE_DAEMON_TOKEN` or a config path, required on every HTTP route and on the WebSocket
+   handshake, compared in constant time. Off-loopback binds now carry a startup note saying what
+   the token does and does not protect.
 
 **Still to build, in the order the roadmap ranks them:**
 
-1. **Daemon authentication** — a bearer token, which is the blocker on binding the daemon
-   anywhere but loopback.
-2. **Linux + macOS + Windows support for real** — the loudest ask in the ecosystem; today only
+1. **Linux + macOS + Windows support for real** — the loudest ask in the ecosystem; today only
    `x86_64-unknown-linux-gnu` is built and there is no CI.
-3. **Headless packaging** — static binaries and a container image for NAS use.
-4. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
+2. **Headless packaging** — static binaries and a container image for NAS use.
+3. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
    the queue and state but deliberately **not** a mode of the HTTP engine.
-5. **Finishing the MPEG-TS remux verification** — a host with a working `ffmpeg` and a real
+4. **Finishing the MPEG-TS remux verification** — a host with a working `ffmpeg` and a real
    transport-stream fixture, to prove the *successful* remux as well as the fallback.
 
 The same document records what verification changed on 2026-10-19: ffmpeg turned out to be
@@ -361,7 +406,7 @@ browser.
 | Kernel filter drivers (`idmwfp*.sys`, `idmtdi*.sys`) | None | Needs kernel code, driver signing and admin rights to do what a userspace proxy client already does |
 | Redirects browser traffic through IDM's proxy | Nothing — Riptide runs its own HTTP stack | No interception of unrelated browsing, and no TLS man-in-the-middle requirement |
 | `declarativeNetRequest` rules to silently rewrite downloads | `downloads.onCreated` + explicit cancel | Visible, reversible, and hands the download back to the browser if the daemon is down |
-| Native messaging host (`IDMMsgHost.exe`) trusted by PID | WebSocket on loopback | No registry keys or per-OS host manifests; the peer is a real endpoint |
+| Native messaging host (`IDMMsgHost.exe`) trusted by PID | WebSocket on loopback, optional bearer token off it | No registry keys or per-OS host manifests, and no "trust whatever connects" assumption — the peer presents a secret instead of being inferred from a process id |
 | Merge-based completion | Direct positional writes + `rename` | The merge step is the single most common IDM complaint |
 
 ## Known limitations
@@ -392,6 +437,28 @@ against this implementation (§12 there). The short version:
   extinct.
 - **`multipart/byteranges` responses are not parsed** (Riptide always asks for one range per
   request, so a conforming server never sends them).
+
+**Daemon**
+
+- **A token is not a substitute for TLS.** The daemon speaks plain HTTP and a plain `ws://`
+  handshake, so a bearer token stops someone who can reach the port but cannot watch the wire.
+  Anything reachable beyond a trusted network needs TLS in front of it (a reverse proxy, or an
+  SSH tunnel); the daemon prints that note itself when bound off loopback.
+- **No token means no authentication at all**, which is why the default bind is `127.0.0.1`.
+  What limits the damage of a tokenless loopback daemon is that its API is not reachable from a
+  web page: `POST` requires `Content-Type: application/json`, which browsers preflight, and no
+  CORS headers are ever sent. A local *process* running as your user can still drive it — as it
+  could edit the state directory directly.
+- **One token, no identities.** There is no per-client token, no expiry, no rotation API and no
+  failure rate-limiting: the question it answers is "may this client talk to my daemon at all",
+  which is what binding off loopback needs, and deliberately not more.
+- **The token rides in the WebSocket query string** for browser clients, because a handshake
+  cannot carry a header. A URL can end up in a log in a way a header cannot, so the header form
+  is preferred everywhere it is possible. Nothing about this affects the default loopback setup,
+  which needs no token.
+- **Failed authentication is logged, not delayed.** A wrong token gets a 401 immediately rather
+  than a backoff. With a 256-bit secret that is the right trade, but it does mean a token that is
+  a short password is only as strong as that password.
 
 **Media**
 
@@ -484,11 +551,11 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 292 tests
-node --test extension/tests/protocol.test.mjs   # JavaScript: 13 tests
+cargo test                              # Rust: 314 tests
+node --test extension/tests/protocol.test.mjs   # JavaScript: 15 tests
 ```
 
-292 Rust tests: 234 unit tests across every module, 10 daemon-protocol tests driving a real
+314 Rust tests: 249 unit tests across every module, 17 daemon-protocol tests driving a real
 WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
 which really does byte ranges, 6 that stand up a mock `Negotiate` server, 6 that verify
 checksums end-to-end against a real HTTP server, 17 that stand up a server which really
@@ -510,6 +577,11 @@ The end-to-end ones assert that
 - a **checksum** that matches publishes the file byte-identically on both the segmented and the
   single-stream path, and a checksum that does not match fails the job, removes the working
   file, publishes nothing, and leaves an **existing good file untouched**;
+- **every route is 401 without the daemon's token** and 200 with it, in either the header or the
+  query form, including the control page and `/health`; the WebSocket handshake is refused
+  outright without it, and the token is compared in constant time;
+- a **`POST` a web page could have sent** — `text/plain`, a form encoding, or no content type at
+  all — is refused, and queues nothing;
 - the grabber follows exactly one level per `depth` and filters trackers;
 - a **`Negotiate` job completes a real SPNEGO handshake** against a mock server that unwraps the
   token, issues an NTLMSSP challenge inside a `NegTokenResp`, and verifies the client's NTProofStr

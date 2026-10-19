@@ -152,9 +152,10 @@ Requests cluster around "run it somewhere that is not my desktop, and talk to it
   answer to a server-shaped question (see §9).
 
 **Riptide:** the daemon, its JSON API, the CLI, and `project tick` for cron are the closest match
-on this page — you can run the daemon on a NAS and drive it over HTTP. Two honest gaps: the
-daemon has **no authentication** (it is loopback-only, which is a boundary, not a secret), and
-the only UI is a status page. Both are cheap; neither is done.
+on this page — you can run the daemon on a NAS and drive it over HTTP, with an optional bearer
+token required on every route (HTTP and the WebSocket handshake alike) so binding it beyond
+loopback is a decision rather than an accident. One honest gap remains: the only UI is a status
+page. That is cheap; it is not done.
 
 ## 8. No ads, no nag, no account
 
@@ -205,6 +206,11 @@ Not commitments — candidates, ordered by (evidence × cost):
 5. **Not** DRM circumvention, and **not** a per-site media extractor (§3): the first is a
    different kind of software, and the second is a maintenance treadmill that IDM itself
    visibly struggles with.
+
+Since this list was written, candidates 1 and 2 have shipped: checksum verification, and daemon
+authentication (a constant-time bearer token from a file, the environment, or a config path,
+required on every HTTP route and on the WebSocket handshake). See [`ROADMAP.md`](ROADMAP.md) for
+what is left and the order it is ranked in.
 
 ## Sources
 

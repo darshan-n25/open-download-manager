@@ -39,6 +39,16 @@ pub struct Config {
     /// Auto-sort finished files into per-type subfolders, as IDM's categories do.
     pub auto_categorize: bool,
     pub daemon_addr: String,
+    /// File holding the bearer token every daemon request must present. `None` means the
+    /// daemon is unauthenticated, which is only appropriate while it is bound to loopback.
+    ///
+    /// A *path*, not the secret: the config file is often world-readable, and a path can be
+    /// shared with a service unit without copying the token into two places.
+    ///
+    /// Serialised as an explicit `null` rather than skipped, so `config set daemon_token_file`
+    /// can find the key (and `config show` shows it, like every other optional setting).
+    #[serde(default)]
+    pub daemon_token_file: Option<PathBuf>,
     pub connect_timeout_secs: u64,
     /// Idle read timeout — IDM's "Connection restarted because of timeout".
     pub read_timeout_secs: u64,
@@ -67,6 +77,7 @@ impl Default for Config {
             insecure: false,
             auto_categorize: true,
             daemon_addr: "127.0.0.1:1001".to_string(),
+            daemon_token_file: None,
             connect_timeout_secs: 15,
             read_timeout_secs: 30,
             retry_backoff_ms: 500,

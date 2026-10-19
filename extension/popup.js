@@ -8,6 +8,8 @@ const api = globalThis.browser ?? globalThis.chrome;
 const $ = (id) => document.getElementById(id);
 
 let apiBase = 'http://127.0.0.1:1001';
+/** The daemon's bearer token, if it requires one; kept in step with the background page. */
+let apiToken = '';
 let found = [];
 let refreshTimer = null;
 
@@ -71,7 +73,18 @@ function setStatus(online) {
 async function loadJobs() {
   let jobs;
   try {
-    const response = await fetch(`${apiBase}/api/jobs`, { cache: 'no-store' });
+    const response = await fetch(`${apiBase}/api/jobs`, {
+      cache: 'no-store',
+      headers: apiToken ? { authorization: `Bearer ${apiToken}` } : {},
+    });
+    if (response.status === 401) {
+      // A 401 is not "offline": the daemon is there and refusing us, so say which of the two
+      // it is rather than sending the user to look at the firewall.
+      setStatus(false);
+      $('queue-summary').textContent = 'the daemon wants a token — add it under Settings';
+      $('jobs').innerHTML = '';
+      return;
+    }
     jobs = await response.json();
   } catch {
     setStatus(false);
@@ -265,6 +278,7 @@ const SETTINGS_FIELDS = [
   ['set-speed', 'speedLimit', 'text'],
   ['set-quality', 'quality', 'text'],
   ['set-output', 'outputDir', 'text'],
+  ['set-token', 'daemonToken', 'text'],
   ['set-cookies', 'forwardCookies', 'checkbox'],
   ['set-referer', 'forwardReferer', 'checkbox'],
   ['set-notify', 'notify', 'checkbox'],
@@ -309,8 +323,12 @@ function bindSettings() {
   let saveTimer = null;
   const save = async () => {
     try {
-      await bg('settings:set', { patch: readForm() });
+      const reply = await bg('settings:set', { patch: readForm() });
+      // The token can be edited here, so take the stored value back rather than the one that
+      // was typed, and re-read the list instead of showing the 401 text until the next poll.
+      apiToken = reply.settings.daemonToken || '';
       $('settings-note').textContent = 'Saved.';
+      await loadJobs();
     } catch (error) {
       $('settings-note').textContent = `Could not save: ${error.message}`;
     }
@@ -331,7 +349,9 @@ function bindSettings() {
 
 async function init() {
   try {
-    apiBase = (await bg('api:base')).base;
+    const reply = await bg('api:base');
+    apiBase = reply.base;
+    apiToken = reply.token || '';
   } catch {
     /* keep the default endpoint */
   }

@@ -252,6 +252,18 @@ pub struct DaemonArgs {
     /// Report the extension endpoint and exit without listening.
     #[arg(long)]
     pub print_endpoint: bool,
+
+    /// Require this token file's contents as a bearer token on every request.
+    ///
+    /// A file rather than a value, because a token passed as an argument is visible to every
+    /// other user on the machine through `ps`. Without a token the daemon trusts whoever can
+    /// reach its socket, which is only appropriate while that is loopback.
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<PathBuf>,
+
+    /// Write a fresh 32-byte token to this file (mode 0600) and exit.
+    #[arg(long, value_name = "PATH")]
+    pub generate_token_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1002,13 +1014,36 @@ async fn cmd_daemon(args: DaemonArgs) -> Result<()> {
     if let Some(a) = &args.addr {
         cfg.daemon_addr = a.clone();
     }
+
+    if let Some(path) = &args.generate_token_file {
+        crate::auth::token::write_token_file(path)?;
+        println!("wrote a new daemon token to {}", path.display());
+        println!(
+            "start the daemon with:  riptide daemon --token-file {}",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let auth =
+        crate::auth::token::load(args.token_file.as_deref(), cfg.daemon_token_file.as_deref())?;
+
     if args.print_endpoint {
         println!("ws://{}/?cid=riptide", cfg.daemon_addr);
         println!("subprotocol: {}", crate::daemon::WS_PROTOCOL);
         println!("http api:    http://{}/api/jobs", cfg.daemon_addr);
+        println!(
+            "auth:        {}",
+            match &auth {
+                Some(_) => "bearer token required",
+                None => "none — loopback only",
+            }
+        );
         return Ok(());
     }
-    crate::daemon::serve(cfg).await
+
+    let (listener, sched) = crate::daemon::bind(&cfg).await?;
+    crate::daemon::serve_on(listener, sched, auth.map(Arc::new)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,6 +1322,11 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
 /// `--limit` and `--quota`, and can switch the limit back off with `none`.
 const BYTE_SETTINGS: [&str; 2] = ["speed_limit", "quota_bytes"];
 
+/// Optional path settings, where `none` / `off` / the empty string means "unset" rather than a
+/// file called `none`. Without this, `config set daemon_token_file none` would look like it
+/// worked and then fail at daemon start with a path that does not exist.
+const OPTIONAL_PATH_SETTINGS: [&str; 1] = ["daemon_token_file"];
+
 /// Coerce a `config set` value before it is written.
 ///
 /// For a byte-count setting: a size (`500M`, `2048`) becomes a number and `none` / `off` /
@@ -1296,6 +1336,17 @@ const BYTE_SETTINGS: [&str; 2] = ["speed_limit", "quota_bytes"];
 /// limit un-switchable-off once it had been set to a number.
 fn coerce_setting(key: &str, parsed: serde_json::Value) -> Result<serde_json::Value> {
     use serde_json::Value;
+
+    if OPTIONAL_PATH_SETTINGS.contains(&key) {
+        if let Value::String(s) = &parsed {
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("off") {
+                return Ok(Value::Null);
+            }
+        }
+        return Ok(parsed);
+    }
+
     if !BYTE_SETTINGS.contains(&key) {
         return Ok(parsed);
     }
@@ -1750,6 +1801,38 @@ mod tests {
         assert_eq!(coerce("connections", "16").unwrap(), json!(16));
 
         assert!(coerce("quota_bytes", "banana").is_err());
+    }
+
+    #[test]
+    fn an_optional_path_setting_can_be_unset_but_a_real_path_is_kept() {
+        use serde_json::json;
+        let coerce = |key: &str, raw: &str| {
+            let parsed = serde_json::from_str(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+            coerce_setting(key, parsed)
+        };
+
+        assert_eq!(
+            coerce("daemon_token_file", "/etc/riptide/token").unwrap(),
+            json!("/etc/riptide/token")
+        );
+        // The switch-off words mean "unset", not "a file called none", which would otherwise
+        // look like it worked and then fail at daemon start.
+        for off in ["none", "off", "", "  ", "NONE"] {
+            assert_eq!(
+                coerce("daemon_token_file", off).unwrap(),
+                serde_json::Value::Null,
+                "{off:?}"
+            );
+        }
+        // A path that merely contains one of those words is a path.
+        assert_eq!(
+            coerce("daemon_token_file", "/srv/none/token").unwrap(),
+            json!("/srv/none/token")
+        );
+
+        // Nothing else becomes null by accident.
+        assert_eq!(coerce("user_agent", "none").unwrap(), json!("none"));
     }
 
     #[test]

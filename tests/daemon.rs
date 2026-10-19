@@ -16,9 +16,14 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use riptide::auth::token::Auth;
 use riptide::config::Config;
 use riptide::daemon::{self, encode_frame, msg, parse_frame, Message, PROTOCOL_VERSION};
 use riptide::project::{Project, ProjectKind, ProjectStore};
+
+/// The token the `*_with_token` fixtures require. A literal, not a generated one, so a test
+/// that forgets to send it fails for the right reason.
+const TOKEN: &str = "test-token-0123456789abcdef0123456789abcdef";
 
 struct Running {
     addr: std::net::SocketAddr,
@@ -31,6 +36,18 @@ async fn start_daemon() -> Running {
 }
 
 async fn start_daemon_with(tweak: impl FnOnce(&mut Config)) -> Running {
+    start_daemon_full(tweak, None).await
+}
+
+/// A daemon that requires `TOKEN` on every request.
+async fn start_daemon_with_token() -> Running {
+    start_daemon_full(|_| {}, Some(std::sync::Arc::new(Auth::new(TOKEN)))).await
+}
+
+async fn start_daemon_full(
+    tweak: impl FnOnce(&mut Config),
+    auth: Option<std::sync::Arc<Auth>>,
+) -> Running {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.state_dir = dir.path().join("state");
@@ -42,7 +59,7 @@ async fn start_daemon_with(tweak: impl FnOnce(&mut Config)) -> Running {
     let (listener, sched) = daemon::bind(&cfg).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = daemon::serve_on(listener, sched).await;
+        let _ = daemon::serve_on(listener, sched, auth).await;
     });
 
     Running {
@@ -54,6 +71,10 @@ async fn start_daemon_with(tweak: impl FnOnce(&mut Config)) -> Running {
 
 fn ws_url(addr: std::net::SocketAddr) -> String {
     format!("ws://{addr}/?cid=riptide-test&rnd=1")
+}
+
+fn ws_url_with_token(addr: std::net::SocketAddr, token: &str) -> String {
+    format!("ws://{addr}/?cid=riptide-test&rnd=1&token={token}")
 }
 
 #[tokio::test]
@@ -358,6 +379,256 @@ async fn the_http_api_lists_projects_and_refuses_names_it_does_not_have() {
     // So is an action the API does not define.
     let (status, _) = http_post(d.addr, "/api/projects/nightly/frobnicate", "").await;
     assert_eq!(status, 404);
+}
+
+// ---------------------------------------------------------------------------
+// Bearer-token authentication
+// ---------------------------------------------------------------------------
+
+/// A raw request carrying an arbitrary header block, so a test can send (or omit) the
+/// `Authorization` header without going through the helpers that hard-code it.
+async fn request_with_headers(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    let (status, body) = raw_request(addr, &head).await;
+    (status, body)
+}
+
+#[tokio::test]
+async fn every_route_requires_the_token_when_one_is_configured() {
+    let d = start_daemon_with_token().await;
+
+    for path in [
+        "/",
+        "/index.html",
+        "/health",
+        "/api/jobs",
+        "/api/quota",
+        "/api/projects",
+    ] {
+        let (status, _) = http_get_raw(d.addr, path).await;
+        assert_eq!(
+            status, 401,
+            "{path} must not be reachable without the token"
+        );
+    }
+
+    // A wrong token is not a token.
+    let (status, _) = request_with_headers(
+        d.addr,
+        "GET",
+        "/api/jobs",
+        &[("Authorization", "Bearer not-the-token")],
+    )
+    .await;
+    assert_eq!(status, 401);
+
+    // The right one is.
+    let (status, body) = request_with_headers(
+        d.addr,
+        "GET",
+        "/api/jobs",
+        &[("Authorization", &format!("Bearer {TOKEN}"))],
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body.trim(), "[]");
+
+    // And so is a differently-cased scheme, which RFC 7235 says is the same scheme.
+    let (status, _) = request_with_headers(
+        d.addr,
+        "GET",
+        "/health",
+        &[("Authorization", &format!("bearer {TOKEN}"))],
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn a_401_says_what_to_do_and_offers_the_scheme() {
+    let d = start_daemon_with_token().await;
+    let mut sock = TcpStream::connect(d.addr).await.unwrap();
+    sock.write_all(b"GET /api/jobs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    sock.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw).to_string();
+
+    assert!(text.starts_with("HTTP/1.1 401 Unauthorized"), "{text}");
+    assert!(
+        text.to_ascii_lowercase()
+            .contains("www-authenticate: bearer"),
+        "a client should be told which scheme to use: {text}"
+    );
+    assert!(text.contains("RIPTIDE_DAEMON_TOKEN"), "{text}");
+}
+
+#[tokio::test]
+async fn the_token_may_ride_in_the_query_string() {
+    // The WebSocket handshake needs this — a browser cannot set a header on it — so the HTTP
+    // side accepts it too rather than having two rules for one credential.
+    let d = start_daemon_with_token().await;
+
+    let (status, _) = http_get_raw(d.addr, &format!("/api/quota?token={TOKEN}")).await;
+    assert_eq!(status, 200);
+
+    let (status, _) = http_get_raw(d.addr, "/api/quota?token=wrong").await;
+    assert_eq!(status, 401);
+
+    // Either carrier is enough. They are the same secret, so a request that presents it twice —
+    // once stale — is not punished for the stale copy.
+    let (status, _) = request_with_headers(
+        d.addr,
+        "GET",
+        "/api/quota?token=wrong",
+        &[("Authorization", &format!("Bearer {TOKEN}"))],
+    )
+    .await;
+    assert_eq!(status, 200, "a good header carries the request");
+
+    let (status, _) = request_with_headers(
+        d.addr,
+        "GET",
+        &format!("/api/quota?token={TOKEN}"),
+        &[("Authorization", "Bearer wrong")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a good query parameter carries the request too"
+    );
+
+    // Both wrong is still wrong.
+    let (status, _) = request_with_headers(
+        d.addr,
+        "GET",
+        "/api/quota?token=wrong",
+        &[("Authorization", "Bearer wrong")],
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn the_websocket_handshake_is_refused_without_the_token() {
+    let d = start_daemon_with_token().await;
+
+    let mut req = ws_url(d.addr).into_client_request().unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("plugin.v3.internetdownloadmanager.com"),
+    );
+    let refused = tokio_tungstenite::connect_async(req).await;
+    assert!(
+        refused.is_err(),
+        "an unauthenticated client must not get a socket at all"
+    );
+
+    // With the token in the query string, the same URL connects and the handshake works.
+    let mut req = ws_url_with_token(d.addr, TOKEN)
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("plugin.v3.internetdownloadmanager.com"),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.send(WsMessage::Text(encode_frame(&Message::new(1, msg::HELLO))))
+        .await
+        .unwrap();
+    assert_eq!(next_frame(&mut ws).await.mtype, msg::HELLO_ACK);
+}
+
+#[tokio::test]
+async fn a_websocket_client_with_headers_may_use_the_bearer_form() {
+    // The header form works on the handshake too, for a client that is not a browser.
+    let d = start_daemon_with_token().await;
+    let mut req = ws_url(d.addr).into_client_request().unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("plugin.v3.internetdownloadmanager.com"),
+    );
+    req.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws.send(WsMessage::Text(encode_frame(&Message::new(1, msg::HELLO))))
+        .await
+        .unwrap();
+    assert_eq!(next_frame(&mut ws).await.mtype, msg::HELLO_ACK);
+}
+
+#[tokio::test]
+async fn an_unauthenticated_daemon_still_requires_nothing() {
+    // The default must not change: no token configured, no token needed.
+    let d = start_daemon().await;
+    let (status, _) = http_get_raw(d.addr, "/api/jobs").await;
+    assert_eq!(status, 200);
+    let mut req = ws_url(d.addr).into_client_request().unwrap();
+    req.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("plugin.v3.internetdownloadmanager.com"),
+    );
+    assert!(tokio_tungstenite::connect_async(req).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_post_that_a_web_page_could_send_is_refused() {
+    // The content types a cross-origin `fetch` or a form can send without a preflight. The
+    // daemon answers no preflight, so refusing these is what stops a page on another origin
+    // from queueing downloads on a tokenless loopback daemon.
+    let d = start_daemon().await;
+    let body = r#"{"url":"http://127.0.0.1:9/csrf.bin"}"#;
+
+    for content_type in [
+        "text/plain",
+        "application/x-www-form-urlencoded",
+        "multipart/form-data; boundary=x",
+    ] {
+        let (status, _) = raw_request(
+            d.addr,
+            &format!(
+                "POST /api/jobs HTTP/1.1\r\nHost: localhost\r\n\
+                 Content-Type: {content_type}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert_eq!(status, 415, "{content_type}");
+    }
+
+    // No header at all is no declaration.
+    let (status, _) = raw_request(
+        d.addr,
+        &format!(
+            "POST /api/jobs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert_eq!(status, 415);
+
+    // Nothing was queued by any of them.
+    let (status, listed) = http_get_raw(d.addr, "/api/jobs").await;
+    assert_eq!(status, 200);
+    assert_eq!(listed.trim(), "[]");
+
+    // A real client still works, header and all.
+    let (status, _) = http_post(d.addr, "/api/jobs", body).await;
+    assert_eq!(status, 201);
 }
 
 // ---------------------------------------------------------------------------

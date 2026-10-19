@@ -28,6 +28,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::auth::token::Auth;
 use crate::config::Config;
 use crate::error::{Result, RiptideError};
 use crate::job::{Job, JobKind, JobState, RequestContext};
@@ -280,6 +281,7 @@ async fn handle_ws(
     stream: &mut TcpStream,
     sched: Arc<Scheduler>,
     peer: std::net::SocketAddr,
+    auth: Option<Arc<Auth>>,
 ) -> Result<()> {
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
@@ -288,6 +290,25 @@ async fn handle_ws(
     #[allow(clippy::result_large_err)]
     let mut ws =
         tokio_tungstenite::accept_hdr_async(&mut *stream, |req: &Request, mut resp: Response| {
+            // Checked before the subprotocol is negotiated, so an unauthorised client never
+            // reaches the point where it could send a single frame.
+            if let Some(auth) = &auth {
+                let headers: Vec<(String, String)> = req
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_ascii_lowercase(),
+                            v.to_str().unwrap_or("").to_string(),
+                        )
+                    })
+                    .collect();
+                if !request_is_authorised(auth, &req.uri().to_string(), &headers) {
+                    tracing::warn!(%peer, "rejected an unauthenticated WebSocket handshake");
+                    return Err(ws_unauthorized());
+                }
+            }
+
             let requested = req
                 .headers()
                 .get("sec-websocket-protocol")
@@ -449,9 +470,98 @@ async fn handle_ws(
 struct HttpRequest {
     method: String,
     path: String,
-    #[allow(dead_code)]
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+/// Does a request carry an acceptable token?
+///
+/// Two carriers, because a browser cannot set a header on a WebSocket handshake: the
+/// `Authorization: Bearer <token>` header, and a `token=` query parameter. Either one is
+/// accepted — they are the same secret, so a client that manages both (an extension holding a
+/// header while a page appends a query) is not punished for it.
+///
+/// The header is the better carrier and the only one the HTTP API needs. The query form is
+/// documented as the lesser option, because a URL ends up in logs and shell history in ways a
+/// header does not.
+fn request_is_authorised(auth: &Auth, target: &str, headers: &[(String, String)]) -> bool {
+    if headers
+        .iter()
+        .find(|(k, _)| k == "authorization")
+        .is_some_and(|(_, value)| auth.accepts_bearer(value))
+    {
+        return true;
+    }
+    match query_param(target, "token") {
+        Some(token) => auth.accepts(&token),
+        None => false,
+    }
+}
+
+/// The value of `key` in a `path?query` target, percent-decoded.
+fn query_param(target: &str, key: &str) -> Option<String> {
+    let query = target.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| decode_component(v))
+    })
+}
+
+/// Does the request declare a JSON body?
+///
+/// `application/json; charset=utf-8` counts; anything else — including a missing header — does
+/// not. The comparison is on the media type only, and case-insensitive, as RFC 9110 says.
+fn is_json_request(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .find(|(k, _)| k == "content-type")
+        .is_some_and(|(_, v)| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+}
+
+/// The 401 every unauthorised request gets.
+///
+/// Deliberately without CORS headers: a page on an unrelated origin must not be able to read
+/// this API, token or no token, and no header we could add would change that check — so the
+/// absence is the policy, not an omission.
+async fn write_unauthorized(stream: &mut TcpStream) -> Result<()> {
+    let body = b"unauthorized: this daemon requires a bearer token\n\
+                 \n\
+                 Send `Authorization: Bearer <token>`. The daemon's token comes from the file \
+                 given by `--token-file` (or the `daemon_token_file` setting), or from the \
+                 RIPTIDE_DAEMON_TOKEN environment variable.\n";
+    let head = format!(
+        "HTTP/1.1 401 Unauthorized\r\n\
+         WWW-Authenticate: Bearer realm=\"riptide\"\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// The same 401, expressed as a WebSocket handshake rejection.
+fn ws_unauthorized() -> tokio_tungstenite::tungstenite::handshake::server::ErrorResponse {
+    use tokio_tungstenite::tungstenite::http::{HeaderValue, Response, StatusCode};
+    let mut resp = Response::new(Some(
+        "unauthorized: this daemon requires a bearer token".to_string(),
+    ));
+    *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    resp.headers_mut().insert(
+        "www-authenticate",
+        HeaderValue::from_static("Bearer realm=\"riptide\""),
+    );
+    resp
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
@@ -538,9 +648,39 @@ async fn write_response(
     Ok(())
 }
 
-async fn handle_http(stream: &mut TcpStream, sched: Arc<Scheduler>) -> Result<()> {
+async fn handle_http(
+    stream: &mut TcpStream,
+    sched: Arc<Scheduler>,
+    auth: Option<Arc<Auth>>,
+) -> Result<()> {
     let req = read_http_request(stream).await?;
     let path = req.path.split('?').next().unwrap_or("/").to_string();
+
+    // Every route, including the control page and `/health`: a partly-open daemon is harder
+    // to reason about than a closed one, and a health check that reaches a protected port is
+    // a monitoring configuration, not a reason to leak the job list.
+    if let Some(auth) = &auth {
+        if !request_is_authorised(auth, &req.path, &req.headers) {
+            return write_unauthorized(stream).await;
+        }
+    }
+
+    // A POST must declare JSON. That is not header fussiness: browsers treat
+    // `application/json` as a non-simple content type, so any cross-origin request that asks
+    // for it is preflighted first, and this daemon answers no preflight. Without the rule, a
+    // page on another origin could queue downloads on a tokenless loopback daemon — it could
+    // not read the reply, but the download would already be queued. With it, the only clients
+    // that can POST are ones that are not a web page.
+    if req.method == "POST" && !is_json_request(&req.headers) {
+        return write_response(
+            stream,
+            415,
+            "Unsupported Media Type",
+            "text/plain; charset=utf-8",
+            b"a POST must declare `Content-Type: application/json`\n",
+        )
+        .await;
+    }
 
     match (req.method.as_str(), path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => {
@@ -796,7 +936,12 @@ refresh();setInterval(refresh,1000);
 </body></html>
 "#;
 
-async fn handle_conn(mut stream: TcpStream, peer: std::net::SocketAddr, sched: Arc<Scheduler>) {
+async fn handle_conn(
+    mut stream: TcpStream,
+    peer: std::net::SocketAddr,
+    sched: Arc<Scheduler>,
+    auth: Option<Arc<Auth>>,
+) {
     // Peek instead of read, so a WebSocket upgrade still sees an intact handshake.
     let mut peek = [0u8; 2048];
     let n = match stream.peek(&mut peek).await {
@@ -810,9 +955,9 @@ async fn handle_conn(mut stream: TcpStream, peer: std::net::SocketAddr, sched: A
     let is_ws = head.contains("upgrade: websocket") || head.contains("upgrade:websocket");
 
     let result = if is_ws {
-        handle_ws(&mut stream, sched, peer).await
+        handle_ws(&mut stream, sched, peer, auth).await
     } else {
-        handle_http(&mut stream, sched).await
+        handle_http(&mut stream, sched, auth).await
     };
     if let Err(e) = result {
         tracing::debug!(%peer, error = %e, "connection error");
@@ -831,21 +976,71 @@ pub async fn bind(cfg: &Config) -> Result<(TcpListener, Arc<Scheduler>)> {
 }
 
 /// Accept connections on an already-bound listener until the process stops.
-pub async fn serve_on(listener: TcpListener, sched: Arc<Scheduler>) -> Result<()> {
+///
+/// `auth` is the token every request must carry, or `None` for a daemon that trusts whoever
+/// can reach its socket. Passing it in rather than reading it from `cfg` keeps the decision
+/// in one place — the CLI resolves the token (including `--token-file`, which is not a
+/// setting) and hands it over here.
+pub async fn serve_on(
+    listener: TcpListener,
+    sched: Arc<Scheduler>,
+    auth: Option<Arc<Auth>>,
+) -> Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!(
         %addr,
         protocol = WS_PROTOCOL,
+        authenticated = auth.is_some(),
         "daemon listening — browser extension endpoint and JSON API"
     );
-    eprintln!("Riptide daemon listening on http://{addr}  (WebSocket subprotocol {WS_PROTOCOL})");
+    eprintln!(
+        "Riptide daemon listening on http://{addr}  ({})",
+        if auth.is_some() {
+            "bearer token required"
+        } else {
+            "no authentication"
+        }
+    );
+    for note in exposure_notes(addr, auth.is_some()) {
+        eprintln!("{note}");
+        tracing::warn!("{note}");
+    }
 
     tokio::spawn(project_ticker(sched.clone()));
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let sched = sched.clone();
-        tokio::spawn(async move { handle_conn(stream, peer, sched).await });
+        let auth = auth.clone();
+        tokio::spawn(async move { handle_conn(stream, peer, sched, auth).await });
+    }
+}
+
+/// What the operator needs to know about who can reach this socket.
+///
+/// Returned rather than printed, so the policy is testable without capturing stderr.
+///
+/// Loopback says nothing: `127.0.0.1` is the documented default and the token exists for the
+/// case where it is not. Off loopback the two failures are different — no token at all is a
+/// hole, and a token over plain HTTP is a weaker guard than it looks — so they get different
+/// text rather than one generic caution.
+fn exposure_notes(addr: std::net::SocketAddr, authenticated: bool) -> Vec<String> {
+    if addr.ip().is_loopback() {
+        return Vec::new();
+    }
+    if authenticated {
+        vec![format!(
+            "note: {addr} is not a loopback address and this is plain HTTP, so the token \
+             travels in the clear. Put TLS in front of it (a reverse proxy, or an SSH \
+             tunnel) before exposing it to a network you do not control."
+        )]
+    } else {
+        vec![format!(
+            "warning: {addr} is not a loopback address and no token is configured, so anyone \
+             who can reach this port can queue downloads and read the job list. Configure one \
+             with `riptide daemon --generate-token-file <path>` and `--token-file <path>`, or \
+             the RIPTIDE_DAEMON_TOKEN environment variable."
+        )]
     }
 }
 
@@ -879,8 +1074,9 @@ async fn project_ticker(sched: Arc<Scheduler>) {
 
 /// Run the daemon until the process is stopped.
 pub async fn serve(cfg: Config) -> Result<()> {
+    let auth = crate::auth::token::load(None, cfg.daemon_token_file.as_deref())?.map(Arc::new);
     let (listener, sched) = bind(&cfg).await?;
-    serve_on(listener, sched).await
+    serve_on(listener, sched, auth).await
 }
 
 #[cfg(test)]
@@ -1104,5 +1300,108 @@ mod tests {
         assert_eq!(job.ctx.proxy.as_deref(), Some("socks5://127.0.0.1:9150"));
         // Numbers arriving as JSON numbers must still work.
         assert_eq!(job.output, std::path::PathBuf::from("/tmp/f"));
+    }
+
+    #[test]
+    fn a_token_query_parameter_is_read_and_decoded() {
+        assert_eq!(
+            query_param("/api/jobs?token=abc", "token").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            query_param("/api/jobs?a=1&token=abc&b=2", "token").as_deref(),
+            Some("abc")
+        );
+        // Percent-decoding, so a token that needed encoding still matches.
+        assert_eq!(
+            query_param("/?token=a%2Bb", "token").as_deref(),
+            Some("a+b")
+        );
+        // Wrong key, no query, valueless pair, and a different route's parameter.
+        assert_eq!(query_param("/api/jobs?token=abc", "auth"), None);
+        assert_eq!(query_param("/api/jobs", "token"), None);
+        assert_eq!(query_param("/api/jobs?token", "token"), None);
+        assert_eq!(query_param("/api/jobs?pretoken=abc", "token"), None);
+    }
+
+    #[test]
+    fn a_request_is_authorised_by_either_carrier_or_neither() {
+        let auth = Auth::new("good");
+        let header = |v: &str| vec![("authorization".to_string(), v.to_string())];
+
+        assert!(request_is_authorised(
+            &auth,
+            "/api/jobs",
+            &header("Bearer good")
+        ));
+        assert!(request_is_authorised(
+            &auth,
+            "/api/jobs",
+            &header("bearer good")
+        ));
+        assert!(request_is_authorised(&auth, "/api/jobs?token=good", &[]));
+        // Either carrier suffices, and a stale copy of the other does not spoil it.
+        assert!(request_is_authorised(
+            &auth,
+            "/api/jobs?token=stale",
+            &header("Bearer good")
+        ));
+        assert!(request_is_authorised(
+            &auth,
+            "/api/jobs?token=good",
+            &header("Bearer stale")
+        ));
+
+        assert!(!request_is_authorised(&auth, "/api/jobs", &[]));
+        assert!(!request_is_authorised(
+            &auth,
+            "/api/jobs",
+            &header("Bearer bad")
+        ));
+        assert!(!request_is_authorised(&auth, "/api/jobs", &header("good")));
+        assert!(!request_is_authorised(
+            &auth,
+            "/api/jobs?token=bad",
+            &header("Bearer bad")
+        ));
+    }
+
+    #[test]
+    fn a_post_must_declare_json() {
+        let h = |v: &str| vec![("content-type".to_string(), v.to_string())];
+        assert!(is_json_request(&h("application/json")));
+        assert!(is_json_request(&h("application/json; charset=utf-8")));
+        assert!(is_json_request(&h("APPLICATION/JSON")));
+        assert!(is_json_request(&h(" application/json ")));
+
+        // The content types a browser will send without a preflight must all be refused —
+        // that is the entire point of the check.
+        assert!(!is_json_request(&h("text/plain")));
+        assert!(!is_json_request(&h("application/x-www-form-urlencoded")));
+        assert!(!is_json_request(&h("multipart/form-data; boundary=x")));
+        assert!(!is_json_request(&h("application/jsonp")));
+        assert!(!is_json_request(&[]));
+    }
+
+    #[test]
+    fn the_exposure_notes_say_nothing_on_loopback_and_differ_off_it() {
+        let lo: std::net::SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let lo6: std::net::SocketAddr = "[::1]:1001".parse().unwrap();
+        assert!(exposure_notes(lo, false).is_empty());
+        assert!(exposure_notes(lo, true).is_empty());
+        assert!(exposure_notes(lo6, false).is_empty());
+
+        // Off loopback with no token: that is a hole, and the note has to say so.
+        let lan: std::net::SocketAddr = "0.0.0.0:1001".parse().unwrap();
+        let warned = exposure_notes(lan, false);
+        assert_eq!(warned.len(), 1);
+        assert!(warned[0].starts_with("warning:"), "{}", warned[0]);
+        assert!(warned[0].contains("RIPTIDE_DAEMON_TOKEN"), "{}", warned[0]);
+
+        // Off loopback with a token: still worth saying the transport is plain.
+        let noted = exposure_notes(lan, true);
+        assert_eq!(noted.len(), 1);
+        assert!(noted[0].starts_with("note:"), "{}", noted[0]);
+        assert!(noted[0].contains("TLS"), "{}", noted[0]);
     }
 }
