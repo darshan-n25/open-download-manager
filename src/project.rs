@@ -12,7 +12,10 @@
 //!   swapped into place, so a reader never sees a half-written file.
 //! * [`ProjectKind::Site`] — a page re-crawled on a schedule, optionally fetching what the
 //!   crawl finds. Each target gets the same conditional treatment as a `File` project, so
-//!   an unchanged page costs one conditional request rather than a re-download.
+//!   an unchanged page costs one conditional request rather than a re-download. With
+//!   `archive` set, the same run instead keeps an **offline mirror**: the pages, plus the
+//!   stylesheets, scripts, images and fonts they need to render, with the markup rewritten
+//!   to point at the local copies (see [`crate::archive`]).
 //!
 //! Three rules are deliberate and worth stating, because the alternatives are all tempting:
 //!
@@ -41,6 +44,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::archive;
 use crate::config::Config;
 use crate::engine::{Engine, SharedLimits};
 use crate::error::{Result, RiptideError};
@@ -120,6 +124,15 @@ impl Validator {
         }
     }
 
+    /// Copy the validators a bare fetch reported, for bytes that are not a job — a site
+    /// archiver's assets.
+    pub fn from_meta(meta: &crate::engine::FetchMeta) -> Self {
+        Validator {
+            etag: meta.etag.clone(),
+            last_modified: meta.last_modified.clone(),
+        }
+    }
+
     /// True when the server gave us nothing to ask about, so every run must re-download.
     pub fn is_empty(&self) -> bool {
         self.etag.is_none() && self.last_modified.is_none()
@@ -152,6 +165,10 @@ pub struct Project {
     /// `Site`: fetch what the crawl finds, rather than only noting it.
     #[serde(default)]
     pub download: bool,
+    /// `Site`: mirror the pages *and everything they need to render*, rewritten so the copy
+    /// works from disk. Supersedes `download`, and uses `max_downloads` as its asset cap.
+    #[serde(default)]
+    pub archive: bool,
     /// `Site`: cap on downloads per run.
     #[serde(default = "default_max_downloads")]
     pub max_downloads: usize,
@@ -223,6 +240,7 @@ impl Project {
             quality: None,
             grab: GrabberConfig::default(),
             download: false,
+            archive: false,
             max_downloads: DEFAULT_MAX_DOWNLOADS,
             validator: Validator::default(),
             validators: BTreeMap::new(),
@@ -550,6 +568,9 @@ impl ProjectRunner {
 
         let outcome = match project.kind {
             ProjectKind::File => self.run_file(project).await,
+            // Only one of these is a mirror, and the difference matters: a plain site run
+            // harvests links, an archive run also holds what the pages need to render.
+            ProjectKind::Site if project.archive => self.run_archive(project).await,
             ProjectKind::Site => self.run_site(project).await,
         };
 
@@ -775,6 +796,96 @@ impl ProjectRunner {
             } else {
                 RunOutcome::Failed
             }
+        }
+    }
+
+    /// A scheduled offline mirror: re-read the pages, transfer only the assets that changed,
+    /// and rewrite the markup so the copy works from disk.
+    ///
+    /// What "unchanged" means here is deliberately strict: the run compares the files it
+    /// would write against the files on disk, so a project whose site has not moved reports
+    /// `Unchanged` even though it did re-read the pages to find that out.
+    ///
+    /// The validators live next to the mirror rather than in the project document, so moving
+    /// or copying the mirror keeps its record of what the server said. See
+    /// [`archive::manifest_path`].
+    async fn run_archive(&self, project: &mut Project) -> RunOutcome {
+        let mut scratch = self.job_for(
+            project,
+            &project.url,
+            self.cfg.download_dir.join(".grab-probe"),
+        );
+        scratch.kind = JobKind::Grabber;
+
+        let engine = match Engine::with_shared(self.cfg.clone(), scratch, self.shared()) {
+            Ok(e) => e,
+            Err(e) => return self.fail(project, &e.to_string()),
+        };
+        let fetcher = engine.fetcher();
+
+        let cfg = archive::ArchiveConfig {
+            grab: project.grab.clone(),
+            // Reused rather than given its own knob: from the outside, "how much does one
+            // run fetch" is one question, whether the answers are downloads or assets.
+            max_assets: project.max_downloads.max(1),
+            ..archive::ArchiveConfig::default()
+        };
+        if let Err(e) = std::fs::create_dir_all(&project.output) {
+            return self.fail(project, &e.to_string());
+        }
+
+        let report = match archive::archive(&fetcher, &project.url, &cfg, &project.output).await {
+            Ok(r) => r,
+            Err(e) => return self.fail(project, &e.to_string()),
+        };
+
+        project.last_found = Some(report.held());
+        project.last_fetched = Some(report.written);
+        project.last_skipped = Some(report.unchanged);
+        project.last_bytes = Some(report.bytes);
+
+        if report.quota_paused {
+            let msg = report
+                .failures
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "download quota exhausted".to_string());
+            tracing::info!(project = %project.name, reason = %msg, "archive paused on the download quota");
+            project.last_error = Some(msg);
+            return RunOutcome::QuotaPaused;
+        }
+
+        tracing::info!(
+            project = %project.name,
+            documents = report.documents,
+            stylesheets = report.stylesheets,
+            assets = report.assets,
+            written = report.written,
+            unchanged = report.unchanged,
+            remote = report.remote_links,
+            "archive run finished"
+        );
+
+        if !report.failures.is_empty() {
+            let summary = format!(
+                "{} of {} file(s) failed: {}",
+                report.failures.len(),
+                report.held(),
+                report.failures.join("; ")
+            );
+            project.last_error = Some(summary.clone());
+            tracing::warn!(project = %project.name, %summary, "archive run finished with errors");
+            return if report.written > 0 {
+                RunOutcome::Partial
+            } else {
+                RunOutcome::Failed
+            };
+        }
+
+        if report.is_unchanged() {
+            RunOutcome::Unchanged
+        } else {
+            RunOutcome::Updated
         }
     }
 

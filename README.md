@@ -2,7 +2,7 @@
 
 A cross-platform download manager in the spirit of Internet Download Manager: parallel
 ranged connections, crash-safe resume, a scheduler, HLS/DASH capture, FTP, browser
-integration, and a link grabber.
+integration, a link grabber, and offline site archiving.
 
 Riptide is a **clean-room reimplementation**. It was designed by statically reverse
 engineering the shipped IDM binaries and then rebuilding the *behaviour* in Rust — no IDM
@@ -14,9 +14,10 @@ code is used or present. The analysis lives in
 > **Read the feature map before trusting a checkbox.** PAC script evaluation, FTPS, MMS and
 > MPEG-TS remuxing without `ffmpeg` are honest gaps, Kerberos itself is absent (Negotiate is
 > implemented with NTLM inside it), and NTLM has not been tested against a real server. §12 of
-> that document checks IDM's own advertised feature list line by line and names four whole
-> features Riptide has no answer for — periodic file synchronization, scheduled grabber
-> projects, and offline site archiving, plus download quotas, which are now implemented.
+> that document checks IDM's own advertised feature list line by line and names what Riptide
+> has no answer for — PAC, FTPS and MMS — having closed the four gaps it found in its own
+> behaviour: periodic file synchronization, scheduled grabber projects, offline site
+> archiving, and download quotas.
 
 ---
 
@@ -53,7 +54,8 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Media | HLS (`EXT-X-*`, byteranges, AES-128 keys, master playlists) and DASH (SegmentTemplate, SegmentTimeline, SegmentList); separate audio+video tracks are muxed into one file |
 | FTP | Passive mode, `SIZE`, `REST`-based resume, anonymous defaults |
 | Grabber | BFS crawl with depth/page limits, include/exclude wildcards, media/archive classification, tracker filtering |
-| Projects | Recurring work stored as one document per project: `file` keeps a URL in step with a local path using conditional requests (`304` costs no body bytes), `site` re-crawls and fetches only what changed; run by the daemon when due, or from `cron` with `project tick` |
+| Archiving | `grab --archive` (or a `site` project with `--archive`) keeps a page and everything it needs to render — stylesheets, scripts, images, fonts — rewriting the markup to local relative paths; every URL gets a path decided by the URL alone, and anything it could not hold keeps pointing at the live site |
+| Projects | Recurring work stored as one document per project: `file` keeps a URL in step with a local path using conditional requests (`304` costs no body bytes), `site` re-crawls and fetches only what changed, `site --archive` keeps an offline mirror; run by the daemon when due, or from `cron` with `project tick` |
 | Browser | MV3 extension + a loopback daemon speaking IDM's `MSG#` framing over its WebSocket subprotocol, plus a plain JSON API |
 | CLI | `download`, `grab`, `daemon`, `probe`, `list`, `show`, `remove`, `pause`, `queue`, `project`, `config`, `state-dir` |
 
@@ -65,7 +67,7 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 239 tests: unit + protocol + end-to-end
+cargo test         # 272 tests: unit + protocol + end-to-end
 ```
 
 ## Use
@@ -97,6 +99,9 @@ riptide download https://cdn.example.com/master.m3u8 -q 1080
 riptide grab https://example.com/downloads --depth 2 --include '*.zip' --include '*.iso'
 riptide grab https://example.com/downloads --download --output-dir ~/Downloads
 
+# Keep a page and everything it needs to render, rewritten to work from disk.
+riptide grab --archive -o ~/Offline https://example.com/docs/
+
 # See the queue.
 riptide list
 riptide show 3f1a9c02
@@ -112,6 +117,9 @@ riptide project add feed --url https://example.com/feed.json --every 1h --start-
 # Re-crawl a page daily and fetch whatever it offers.
 riptide project add mirror --kind site --url https://example.com/downloads \
     --every 1d --download -o ~/Mirror
+# Or keep a daily offline mirror of a section of a site.
+riptide project add offline --kind site --url https://example.com/docs/ \
+    --every 1d --archive -o ~/Offline
 # The daemon runs due projects; `cron` users can run them from a timer instead.
 riptide project tick
 ```
@@ -141,6 +149,8 @@ document per project under `state_dir/projects/`, and selects the behaviour with
 riptide project add feed --url https://example.com/feed.json --every 1h --start-now
 riptide project add mirror --kind site --url https://example.com/downloads \
     --every 1d --download -o ~/Mirror
+riptide project add offline --kind site --url https://example.com/docs \
+    --every 1d --archive -o ~/OfflineDocs
 
 riptide project list           # name, interval, when each next runs, how the last run went
 riptide project show feed
@@ -180,6 +190,44 @@ time on purpose: an unattended job should be gentle with the origin. `--max-down
 lists them. Everything a project transfers goes through the same engine as an interactive
 download, so it is governed by the same global and per-file speed ceilings, the same
 per-server connection ceiling and the same quota.
+
+## Offline site archiving
+
+`--archive` turns the same crawl into a mirror you can read with the network off: the pages,
+plus the stylesheets, scripts, images and fonts they need in order to look right, with the
+markup rewritten so the copy works from disk.
+
+```sh
+riptide grab --archive -o ~/Offline/docs https://example.com/docs/
+riptide project add offline --kind site --url https://example.com/docs/ \
+    --every 1d --archive -o ~/Offline/docs
+```
+
+Four rules decide what ends up on disk, and they are worth knowing before trusting the
+result:
+
+- **A URL's place is decided by the URL alone.** `https://site/dir/page.html` becomes
+  `dir/page.html`; a URL on another host goes under `_hosts/<host>/` so that two sites with
+  the same paths cannot collide; `?a=1` and `?a=2` are different files. Nothing depends on
+  visit order, so re-running an archive overwrites its own files rather than accumulating
+  copies. The one deliberate alias is that `/dir/` and `/dir/index.html` are the same
+  document, because they are.
+- **A reference the run could not hold keeps pointing at the live site.** Whatever a filter
+  excluded, a page past the depth limit, or a target that 404'd stays an absolute URL — a
+  link the reader can see is remote, rather than a local path that is not there. The run
+  prints how many it left that way, and they are counted in the JSON report.
+- **Markup and stylesheets are re-read every run; everything else is asked about first.**
+  HTML and CSS are the maps to everything else, so a `304` on them would mean never noticing
+  that an image they point at had changed. They are small; images, fonts and scripts carry
+  `If-None-Match`, so a run in which nothing changed moves no bodies at all and reports
+  `unchanged`. What the server said is kept in `_riptide/validators.json` **inside the
+  archive**, so a mirror that is copied or moved keeps its record and the next run is still
+  incremental — a repeat `grab --archive` costs one conditional request per asset, not a
+  re-download.
+- **An archive is not a mirror of a server.** Video, installers and archives are things to
+  *download*, not things a page needs in order to render, so they are not swept up — point
+  `riptide grab --download` at the page for those. `--max-assets` (or `--max-downloads` for a
+  `site` project) caps how many assets a single run will hold.
 
 ## Browser integration
 
@@ -226,11 +274,12 @@ src/
   net/           client construction, TLS policy, proxy parsing and resolution
   media/         HLS resolver, MPD parser, muxing and remuxing
   grabber.rs     link extraction, filtering, crawl
+  archive.rs     offline mirroring: URL→path placement, markup rewriting, asset fetching
   project.rs     recurring projects: periodic file sync, scheduled site crawls, due-time logic
   ftp.rs         passive-mode FTP with REST resume
   daemon.rs      `MSG#` WebSocket service + JSON HTTP API + project ticker
 extension/       MV3 browser integration (background, popup, options)
-tests/           end-to-end tests against servers that really do byte ranges, conditional requests and SPNEGO, plus daemon protocol tests
+tests/           end-to-end tests against servers that really do byte ranges, conditional requests and SPNEGO, plus daemon protocol tests and an archive suite that reads its own output back
 ```
 
 ## How Riptide differs from IDM
@@ -323,12 +372,31 @@ against this implementation (§12 there). The short version:
   the user chose that path; for a `site` project, a URL with no file name of its own gets
   one derived from its host and path so two index pages cannot collide.
 
+**Archiving**
+
+- **The rewrite is regex-based over attributes and `url(...)`, not a real HTML parser.**
+  That is deliberate — HTML5 in the wild is not XML, and a tag-soup parser written for this
+  would have its own bugs — but it means a URL assembled by JavaScript at run time is not
+  seen. A page whose images are only referenced from script will archive as a page with
+  remote images.
+- **Only UTF-8 and the single-byte charsets are decoded.** A page in, say, Shift-JIS is
+  decoded as UTF-8 with replacements and re-written that way, which is reported rather than
+  done silently. Everything else keeps the charset it was served with, because a binary
+  asset is never re-encoded.
+- **An archive never deletes a file.** A reference that disappears from a page leaves its
+  old copy on disk, so a mirror is a union of what has been seen, not a snapshot.
+- **Assets are swept up by extension, not by what the page actually uses.** A page that
+  links a `.pdf` keeps it remote; a page that links a `.json` gets it. `--exclude` and
+  `--include` are the same knobs the plain grabber uses, so a filter learned once applies
+  to both.
+- **A server that offers neither `ETag` nor `Last-Modified` makes every asset look
+  changed**, so such an archive re-transfers its assets each run even when nothing moved.
+- **The manifest is rewritten from what a run saw**, so a URL that no page references any
+  more loses its entry — while its file stays on disk, as above.
+
 **Whole features IDM has that Riptide does not**
 
-- **No periodic file synchronization** and **no scheduled grabber projects** — the "keep this
-  mirror in step" mode. Riptide downloads what you ask it to, once.
-- **No offline site archiving.** The grabber finds and downloads matching targets; it does not
-  fetch a page's CSS/JS/images and rewrite its links for offline browsing.
+- **No PAC evaluation, no FTPS, no MMS.** See the protocol section above for each.
 - **No antivirus-on-completion hook**, no self-updater, no installation wizard, and no UI
   languages other than English.
 - **No BitTorrent.** IDM has none either; it only downloads `.torrent` files.
@@ -344,14 +412,15 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 239 tests
+cargo test                              # Rust: 272 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 13 tests
 ```
 
-239 Rust tests: 197 unit tests across every module, 10 daemon-protocol tests driving a real
+272 Rust tests: 220 unit tests across every module, 10 daemon-protocol tests driving a real
 WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
-which really does byte ranges, 6 that stand up a mock `Negotiate` server, and 17 that stand
-up a server which really honours `If-None-Match` and `Range`.
+which really does byte ranges, 6 that stand up a mock `Negotiate` server, 17 that stand up a
+server which really honours `If-None-Match` and `Range`, and 10 that archive a small site and
+then read their own output back to check that every rewritten reference resolves.
 
 The end-to-end ones assert that
 
@@ -384,6 +453,20 @@ And the project tests assert the properties that only show up *between* runs:
   and survives a target that 404s without losing the others;
 - the daemon's due-sweep path runs exactly the projects whose time has come, persists each
   result, and reschedules from the end of the run rather than replaying missed slots.
+
+And the archive tests assert the properties that make the mirror readable with the network
+off:
+
+- every reference in every rewritten document — and in the stylesheet's `url(...)`s —
+  resolves to a file that is actually in the archive;
+- a reference the run could not hold (an excluded one, one past the depth limit) keeps the
+  **live URL** rather than a local path that is not there;
+- a second run of an unchanged site transfers **only the pages**, gets a `304` for every
+  asset, and rewrites no file;
+- an asset that changes on its own is picked up even though the pages around it did not
+  change, and a new reference appearing inside a stylesheet is followed;
+- two URLs that differ only in their query string, or in a character a naive sanitiser
+  would drop, never share a path — and nothing climbs out of the archive root.
 
 The unit tests pin the parts that are easy to get subtly wrong: the segment table's filing
 and re-splitting, `RateLimiter` burst-then-throttle behaviour, the `ServerLimits` ceiling under

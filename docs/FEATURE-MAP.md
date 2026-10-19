@@ -85,7 +85,7 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | Retry a queued file every 30 seconds until it starts `[OBSERVED, IDM tips]` | **Done** | the scheduler holds a waiting job and re-checks it | |
 | Pause/resume across restarts | **Done** | `JobState::Paused` + the persisted segment table | Ctrl-C cancels via a flag so jobs land in `Paused`, i.e. resumable. |
 | Shut the machine down when the queue drains `[OBSERVED]` | **Absent** | — | Deliberate: it is a platform-specific power call that a CLI should not make silently. |
-| Recurring work: periodic file synchronization, and scheduled site-grabber projects | **Done** | `src/project.rs`, `riptide project`, the daemon's ticker | One persisted definition per project, `--kind file` or `--kind site`, in `state_dir/projects/`. A `file` project sends `If-None-Match`/`If-Modified-Since` and treats `304` as "nothing to do", so an unchanged sync moves no body bytes; anything else is a new version, fetched in full into the working file and renamed into place, so a failed run cannot damage the copy on disk and a stale partial from an older version is never spliced in. A `site` project re-runs the crawl and fetches only targets that changed, with the same conditional treatment per target. The daemon runs due projects (one 30 s poll), and `riptide project tick` does the same for `cron`. Buys into the same global/per-file rate limits, per-server ceiling and quota as an interactive download. Deltas from IDM: the next run is measured from the end of the previous one, so missed slots are collapsed into a single catch-up run rather than replayed; and there is one project store rather than IDM's several separate queues. |
+| Recurring work: periodic file synchronization, and scheduled site-grabber projects | **Done** | `src/project.rs`, `riptide project`, the daemon's ticker | One persisted definition per project, `--kind file` or `--kind site`, in `state_dir/projects/`. A `file` project sends `If-None-Match`/`If-Modified-Since` and treats `304` as "nothing to do", so an unchanged sync moves no body bytes; anything else is a new version, fetched in full into the working file and renamed into place, so a failed run cannot damage the copy on disk and a stale partial from an older version is never spliced in. A `site` project re-runs the crawl and fetches only targets that changed, with the same conditional treatment per target; with `--archive` the same run keeps an offline mirror instead (see §8). The daemon runs due projects (one 30 s poll), and `riptide project tick` does the same for `cron`. Buys into the same global/per-file rate limits, per-server ceiling and quota as an interactive download. Deltas from IDM: the next run is measured from the end of the previous one, so missed slots are collapsed into a single catch-up run rather than replayed; and there is one project store rather than IDM's several separate queues. |
 | Category folders (`FoldersTree`, `IDMFType.dat` extension map) `[OBSERVED]` | **Partial** | `config.auto_categorize`, `src/config.rs` | Sorts finished files into per-type subfolders using a small built-in extension map. It does **not** read IDM's `IDMFType.dat` or reproduce its folder tree. |
 
 ## 6. Media: HLS, DASH, remuxing
@@ -126,6 +126,8 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | Media/archive classification with an extension map | **Done** | `classify`, plus the built-in media/archive extension sets | `.txt`/images/unknown types are intentionally not reported. |
 | Tracker/ad filtering | **Done** | `is_tracker` | |
 | `Get all links` / site-level "download everything" | **Partial** | `grab --download` fetches every selected target | Same machinery, no separate UI command. |
+| **Complete web sites for offline browsing**, rewriting links to local files `[OBSERVED]` | **Done** | `src/archive.rs`, `grab --archive`, `project add --kind site --archive` | Fetches the page plus the stylesheets, scripts, images and fonts it needs to render, then rewrites `href`/`src`/`srcset`/`poster`/inline `url(...)`/`@import` to local relative paths. The placement and rewriting rules — and the ones deliberately not attempted — are spelled out in the two rows below. |
+| Archive a site **on a schedule**, so the mirror tracks the live site | `sprojects.dat` `[OBSERVED]` | `Project.archive` | Pages and stylesheets are re-read (they are the map to everything else); every other asset is conditional, so an unchanged mirror moves no bodies and reports `unchanged`. What the server said is kept in `_riptide/validators.json` beside the mirror, so the state travels with the archive rather than with the project file. |
 
 ## 9. Browser integration
 
@@ -191,8 +193,8 @@ weak evidence but the only kind available without a disassembler here.
 | Built-in scheduler: connect at a set time, download, **disconnect/hang up the modem**, or **shut the computer down** when done | `Shut down`, `Shut down now`, `Hang up modem`, `Hang up now`, `Internet Download Manager has finished queue processing. According to scheduler settings IDM is going to hang up your modem.` `[OBSERVED]` | **Partial** | Scheduled start, queue width, and recurring projects (§5) are done. Shutdown, modem hang-up, and "disconnect when done" are **Absent** — they are platform power/dial-up calls a CLI should not make silently, and dial-up is long gone. |
 | **Periodic synchronization of files**; several separate queues | `Periodic synchronization`, `synchroniz*` `[OBSERVED]` | **Done** | `riptide project add --kind file`: a persisted URL↔path pair that asks the server whether the copy on disk is current (`If-None-Match`/`If-Modified-Since`) and refetches in full only when it is not. One project store rather than several separate queues — the distinction in IDM is a UI convenience, not a scheduling difference. |
 | Spider/grabber: all files matching filters | `GrabberSts`, `sprojects.dat`, `surlexclist.dat` `[OBSERVED]` | **Done** | §8. |
-| Grabber: **complete web sites for offline browsing**, rewriting links to local files | `Complete start page with all pictures, styles, and scripts for offline browsing`, `Convert the links in downloaded html files to the local files for offline browsing` `[OBSERVED]` | **Absent** | Riptide's grabber *finds and downloads* targets; it does not archive a page (CSS, JS, images) or rewrite HTML to point at the local copies. |
-| Grabber projects on a schedule, periodically | `sprojects.dat`, `Periodic synchronization` `[OBSERVED]` | **Done** | `riptide project add --kind site`: re-runs the crawl on an interval and, with `--download`, fetches what it finds — each target getting the same conditional treatment as a `file` project, so an unchanged site costs one request per target and no bodies. Run by the daemon when due, or by `cron` via `project tick`. |
+| Grabber: **complete web sites for offline browsing**, rewriting links to local files | `Complete start page with all pictures, styles, and scripts for offline browsing`, `Convert the links in downloaded html files to the local files for offline browsing` `[OBSERVED]` | **Done** | `riptide grab --archive`, or a `site` project with `--archive`. A URL's place on disk is decided by the URL alone (host, path, query), so two URLs that differ only in their query string cannot collide and re-running overwrites rather than accumulating copies; other hosts are filed under `_hosts/<host>/`. Anything the run could not hold — filtered out, past the depth limit, or 404 — is left pointing at the **live URL** rather than at a local path that does not exist, and the run reports how many. The rewrite is deliberate regex work over attributes and `url(...)` rather than an HTML parser, so a URL built by JavaScript at run time is not seen. |
+| Grabber projects on a schedule, periodically | `sprojects.dat`, `Periodic synchronization` `[OBSERVED]` | **Done** | `riptide project add --kind site`: re-runs the crawl on an interval and, with `--download`, fetches what it finds — each target getting the same conditional treatment as a `file` project, so an unchanged site costs one request per target and no bodies. With `--archive` the same run keeps an offline mirror instead. Run by the daemon when due, or by `cron` via `project tick`. |
 | Download categories | `IDMFType.dat`, `FoldersTree` `[OBSERVED]` | **Partial** | §5. |
 | "Download All" — add every link on the page | grabber's include/exclude filters `[OBSERVED]` | **Partial** | `riptide grab --download` does this from the CLI and from the popup's page scan. |
 | **Download limits**: quotas in megabytes per hour | `Download limits`, `Download limits exceeded!` `[OBSERVED]` | **Done** | Two independent mechanisms, both from the binary's own vocabulary. **Rate limits** in bytes/second, global and per file (`Speed Limiter`, `Use Speed Limiter`, `Remember Speed Limiter settings for this file`). **A quota over a fixed window** — `quota_bytes` of `quota_window_secs`, e.g. "no more than 500 MB per hour" — enforced on every byte written, by one process-wide budget shared across jobs, the media remuxer, FTP, and crawls. Exhaustion **pauses** the job rather than failing it: progress is kept, the reason says how long until the window refills, and `riptide queue` continues it. The window is remembered in `state_dir/quota.json`, so a restart does not hand back a fresh budget. Two deliberate divergences: the window is a fixed span from the first byte charged rather than IDM's per-hour bucket, and a charge too large for the remaining budget is refused outright rather than partially written, so a job can pause with up to one chunk of budget unspent. |
@@ -218,22 +220,25 @@ download engine:
 3. **Download quotas over a time window**, as opposed to instantaneous rate limits.
    *Now implemented* — see the "Download limits" row above.
 4. **Offline site archiving with link rewriting**, as opposed to link harvesting.
+   *Now implemented* — see the two new rows in §8.
 
 Everything else on the list is either implemented, deliberately refused, or UI that a
 terminal-first tool has no place for.
 
 ## 13. What "tested" means here
 
-`cargo test` runs 239 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
+`cargo test` runs 272 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
 more against the extension's framing. The distinction that matters in this document:
 
 - **Unit tests** prove an algorithm in isolation (parsers, KDFs, the segment table, the
   semaphores, the JS framing, project schedule arithmetic).
 - **Protocol tests** (`tests/daemon.rs`) drive the daemon over a real WebSocket and its JSON API.
-- **End-to-end tests** (`tests/segmented.rs`, `tests/projects.rs`) stand up real HTTP servers
-  that really do byte ranges and conditional requests, and check the bytes on disk.
-  byte ranges and check the bytes on disk; `tests/negotiate.rs` stands up a mock RFC 4559 server
-  that issues an NTLMSSP challenge inside SPNEGO and re-derives the client's NTProofStr.
+- **End-to-end tests** (`tests/segmented.rs`, `tests/projects.rs`, `tests/archive.rs`) stand up
+  real HTTP servers that really do byte ranges and conditional requests, and check the bytes on
+  disk; `tests/negotiate.rs` stands up a mock RFC 4559 server that issues an NTLMSSP challenge
+  inside SPNEGO and re-derives the client's NTProofStr. The archive suite additionally reads its
+  own output back: it re-parses every reference in every file it wrote, resolves it against that
+  file's directory, and asserts the target exists.
 - **Live checks** run the release binary against a separately written server on this machine —
   useful for catching build-configuration and CLI-level mistakes that in-process tests cannot
   see, but still not an interop test against anyone else's implementation. The recurring-project
@@ -241,7 +246,9 @@ more against the extension's framing. The distinction that matters in this docum
   the second run transferred **zero** body bytes and had its `304` counted by the server, a
   changed remote replaced the file exactly even with a stale working file planted on disk, a
   `site` project fetched its targets and then skipped both on the next run, and the daemon's own
-  ticker ran the project unprompted once its interval elapsed.
+  ticker ran the project unprompted once its interval elapsed. Archiving was checked the same
+  way against the same separately written conditional-`GET` server, and the resulting mirror was
+  opened from disk with the server stopped.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
 Windows host, a PAC file, an FTPS server, `ffmpeg`, an MMS source, a live HLS/DASH origin, a

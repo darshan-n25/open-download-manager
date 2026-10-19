@@ -14,8 +14,10 @@
 //! * a localhost daemon that speaks a `MSG#`-framed protocol to a browser extension so the
 //!   browser stays dumb and the engine stays powerful (see [`daemon`]);
 //! * recurring projects: periodic file synchronization and scheduled site crawls
-//!   (see [`project`]).
+//!   (see [`project`]);
+//! * offline site archiving that rewrites markup to work from disk (see [`archive`]).
 
+pub mod archive;
 pub mod auth;
 pub mod cli;
 pub mod config;

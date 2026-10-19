@@ -1,8 +1,8 @@
 //! Command line interface.
 //!
 //! The shape deliberately matches what IDM users expect: fire-and-forget downloads, a
-//! persistent queue you can list and resume, a site grabber, and a daemon the browser
-//! extension talks to.
+//! persistent queue you can list and resume, a site grabber that can also keep an offline
+//! mirror, and a daemon the browser extension talks to.
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use crate::archive::{self, ArchiveConfig};
 use crate::config::Config;
 use crate::engine::{Engine, ProgressFn, ProgressSample};
 use crate::error::{Result, RiptideError};
@@ -214,7 +215,18 @@ pub struct GrabArgs {
     #[arg(long)]
     pub download: bool,
 
-    /// Directory for `--download`.
+    /// Mirror the page and what it needs to render: keep the stylesheets, scripts, images
+    /// and fonts, and rewrite the markup to point at the local copies.
+    ///
+    /// Fetches by itself, so `--download` is not needed and is ignored.
+    #[arg(long)]
+    pub archive: bool,
+
+    /// Cap on how many assets one `--archive` run will hold.
+    #[arg(long, value_name = "N", default_value_t = archive::DEFAULT_MAX_ASSETS)]
+    pub max_assets: usize,
+
+    /// Directory for `--download`, or the archive root for `--archive`.
     #[arg(short = 'o', long)]
     pub output_dir: Option<PathBuf>,
 }
@@ -426,7 +438,13 @@ pub struct ProjectAddArgs {
     #[arg(long)]
     pub download: bool,
 
-    /// Cap on how many crawl results one run will fetch.
+    /// Keep an offline mirror instead: the pages, plus the stylesheets, scripts, images and
+    /// fonts they need to render, with the markup rewritten to point at the local copies.
+    #[arg(long)]
+    pub archive: bool,
+
+    /// Cap on how many crawl results one run will fetch, or on the assets `--archive`
+    /// holds.
     #[arg(long, value_name = "N", default_value_t = project::DEFAULT_MAX_DOWNLOADS)]
     pub max_downloads: usize,
 }
@@ -732,6 +750,18 @@ fn reporter(label: String, quiet: bool) -> Option<ProgressFn> {
 // Grabber
 // ---------------------------------------------------------------------------
 
+/// The directory a one-shot archive lands in when `-o` is not given.
+///
+/// Named after the host so that archiving two sites cannot mix them, and sanitized because a
+/// host with a port contains a colon.
+fn archive_root_name(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .map(|h| util::sanitize_filename(&h))
+        .unwrap_or_else(|| "archive".to_string())
+}
+
 async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
     let mut cfg = Config::load();
 
@@ -761,6 +791,70 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
 
     let engine = Engine::new(cfg.clone(), scratch)?;
     let fetcher = engine.fetcher();
+
+    if args.archive {
+        let acfg = ArchiveConfig {
+            grab: GrabberConfig {
+                depth: args.depth,
+                max_pages: args.max_pages.unwrap_or(grabber::DEFAULT_MAX_PAGES),
+                same_host: !args.any_host,
+                include: args.include.clone(),
+                exclude: args.exclude.clone(),
+                media_only: false,
+            },
+            max_assets: args.max_assets.max(1),
+            ..ArchiveConfig::default()
+        };
+        let root = match &args.output_dir {
+            Some(d) => d.clone(),
+            None => cfg.download_dir.join(archive_root_name(&args.url)),
+        };
+        std::fs::create_dir_all(&root)?;
+        if !quiet {
+            eprintln!("archiving {} into {}", args.url, root.display());
+        }
+        let report = archive::archive(&fetcher, &args.url, &acfg, &root).await?;
+        // The archive fetched through the engine's own budget without a job record, so the
+        // window is checkpointed here rather than at a job boundary.
+        engine.quota().flush();
+        if !quiet {
+            eprintln!(
+                "{} document(s), {} stylesheet(s), {} asset(s): {} written, {} unchanged, {} bytes",
+                report.documents,
+                report.stylesheets,
+                report.assets,
+                report.written,
+                report.unchanged,
+                report.bytes
+            );
+            if report.remote_links > 0 {
+                eprintln!(
+                    "{} reference(s) left pointing at the live site (excluded by a filter, \
+                     past the depth limit, or not retrievable)",
+                    report.remote_links
+                );
+            }
+        }
+        if report.quota_paused {
+            return Err(RiptideError::other(format!(
+                "the download quota ran out part-way through the archive; {} file(s) were \
+                 written into {} and will be re-checked on the next run",
+                report.written,
+                root.display()
+            )));
+        }
+        if !report.failures.is_empty() {
+            for f in &report.failures {
+                eprintln!("failed: {f}");
+            }
+            return Err(RiptideError::other(format!(
+                "{} of {} file(s) could not be archived",
+                report.failures.len(),
+                report.held()
+            )));
+        }
+        return Ok(());
+    }
 
     if !quiet {
         eprintln!(
@@ -1295,13 +1389,15 @@ async fn cmd_project_add(
             media_only: !a.pages,
         };
         p.download = a.download;
+        p.archive = a.archive;
         p.max_downloads = a.max_downloads.max(1);
-        if a.download {
+        if a.download || a.archive {
             std::fs::create_dir_all(&p.output).ok();
         }
-    } else if a.download {
+    } else if a.download || a.archive {
         return Err(RiptideError::other(
-            "--download only applies to `--kind site`; a `file` project always fetches its URL",
+            "--download and --archive only apply to `--kind site`; a `file` project always \
+             fetches its URL",
         ));
     }
 
@@ -1435,16 +1531,23 @@ fn cmd_project_show(store: &ProjectStore, name: &str) -> Result<()> {
         if !p.grab.exclude.is_empty() {
             println!("  exclude    {}", p.grab.exclude.join(", "));
         }
-        println!(
-            "  download   {}",
-            if p.download {
-                "yes"
-            } else {
-                "no (planning only)"
+        if p.archive {
+            println!("  mode       archive (offline mirror, links rewritten)");
+            if let (Some(f), Some(x), Some(s)) = (p.last_found, p.last_fetched, p.last_skipped) {
+                println!("  last pass  {f} file(s): {x} written, {s} already current");
             }
-        );
-        if let (Some(f), Some(x), Some(s)) = (p.last_found, p.last_fetched, p.last_skipped) {
-            println!("  last crawl {f} link(s): {x} fetched, {s} already current");
+        } else {
+            println!(
+                "  download   {}",
+                if p.download {
+                    "yes"
+                } else {
+                    "no (planning only)"
+                }
+            );
+            if let (Some(f), Some(x), Some(s)) = (p.last_found, p.last_fetched, p.last_skipped) {
+                println!("  last crawl {f} link(s): {x} fetched, {s} already current");
+            }
         }
     } else {
         match (&p.validator.etag, &p.validator.last_modified) {

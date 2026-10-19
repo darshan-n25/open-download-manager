@@ -422,6 +422,14 @@ impl Engine {
         }
     }
 
+    /// The process-wide download budget this engine charges against.
+    ///
+    /// Exposed so a caller that fetched through [`Engine::fetcher`] without a job — the site
+    /// archiver — can checkpoint the window when it is done.
+    pub fn quota(&self) -> Arc<Quota> {
+        self.quota.clone()
+    }
+
     pub fn client(&self) -> &Arc<NetClient> {
         &self.client
     }
@@ -1109,6 +1117,70 @@ pub struct Fetcher {
     cancel: Arc<AtomicBool>,
 }
 
+/// The validators a server offered for the bytes it just sent.
+///
+/// Deliberately not a `Job` field: the site archiver fetches assets that are not jobs, and
+/// those still need their `ETag` remembered so the next run can ask instead of pulling the
+/// body again.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FetchMeta {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
+}
+
+impl FetchMeta {
+    fn of(resp: &reqwest::Response) -> Self {
+        let get = |name: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        FetchMeta {
+            etag: get(ETAG),
+            last_modified: get(LAST_MODIFIED),
+            content_type: get(CONTENT_TYPE),
+        }
+    }
+
+    /// True when the server gave nothing to ask about, so every fetch must pull the body.
+    pub fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+
+    /// Conditional-request headers for these validators.
+    pub fn headers(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(e) = &self.etag {
+            out.push(("If-None-Match".to_string(), e.clone()));
+        }
+        if let Some(l) = &self.last_modified {
+            out.push(("If-Modified-Since".to_string(), l.clone()));
+        }
+        out
+    }
+}
+
+/// The result of a fetch that may have been answered `304 Not Modified`.
+#[derive(Clone, Debug)]
+pub enum Conditional<T> {
+    /// The server confirmed the caller's copy is still current. **No body was read.**
+    NotModified,
+    /// New bytes, plus whatever the server said about them.
+    Fresh(T),
+}
+
+/// The working file a streaming fetch writes into before renaming it into place.
+///
+/// Appended rather than substituted (`dest.with_extension` would turn `a.css` and `a.js`
+/// into the same `a.tmpdl`), so two files in one directory can never collide on it.
+fn temp_sibling(dest: &Path) -> std::path::PathBuf {
+    let mut s = dest.as_os_str().to_os_string();
+    s.push(".tmpdl");
+    std::path::PathBuf::from(s)
+}
+
 impl Fetcher {
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
         let mut rb = self.client.raw().get(url);
@@ -1116,6 +1188,13 @@ impl Fetcher {
             rb = rb.header("Authorization", a);
         }
         rb
+    }
+
+    /// A GET carrying whatever conditional headers the caller has.
+    fn conditional_request(&self, url: &str, cond: &[(String, String)]) -> reqwest::RequestBuilder {
+        cond.iter().fold(self.request(url), |rb, (k, v)| {
+            rb.header(k.as_str(), v.as_str())
+        })
     }
 
     /// Reserve a connection slot for `url`'s host. The permit is held for the whole response,
@@ -1133,8 +1212,33 @@ impl Fetcher {
     }
 
     pub async fn to_bytes(&self, url: &str, max: u64) -> Result<Vec<u8>> {
+        match self.to_bytes_cond(url, max, &[]).await? {
+            Conditional::Fresh((bytes, _)) => Ok(bytes),
+            // Unreachable: a `304` is only possible in answer to a conditional request, and
+            // an unconditional one sent none.
+            Conditional::NotModified => Err(RiptideError::other(format!(
+                "{url}: the server answered 304 to an unconditional request"
+            ))),
+        }
+    }
+
+    /// Fetch a whole small resource into memory, optionally asking first whether the
+    /// caller's copy is still current.
+    ///
+    /// `cond` is a list of `If-None-Match` / `If-Modified-Since` pairs; see
+    /// [`FetchMeta::headers`]. `Conditional::NotModified` means the copy the caller already
+    /// has is current and **no body was read**.
+    pub async fn to_bytes_cond(
+        &self,
+        url: &str,
+        max: u64,
+        cond: &[(String, String)],
+    ) -> Result<Conditional<(Vec<u8>, FetchMeta)>> {
         let _slot = self.permit(url).await;
-        let resp = self.request(url).send().await?;
+        let resp = self.conditional_request(url, cond).send().await?;
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            return Ok(Conditional::NotModified);
+        }
         if !resp.status().is_success() {
             return Err(RiptideError::other(format!(
                 "HTTP {} fetching {url}",
@@ -1148,6 +1252,7 @@ impl Fetcher {
                 )));
             }
         }
+        let meta = FetchMeta::of(&resp);
         let mut buf: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -1160,36 +1265,80 @@ impl Fetcher {
             self.charge(chunk.len() as u64).await?;
             buf.extend_from_slice(&chunk);
         }
-        Ok(buf)
+        Ok(Conditional::Fresh((buf, meta)))
     }
 
     pub async fn to_file(&self, url: &str, dest: &Path) -> Result<u64> {
+        match self.to_file_cond(url, dest, &[], u64::MAX).await? {
+            Conditional::Fresh((n, _)) => Ok(n),
+            Conditional::NotModified => Err(RiptideError::other(format!(
+                "{url}: the server answered 304 to an unconditional request"
+            ))),
+        }
+    }
+
+    /// Stream a resource into `dest`, optionally asking first whether the caller's copy is
+    /// still current, and refusing to move more than `max` bytes.
+    ///
+    /// On `NotModified` `dest` is **not touched**, so a caller that keeps the file it has
+    /// cannot end up with a truncated one.
+    pub async fn to_file_cond(
+        &self,
+        url: &str,
+        dest: &Path,
+        cond: &[(String, String)],
+        max: u64,
+    ) -> Result<Conditional<(u64, FetchMeta)>> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(RiptideError::Cancelled);
         }
         let _slot = self.permit(url).await;
-        let resp = self.request(url).send().await?;
+        let resp = self.conditional_request(url, cond).send().await?;
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            return Ok(Conditional::NotModified);
+        }
         if !resp.status().is_success() {
             return Err(RiptideError::other(format!(
                 "HTTP {} fetching {url}",
                 resp.status()
             )));
         }
+        if let Some(len) = resp.content_length() {
+            if len > max {
+                return Err(RiptideError::other(format!(
+                    "refusing to fetch {len} bytes from {url} (limit {max})"
+                )));
+            }
+        }
+        let meta = FetchMeta::of(&resp);
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let tmp = dest.with_extension("tmpdl");
+        let tmp = temp_sibling(dest);
         let mut file = tokio::fs::File::create(&tmp).await?;
         let mut written = 0u64;
         let mut stream = resp.bytes_stream();
         loop {
             match tokio::time::timeout(self.read_timeout, stream.next()).await {
-                Err(_) => return Err(RiptideError::other(format!("read timeout on {url}"))),
+                Err(_) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err(RiptideError::other(format!("read timeout on {url}")));
+                }
                 Ok(None) => break,
-                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(Some(Err(e))) => {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err(e.into());
+                }
                 Ok(Some(Ok(chunk))) => {
                     use tokio::io::AsyncWriteExt;
                     let n = chunk.len() as u64;
+                    if written + n > max {
+                        drop(file);
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                        return Err(RiptideError::other(format!(
+                            "resource {url} exceeds {max} bytes"
+                        )));
+                    }
                     self.charge(n).await?;
                     file.write_all(&chunk).await?;
                     written += n;
@@ -1202,7 +1351,7 @@ impl Fetcher {
         }
         drop(file);
         tokio::fs::rename(&tmp, dest).await?;
-        Ok(written)
+        Ok(Conditional::Fresh((written, meta)))
     }
 
     /// Fetch a byte range of a resource fully into memory. Used for HLS

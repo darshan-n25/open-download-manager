@@ -743,8 +743,9 @@ WebSocket subprotocol on this port. This page is the plain-HTTP control surface.
 <ul id="jobs"></ul>
 
 <h2>Projects</h2>
-<p class="muted">Recurring work: a file kept in sync with a URL, or a site re-crawled on a
-schedule. Created with <code>riptide project add</code>; the daemon runs them when due.</p>
+<p class="muted">Recurring work: a file kept in sync with a URL, a site re-crawled on a
+schedule, or an offline mirror of a site and everything it needs to render. Created with
+<code>riptide project add</code>; the daemon runs them when due.</p>
 <ul id="projects"></ul>
 
 <script>
@@ -770,10 +771,10 @@ async function refresh(){
 
   const projects=await (await fetch('/api/projects')).json();
   document.getElementById('projects').innerHTML = projects.length ? projects.map(pr=>
-    `<li><b>${pr.name}</b> — ${pr.kind}, next ${pr.next_run_in}
+    `<li><b>${pr.name}</b> — ${pr.kind}${pr.archive?' (archive)':''}, next ${pr.next_run_in}
       ${pr.enabled?'':'<span class="muted">(disabled)</span>'}
       <button onclick="runProject('${pr.name}')">Run now</button><br>
-      <span class="muted">${pr.output} · last ${pr.last_run}</span></li>`
+      <span class="muted">${pr.output} · last ${pr.last_run}${pr.last_found!=null?` · ${pr.last_found} file(s)`:''}</span></li>`
   ).join('') : '<li class="muted">No projects.</li>';
 }
 async function runProject(name){
