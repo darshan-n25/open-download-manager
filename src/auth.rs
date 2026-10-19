@@ -1,11 +1,20 @@
-//! HTTP authentication: Basic, Bearer, Digest (RFC 7616), and NTLMv2.
+//! HTTP authentication: Basic, Bearer, Digest (RFC 7616), NTLMv2, and
+//! Negotiate (SPNEGO, RFC 4178/4559).
 //!
 //! IDM's vocabulary, recovered from its string table, is exactly this set:
 //! `Authorization: Basic %s`, `Authorization: Digest username="%s", realm="%s",
 //! nonce="%s", uri="%s", ...`, `BearerAuth`, `Proxy-Authorization: Basic|Digest`,
 //! and SSPI-backed Negotiate (`AcquireCredentialsHandleA`).
+//!
+//! The one material difference is underneath Negotiate. IDM hands it to Windows
+//! SSPI, which can produce a real Kerberos ticket. Riptide implements SPNEGO with
+//! NTLMSSP as the inner mechanism, which covers a server that accepts NTLM inside
+//! `Negotiate` but not one configured for Kerberos only. See
+//! [`spnego`] for why that line is drawn where it is, and how the unsupported case
+//! is reported.
 
 pub mod ntlm;
+pub mod spnego;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +25,8 @@ pub enum AuthKind {
     Digest,
     Bearer,
     Ntlm,
+    /// SPNEGO (`WWW-Authenticate: Negotiate`), completed with NTLM inside.
+    Negotiate,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -64,13 +75,34 @@ impl AuthSpec {
         }
     }
 
+    /// NTLMv2, sent as bare `Authorization: NTLM <base64>` messages.
     pub fn ntlm(
         user: impl Into<String>,
         pass: impl Into<String>,
         domain: impl Into<String>,
     ) -> Self {
+        Self::challenge_response(AuthKind::Ntlm, user, pass, domain)
+    }
+
+    /// SPNEGO (`WWW-Authenticate: Negotiate`), completed with NTLMSSP as the inner
+    /// mechanism. Same credentials as [`AuthSpec::ntlm`]; only the wrapping and the
+    /// header name differ.
+    pub fn negotiate(
+        user: impl Into<String>,
+        pass: impl Into<String>,
+        domain: impl Into<String>,
+    ) -> Self {
+        Self::challenge_response(AuthKind::Negotiate, user, pass, domain)
+    }
+
+    fn challenge_response(
+        kind: AuthKind,
+        user: impl Into<String>,
+        pass: impl Into<String>,
+        domain: impl Into<String>,
+    ) -> Self {
         AuthSpec {
-            kind: AuthKind::Ntlm,
+            kind,
             username: Some(user.into()),
             password: Some(pass.into()),
             token: None,
@@ -103,7 +135,8 @@ impl AuthSpec {
     }
 
     /// Header this spec can supply *before* being challenged.
-    /// Digest and NTLM are challenge-response and therefore return `None`.
+    /// Digest, NTLM and Negotiate are challenge-response and therefore return
+    /// `None`.
     pub fn preemptive_header(&self) -> Option<(String, String)> {
         match self.kind {
             AuthKind::Basic => Some((
@@ -117,7 +150,7 @@ impl AuthSpec {
                 "Authorization".into(),
                 format!("Bearer {}", self.token.as_deref().unwrap_or("")),
             )),
-            AuthKind::Digest | AuthKind::Ntlm => None,
+            AuthKind::Digest | AuthKind::Ntlm | AuthKind::Negotiate => None,
         }
     }
 }
@@ -137,7 +170,9 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// Parse a `user:pass` style spec, with an optional `<kind>:` prefix.
 ///
 /// Accepted forms: `user:pass`, `basic:user:pass`, `digest:user:pass`,
-/// `bearer:<token>`, `ntlm:DOMAIN\user:pass`, `ntlm:user:pass` (domain defaults to `""`).
+/// `bearer:<token>`, `ntlm:DOMAIN\user:pass`, `ntlm:user:pass` (domain defaults to
+/// `""`), and `negotiate:` / `negotiate-ntlm:` for the same credentials sent
+/// inside SPNEGO instead of as bare NTLM messages.
 pub fn parse_auth_spec(s: &str) -> Option<AuthSpec> {
     let s = s.trim();
     if s.is_empty() {
@@ -147,7 +182,7 @@ pub fn parse_auth_spec(s: &str) -> Option<AuthSpec> {
         Some((k, r))
             if matches!(
                 k.to_ascii_lowercase().as_str(),
-                "basic" | "digest" | "bearer" | "ntlm"
+                "basic" | "digest" | "bearer" | "ntlm" | "negotiate" | "negotiate-ntlm"
             ) =>
         {
             (k.to_ascii_lowercase(), r)
@@ -157,13 +192,20 @@ pub fn parse_auth_spec(s: &str) -> Option<AuthSpec> {
 
     match kind.as_str() {
         "bearer" => Some(AuthSpec::bearer(rest)),
-        "ntlm" => {
-            let (userpart, pass) = rest.rsplit_once(':')?;
-            let (domain, user) = match userpart.split_once('\\') {
-                Some((d, u)) => (d.to_string(), u.to_string()),
-                None => (String::new(), userpart.to_string()),
-            };
-            Some(AuthSpec::ntlm(user, pass, domain))
+        // `negotiate-ntlm:` is the same thing under its accurate name: SPNEGO with
+        // NTLMSSP inside. Both spellings are accepted so that neither the user who
+        // wants "Negotiate" nor the user who wants "exactly NTLM, wrapped" is
+        // surprised.
+        "ntlm" | "negotiate" | "negotiate-ntlm" => {
+            // Only the first colon separates the credentials from the password, so a
+            // password is free to contain colons.
+            let (userpart, pass) = rest.split_once(':')?;
+            let (domain, user) = split_domain(userpart);
+            Some(if kind == "ntlm" {
+                AuthSpec::ntlm(user, pass, domain)
+            } else {
+                AuthSpec::negotiate(user, pass, domain)
+            })
         }
         "digest" => {
             let (user, pass) = rest.split_once(':')?;
@@ -173,6 +215,15 @@ pub fn parse_auth_spec(s: &str) -> Option<AuthSpec> {
             let (user, pass) = rest.split_once(':')?;
             Some(AuthSpec::basic(user, pass))
         }
+    }
+}
+
+/// Split `DOMAIN\user` into its two halves, or an empty domain when there is no
+/// backslash.
+fn split_domain(userpart: &str) -> (String, String) {
+    match userpart.split_once('\\') {
+        Some((d, u)) => (d.to_string(), u.to_string()),
+        None => (String::new(), userpart.to_string()),
     }
 }
 
@@ -425,7 +476,45 @@ mod tests {
         assert_eq!(n.domain(), "CORP");
         assert_eq!(n.user(), "bob");
 
+        let ng = parse_auth_spec("negotiate:CORP\\bob:hunter2").unwrap();
+        assert_eq!(ng.kind, AuthKind::Negotiate);
+        assert_eq!(ng.domain(), "CORP");
+        assert_eq!(ng.user(), "bob");
+
+        // The accurate name for the same thing, and the prefix is case-insensitive.
+        let alias = parse_auth_spec("Negotiate-NTLM:bob:pw").unwrap();
+        assert_eq!(alias.kind, AuthKind::Negotiate);
+        assert_eq!(alias.domain(), "");
+        assert_eq!(alias.user(), "bob");
+
+        // ...but plain NTLM and Negotiate must not be confused with each other.
+        assert_ne!(n.kind, ng.kind);
+
         assert!(parse_auth_spec("nopass").is_none());
+    }
+
+    /// Only the *first* colon separates the user (or `DOMAIN\user`) from the
+    /// password, so a password may contain colons.
+    #[test]
+    fn a_password_may_contain_a_colon() {
+        let ng = parse_auth_spec("negotiate:CORP\\bob:p:a:ss").unwrap();
+        assert_eq!(ng.domain(), "CORP");
+        assert_eq!(ng.user(), "bob");
+        assert_eq!(ng.pass(), "p:a:ss");
+    }
+
+    #[test]
+    fn negotiate_is_challenge_response_and_serializes_by_name() {
+        let a = AuthSpec::negotiate("bob", "pw", "CORP");
+        // Nothing may be sent before the server offers a challenge: the token has to
+        // come back from the server's mechTypes choice first.
+        assert!(a.preemptive_header().is_none());
+        // Jobs are persisted as JSON, so the spelling is part of the on-disk format.
+        assert_eq!(serde_json::to_string(&a.kind).unwrap(), "\"negotiate\"");
+        assert_eq!(
+            serde_json::from_str::<AuthKind>("\"negotiate\"").unwrap(),
+            AuthKind::Negotiate
+        );
     }
 
     #[test]

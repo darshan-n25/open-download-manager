@@ -111,8 +111,9 @@ pub struct NetOpts {
     #[arg(long)]
     pub cookie: Option<String>,
 
-    /// Credentials: `user:pass` (Basic), `digest:user:pass`, `ntlm:user:pass:domain`,
-    /// or `bearer:token`.
+    /// Credentials: `user:pass` (Basic), `digest:user:pass`, `bearer:token`,
+    /// `ntlm:DOMAIN\user:pass` (bare NTLM), or `negotiate:DOMAIN\user:pass`
+    /// (SPNEGO, completed with NTLM).
     #[arg(long)]
     pub auth: Option<String>,
 

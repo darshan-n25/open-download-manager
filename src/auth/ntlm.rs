@@ -216,25 +216,6 @@ pub fn type3(t2: &Type2, user: &str, domain: &str, password: &str, workstation: 
     out
 }
 
-/// Base64 of a Type 1 message, ready to place in `Authorization: NTLM <b64>`.
-pub fn type1_b64(domain: &str, workstation: &str) -> String {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-    STANDARD.encode(type1(domain, workstation))
-}
-
-pub fn type3_b64(
-    t2: &Type2,
-    user: &str,
-    domain: &str,
-    password: &str,
-    workstation: &str,
-) -> String {
-    use base64::engine::general_purpose::STANDARD;
-    use base64::Engine;
-    STANDARD.encode(type3(t2, user, domain, password, workstation))
-}
-
 /// Extract the base64 Type 2 message from a `WWW-Authenticate: NTLM <b64>` header.
 pub fn challenge_from_header(header: &str) -> Option<Type2> {
     use base64::engine::general_purpose::STANDARD;

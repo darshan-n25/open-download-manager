@@ -61,8 +61,9 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | `Authorization: Basic %s` `[OBSERVED]` | **Done** | `src/auth.rs` | Test `basic_header_is_rfc7617`. |
 | `Authorization: Digest username="%s", realm="%s", nonce="%s", uri="%s", %sresponse="%s"` `[OBSERVED]` | **Done** | `src/auth.rs` | RFC 7616, `qop=auth`, `nc` incremented per reuse of a nonce. Test `digest_matches_rfc7616_example`. |
 | `Authorization: Bearer` `[OBSERVED]` | **Done** | `src/auth.rs` | |
-| `AcquireCredentialsHandleA` → SSPI, i.e. Negotiate/NTLM/Kerberos `[OBSERVED]` | **Partial** | `src/auth/ntlm.rs` | NTLMv2 is implemented from MS-NLMP with no SSPI. **Kerberos is Absent**, and therefore so is SPNEGO negotiation that chooses it. |
-| NTLM handshake (`WWW-Authenticate: NTLM`) | **Unverified** | `src/auth/ntlm.rs` | `NTOWFv2`, Type 1/2/3 message construction (`MD4`, `HMAC-MD5`, target info, timestamp, channel-free) are unit-tested against published vectors. **It has never been run against a real IIS/Exchange/SharePoint endpoint.** Expect to fix field-ordering bugs the first time it is. |
+| `AcquireCredentialsHandleA` → SSPI, i.e. Negotiate/NTLM/Kerberos `[OBSERVED]` | **Partial** | `src/auth/ntlm.rs`, `src/auth/spnego.rs` | Both non-Kerberos mechanisms are implemented with no SSPI at all. `Negotiate` is SPNEGO (RFC 4178/4559) wrapping NTLMSSP, hand-rolled from DER up: `src/auth/spnego.rs` offers only the NTLMSSP OID in its `mechTypes` list, because RFC 4178 §3.1 forbids offering a mechanism the client cannot complete. **Kerberos is Absent** — there is no KDC client — and a server that insists on it is detected and reported, not silently failed. |
+| NTLM handshake (`WWW-Authenticate: NTLM`) | **Unverified** | `src/auth/ntlm.rs` | `NTOWFv2`, Type 1/2/3 message construction (`MD4`, `HMAC-MD5`, target info, timestamp, channel-free) are unit-tested against published vectors, and the handshake now runs end-to-end in `tests/negotiate.rs` against a mock server that re-derives NTProofStr. **It has never been run against a real IIS/Exchange/SharePoint endpoint**, so expect field-ordering bugs the first time it is. |
+| `WWW-Authenticate: Negotiate` (SPNEGO) `[OBSERVED]` | **Unverified** | `src/auth/spnego.rs` | Initial `initialContextToken` + `NegTokenInit` carrying an optimistic NTLMSSP Type 1; the later token is a bare `NegTokenResp` with `negState = accept-completed` (RFC 4178 §4.2 forbids re-wrapping it). The encoder is asserted against the octet layout in RFC 4178 Appendix D and independently re-parsed with `openssl asn1parse`; the decoder is checked against Kerberos-oid tokens so that case diagnoses correctly. A mock RFC 4559 server drives the whole path in `tests/negotiate.rs`. No real Windows host was available. |
 | `Proxy-Authorization: Basic\|Digest` `[OBSERVED]` | **Done** | credentials embedded in the proxy URL | A `407` is reported clearly rather than retried blindly. |
 
 ## 4. Proxies and transport
@@ -196,7 +197,7 @@ weak evidence but the only kind available without a disassembler here.
 | **Download limits**: quotas in megabytes per hour | `Download limits`, `Download limits exceeded!` `[OBSERVED]` | **Done** | Two independent mechanisms, both from the binary's own vocabulary. **Rate limits** in bytes/second, global and per file (`Speed Limiter`, `Use Speed Limiter`, `Remember Speed Limiter settings for this file`). **A quota over a fixed window** — `quota_bytes` of `quota_window_secs`, e.g. "no more than 500 MB per hour" — enforced on every byte written, by one process-wide budget shared across jobs, the media remuxer, FTP, and crawls. Exhaustion **pauses** the job rather than failing it: progress is kept, the reason says how long until the window refills, and `riptide queue` continues it. The window is remembered in `state_dir/quota.json`, so a restart does not hand back a fresh budget. Two deliberate divergences: the window is a fixed span from the first byte charged rather than IDM's per-hour bucket, and a charge too large for the remaining budget is refused outright rather than partially written, so a job can pause with up to one chunk of budget unspent. |
 | Automatic antivirus checking on completion | `If you would like to run antivirus software on download completion, you should type or browse the complete path to its executable file…`, `[file]` parameter convention `[OBSERVED]` | **Absent** | Running a configured scanner with the finished path on completion. Not implemented. |
 | Proxy servers, "for example Microsoft ISA, and FTP proxy servers" | `Use &FTP Proxy` `[OBSERVED]` | **Partial** | HTTP/HTTPS/SOCKS proxies are done, including IDM's compact mode strings. An **FTP proxy** (proxying the FTP control connection) is **Absent**; FTP goes direct. |
-| Auth: Basic, **Negotiate, NTLM, and Kerberos** | `AcquireCredentialsHandleA`, SSPI `[OBSERVED]` | **Partial** | §3: Kerberos absent, NTLMv2 unverified. |
+| Auth: Basic, **Negotiate, NTLM, and Kerberos** | `AcquireCredentialsHandleA`, SSPI `[OBSERVED]` | **Partial** | §3: Negotiate is implemented as SPNEGO over NTLM, Kerberos absent, NTLMv2 unverified against a live host. |
 | Drag and drop links in, files out | `Drag*` `[OBSERVED]` | **Absent** | There is no window to drag anything to. |
 | Customizable interface: toolbars, skins, dark theme | `skin`, dark-theme strings `[OBSERVED]` | **Refused** | No GUI. The extension popup does follow the OS light/dark preference. |
 | Multilingual (30+ languages) | `Languages*` `[OBSERVED]` | **Absent** | English only, in both the CLI and the extension. |
@@ -221,19 +222,24 @@ terminal-first tool has no place for.
 
 ## 13. What "tested" means here
 
-`cargo test` runs 152 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
+`cargo test` runs 201 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
 more against the extension's framing. The distinction that matters in this document:
 
 - **Unit tests** prove an algorithm in isolation (parsers, KDFs, the segment table, the
   semaphores, the JS framing).
 - **Protocol tests** (`tests/daemon.rs`) drive the daemon over a real WebSocket.
 - **End-to-end tests** (`tests/segmented.rs`) stand up a real HTTP server that really does
-  byte ranges and check the bytes on disk.
+  byte ranges and check the bytes on disk; `tests/negotiate.rs` stands up a mock RFC 4559 server
+  that issues an NTLMSSP challenge inside SPNEGO and re-derives the client's NTProofStr.
+- **Live checks** run the release binary against a separately written server on this machine —
+  useful for catching build-configuration and CLI-level mistakes that in-process tests cannot
+  see, but still not an interop test against anyone else's implementation.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
-server, a PAC file, an FTPS server, `ffmpeg`, an MMS source, or a live HLS/DASH origin. Those
-rows are labelled **Unverified**, **Partial**, **Absent** or **Refused** above and should be
-treated that way.
+Windows host, a PAC file, an FTPS server, `ffmpeg`, an MMS source, or a live HLS/DASH origin.
+Those rows are labelled **Unverified**, **Partial**, **Absent** or **Refused** above and should
+be treated that way. The mock `Negotiate` server in `tests/negotiate.rs` is written from the
+specifications too, so agreement with it proves conformance to those documents, not to IIS.
 
 ## 14. Sources
 

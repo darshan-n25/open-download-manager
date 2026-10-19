@@ -503,12 +503,23 @@ impl Engine {
                     scheme: "unknown".into(),
                 });
             };
-            let challenge = resp
-                .headers()
-                .get(WWW_AUTHENTICATE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+            // A server commonly advertises several schemes at once — `Basic` and
+            // `Negotiate`, or `Negotiate` and `NTLM` — so answer the one this job was
+            // configured for rather than whichever happens to be listed first.
+            let headers = www_authenticate_headers(&resp);
+            let wanted = match spec.kind {
+                AuthKind::Basic => "basic",
+                AuthKind::Digest => "digest",
+                AuthKind::Bearer => "bearer",
+                AuthKind::Ntlm => "ntlm",
+                AuthKind::Negotiate => "negotiate",
+            };
+            let challenge = headers
+                .iter()
+                .find(|h| auth::scheme_of(h).as_deref() == Some(wanted))
+                .or_else(|| headers.first())
+                .cloned()
+                .unwrap_or_default();
 
             match spec.kind {
                 AuthKind::Digest => {
@@ -530,8 +541,15 @@ impl Engine {
                     self.auth_override = Some(value);
                 }
                 AuthKind::Ntlm => {
-                    self.auth_override =
-                        Some(ntlm_negotiate(&self.client, url, &spec, extra).await?);
+                    self.auth_override = Some(
+                        ntlm_exchange(&self.client, url, &spec, extra, AuthExchange::Ntlm).await?,
+                    );
+                }
+                AuthKind::Negotiate => {
+                    self.auth_override = Some(
+                        ntlm_exchange(&self.client, url, &spec, extra, AuthExchange::Spnego)
+                            .await?,
+                    );
                 }
                 AuthKind::Basic | AuthKind::Bearer => {
                     // Both are preemptive; a 401 means the credentials are simply wrong.
@@ -1428,42 +1446,138 @@ async fn stream_range(
 fn st_progress_hint(_shared: &Arc<Shared>, _h: &Arc<SegHandle>, _pos: u64, _end: u64) {}
 
 // ---------------------------------------------------------------------------
-// NTLM
+// NTLM and Negotiate
 // ---------------------------------------------------------------------------
 
+/// Every value of every `WWW-Authenticate` header, in order.
+///
+/// A server routinely advertises several schemes at once — `Negotiate` and `NTLM`,
+/// or `Basic` and `Digest` — as repeated headers. Reading only the first one picks
+/// whichever the server happened to list first, which is how a job configured for
+/// Digest ends up being answered with a Basic challenge.
+fn www_authenticate_headers(resp: &reqwest::Response) -> Vec<String> {
+    resp.headers()
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How a challenge-response exchange puts its tokens on the wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthExchange {
+    /// `Authorization: NTLM <base64>`, carrying bare NTLMSSP messages.
+    Ntlm,
+    /// `Authorization: Negotiate <base64>`, with the NTLMSSP messages inside SPNEGO.
+    Spnego,
+}
+
+impl AuthExchange {
+    fn first(&self, type1: &[u8]) -> String {
+        match self {
+            AuthExchange::Ntlm => format!("NTLM {}", auth::base64_encode(type1)),
+            AuthExchange::Spnego => {
+                format!("Negotiate {}", auth::spnego::initial_authorization(type1))
+            }
+        }
+    }
+
+    fn last(&self, type3: &[u8]) -> String {
+        match self {
+            AuthExchange::Ntlm => format!("NTLM {}", auth::base64_encode(type3)),
+            AuthExchange::Spnego => {
+                format!("Negotiate {}", auth::spnego::response_authorization(type3))
+            }
+        }
+    }
+}
+
 /// Perform the 3-leg NTLM handshake and return the final `Authorization` value.
-async fn ntlm_negotiate(
+///
+/// Both of Riptide's NTLM-shaped schemes run through here, because the messages are
+/// identical and only the wrapping differs: `NTLM` sends them bare, and `Negotiate`
+/// sends them inside SPNEGO (see [`auth::spnego`]).
+async fn ntlm_exchange(
     client: &Arc<NetClient>,
     url: &str,
     spec: &auth::AuthSpec,
     extra: &[(String, String)],
+    mode: AuthExchange,
 ) -> Result<String> {
     let ws = spec.workstation();
-    let type1 = auth::ntlm::type1_b64(spec.domain(), &ws);
+    let type1 = auth::ntlm::type1(spec.domain(), &ws);
 
     let mut rb = client.raw().request(Method::GET, url);
     for (k, v) in extra {
         rb = rb.header(k, v);
     }
     let resp = rb
-        .header("Authorization", format!("NTLM {type1}"))
+        .header("Authorization", mode.first(&type1))
         .send()
         .await?;
-    let challenge_header = resp
-        .headers()
-        .get(WWW_AUTHENTICATE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let headers = www_authenticate_headers(&resp);
     drop(resp);
 
-    let Some(t2) = auth::ntlm::challenge_from_header(&challenge_header) else {
-        return Err(RiptideError::AuthFailed(
-            "server did not return an NTLM challenge".into(),
-        ));
+    let t2 = match mode {
+        AuthExchange::Ntlm => headers
+            .iter()
+            .find_map(|h| auth::ntlm::challenge_from_header(h))
+            .ok_or_else(|| {
+                RiptideError::AuthFailed(
+                    "server did not offer an NTLM challenge, so there is nothing to answer".into(),
+                )
+            })?,
+        AuthExchange::Spnego => {
+            let challenge = headers
+                .iter()
+                .find_map(|h| auth::spnego::negotiate_payload(h))
+                .and_then(|payload| auth::spnego::parse_server_token(&payload))
+                .ok_or_else(|| {
+                    RiptideError::AuthFailed(
+                        "the server answered with an unreadable Negotiate token. A server \
+                         configured for Kerberos only often replies with an empty or \
+                         Kerberos-only challenge, which an NTLM client cannot answer; \
+                         enable NTLM on it, or use `ntlm:`, `basic:`, or `digest:`"
+                            .into(),
+                    )
+                })?;
+
+            // Say this in the right words. Failing with "not an NTLM message" would
+            // leave the user guessing at their server's Kerberos configuration.
+            if challenge.mech() == Some(auth::spnego::Mech::Kerberos) {
+                return Err(RiptideError::AuthFailed(
+                    "the server answered Negotiate with a Kerberos token. Riptide \
+                     implements SPNEGO with NTLM as the inner mechanism and has no \
+                     Kerberos implementation, so a Kerberos-only server cannot be \
+                     authenticated against; enable NTLM on the server, or use \
+                     `ntlm:`, `basic:`, or `digest:`"
+                        .into(),
+                ));
+            }
+            if challenge.is_reject() {
+                return Err(RiptideError::AuthFailed(
+                    "the server rejected the offered mechanism, which for Riptide is \
+                     NTLMSSP alone"
+                        .into(),
+                ));
+            }
+
+            let token = challenge.token.as_deref().ok_or_else(|| {
+                RiptideError::AuthFailed(
+                    "the Negotiate challenge carried no mechanism token".into(),
+                )
+            })?;
+            auth::ntlm::parse_type2(token).ok_or_else(|| {
+                RiptideError::AuthFailed(
+                    "the Negotiate challenge did not contain an NTLM message".into(),
+                )
+            })?
+        }
     };
-    let type3 = auth::ntlm::type3_b64(&t2, spec.user(), spec.domain(), spec.pass(), &ws);
-    Ok(format!("NTLM {type3}"))
+
+    let type3 = auth::ntlm::type3(&t2, spec.user(), spec.domain(), spec.pass(), &ws);
+    Ok(mode.last(&type3))
 }
 
 #[cfg(test)]

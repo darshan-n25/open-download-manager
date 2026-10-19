@@ -11,12 +11,12 @@ code is used or present. The analysis lives in
 `OBSERVED` / `INFERRED` / `UNKNOWN`) and the feature-by-feature comparison, including what is
 **not** implemented, lives in [`docs/FEATURE-MAP.md`](docs/FEATURE-MAP.md).
 
-> **Read the feature map before trusting a checkbox.** Kerberos/Negotiate, PAC script
-> evaluation, FTPS, MMS and MPEG-TS remuxing without `ffmpeg` are honest gaps, and NTLM has
-> not been tested against a real server. §12 of that document checks IDM's own advertised
-> feature list line by line and names four whole features Riptide has no answer for —
-> periodic file synchronization, scheduled grabber projects, and offline site archiving, plus
-> download quotas, which are now implemented.
+> **Read the feature map before trusting a checkbox.** PAC script evaluation, FTPS, MMS and
+> MPEG-TS remuxing without `ffmpeg` are honest gaps, Kerberos itself is absent (Negotiate is
+> implemented with NTLM inside it), and NTLM has not been tested against a real server. §12 of
+> that document checks IDM's own advertised feature list line by line and names four whole
+> features Riptide has no answer for — periodic file synchronization, scheduled grabber
+> projects, and offline site archiving, plus download quotas, which are now implemented.
 
 ---
 
@@ -46,7 +46,7 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Area | What you get |
 | --- | --- |
 | HTTP/HTTPS | Segmented ranged download, resume with `If-Range` validators, retries with backoff, redirects, cookies, custom headers, `Content-Disposition` filename handling |
-| Auth | Basic, Digest (RFC 7616), Bearer, NTLMv2 (RFC/MS-NLMP implemented from scratch — see gaps) |
+| Auth | Basic, Digest (RFC 7616), Bearer, NTLMv2 (MS-NLMP written from scratch), and Negotiate/SPNEGO (RFC 4178/4559) wrapping NTLM — real Kerberos is not implemented |
 | Proxies | `http`, `https`, `socks5`, IDM's compact `mode:value;bypass` strings, Tor presets |
 | Queue | Persistent job store, configurable width, scheduled starts, pause/resume across restarts |
 | Limits | Global and per-file rate limits, a per-server connection cap, and a bytes-per-window budget (`--quota 500M --quota-window 1h`) that pauses jobs instead of failing them |
@@ -64,7 +64,7 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 180 tests: unit + protocol + end-to-end
+cargo test         # 201 tests: unit + protocol + end-to-end
 ```
 
 ## Use
@@ -83,6 +83,11 @@ riptide probe https://example.com/file.iso
 riptide download https://example.com/private.zip \
     --referer https://example.com/page --auth alice:s3cret \
     --proxy socks5://127.0.0.1:9050
+
+# Against IIS/SharePoint: SPNEGO (`Negotiate`), completed with NTLM.
+riptide download https://intranet.corp/report.xlsx --auth 'negotiate:CORP\alice:s3cret'
+# ...or the same credentials as bare NTLM messages.
+riptide download https://intranet.corp/report.xlsx --auth 'ntlm:CORP\alice:s3cret'
 
 # Capture a stream, preferring 1080p, from a manifest URL.
 riptide download https://cdn.example.com/master.m3u8 -q 1080
@@ -156,6 +161,7 @@ src/
   scheduler.rs   queue width, scheduled starts, cancellation propagation
   auth.rs        Basic, Digest, Bearer; spec parsing and challenge handling
   auth/ntlm.rs   NTLMv2 (NTOWFv2, Type 1/2/3 messages) from MS-NLMP
+  auth/spnego.rs SPNEGO (RFC 4178/4559): hand-rolled DER, wrapping, mechanism classification
   net/           client construction, TLS policy, proxy parsing and resolution
   media/         HLS resolver, MPD parser, muxing and remuxing
   grabber.rs     link extraction, filtering, crawl
@@ -198,9 +204,17 @@ against this implementation (§12 there). The short version:
 
 **Protocol and security**
 
-- **Kerberos/Negotiate** is not implemented. Only Basic/Digest/Bearer/NTLMv2 are.
+- **Kerberos/Negotiate**: `negotiate:` works by wrapping NTLMv2 in SPNEGO, which is what a
+  server that accepts NTLM inside `Negotiate` expects — IIS's default provider order. **Actual
+  Kerberos is not implemented**: there is no KDC client, so a Kerberos-only server is detected
+  and reported in those words instead of failing obscurely. The `mechTypes` list offers only
+  NTLMSSP, because RFC 4178 §3.1 forbids offering a mechanism you cannot complete. The whole
+  path is covered end-to-end against a mock server implementing RFC 4559 and MS-NLMP, because
+  no real Windows or domain-joined host was available.
 - **NTLMv2 is unverified against a live server** — the message layout and hash are tested
-  against published vectors, but no interop run has happened.
+  against published vectors, and the full handshake runs end-to-end (including NTProofStr
+  verification) against a mock server written from MS-NLMP, but no interop run against real
+  IIS/Exchange/SharePoint or a domain-joined host has happened.
 - **PAC scripts are not evaluated**: no in-process JavaScript engine. A PAC URL logs a warning
   and falls back to the ambient proxy configuration.
 - **FTP is single-connection**, `ftps://` is explicitly refused rather than silently treated as
@@ -246,13 +260,13 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 180 tests
+cargo test                              # Rust: 201 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 13 tests
 ```
 
-180 Rust tests: 162 unit tests across every module, 9 daemon-protocol tests driving a real
-WebSocket client against a bound daemon, and 9 end-to-end tests that stand up an HTTP server
-which really does byte ranges.
+201 Rust tests: 177 unit tests across every module, 9 daemon-protocol tests driving a real
+WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
+which really does byte ranges, and 6 that stand up a mock `Negotiate` server.
 
 The end-to-end ones assert that
 
@@ -266,11 +280,18 @@ The end-to-end ones assert that
 - a **download quota** stops a job mid-transfer as `paused` (not `failed`), keeps the partial
   file, and a later run finishes it byte-identically; and that a **restarted** process does not
   hand back a fresh budget;
-- the grabber follows exactly one level per `depth` and filters trackers.
+- the grabber follows exactly one level per `depth` and filters trackers;
+- a **`Negotiate` job completes a real SPNEGO handshake** against a mock server that unwraps the
+  token, issues an NTLMSSP challenge inside a `NegTokenResp`, and verifies the client's NTProofStr
+  against the challenge it issued, then downloads the file byte-identically — and that a
+  Kerberos-only server, a wrong password, and a server offering only bare NTLM each fail with a
+  message naming the actual problem.
 
 The unit tests pin the parts that are easy to get subtly wrong: the segment table's filing
 and re-splitting, `RateLimiter` burst-then-throttle behaviour, the `ServerLimits` ceiling under
-24 concurrent tasks, RFC 7616 Digest and MS-NLMP NTLMv2 vectors, `parse_proxy` on IDM's compact
+24 concurrent tasks, RFC 7616 Digest and MS-NLMP NTLMv2 vectors, the SPNEGO DER against the
+octet layout in RFC 4178 Appendix D (independently re-parsed with `openssl asn1parse`),
+`parse_proxy` on IDM's compact
 `mode:value;bypass` strings, HLS/DASH manifest parsing and AES-128 decryption, and — because
 the browser extension is a second implementation of the same framing — the **exact
 `encodeURIComponent` output** a browser produces, decoded back verbatim by the daemon.
