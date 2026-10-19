@@ -21,6 +21,7 @@
 
 pub mod archive;
 pub mod auth;
+pub mod bt;
 pub mod checksum;
 pub mod cli;
 pub mod config;

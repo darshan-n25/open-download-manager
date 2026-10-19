@@ -9,6 +9,10 @@ license = "MIT"
 name = "riptide"
 path = "src/main.rs"
 
+[[bin]]
+name = "riptide-bt"
+path = "src/bin/riptide-bt.rs"
+
 [lib]
 name = "riptide"
 path = "src/lib.rs"
