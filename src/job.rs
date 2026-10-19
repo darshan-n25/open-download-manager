@@ -219,6 +219,12 @@ pub struct Job {
     /// callers can tell "waiting for budget" apart from "waiting for the user".
     #[serde(default)]
     pub quota_paused: bool,
+    /// The server answered a conditional request with `304 Not Modified`: the bytes
+    /// already on disk are the current version, so there is nothing to fetch. Only a
+    /// synchronization project sets this, by sending `If-None-Match` /
+    /// `If-Modified-Since`.
+    #[serde(default)]
+    pub not_modified: bool,
 }
 
 impl Job {
@@ -251,6 +257,7 @@ impl Job {
             updated_ms: now,
             error: None,
             quota_paused: false,
+            not_modified: false,
         }
     }
 

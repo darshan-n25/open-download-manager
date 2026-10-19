@@ -46,6 +46,9 @@ pub enum RiptideError {
     #[error("no such job: {0}")]
     NoSuchJob(String),
 
+    #[error("no such project: {0}")]
+    NoSuchProject(String),
+
     #[error("{0}")]
     Other(String),
 }

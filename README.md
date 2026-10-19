@@ -53,8 +53,9 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Media | HLS (`EXT-X-*`, byteranges, AES-128 keys, master playlists) and DASH (SegmentTemplate, SegmentTimeline, SegmentList); separate audio+video tracks are muxed into one file |
 | FTP | Passive mode, `SIZE`, `REST`-based resume, anonymous defaults |
 | Grabber | BFS crawl with depth/page limits, include/exclude wildcards, media/archive classification, tracker filtering |
+| Projects | Recurring work stored as one document per project: `file` keeps a URL in step with a local path using conditional requests (`304` costs no body bytes), `site` re-crawls and fetches only what changed; run by the daemon when due, or from `cron` with `project tick` |
 | Browser | MV3 extension + a loopback daemon speaking IDM's `MSG#` framing over its WebSocket subprotocol, plus a plain JSON API |
-| CLI | `download`, `grab`, `daemon`, `probe`, `list`, `show`, `remove`, `pause`, `queue`, `config`, `state-dir` |
+| CLI | `download`, `grab`, `daemon`, `probe`, `list`, `show`, `remove`, `pause`, `queue`, `project`, `config`, `state-dir` |
 
 ## Build and install
 
@@ -64,7 +65,7 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 201 tests: unit + protocol + end-to-end
+cargo test         # 239 tests: unit + protocol + end-to-end
 ```
 
 ## Use
@@ -105,6 +106,14 @@ riptide queue --quota 500M --quota-window 1h
 # ...or make it the standing policy.
 riptide config set quota_bytes 500M
 riptide config set quota_window_secs 3600
+
+# Keep a file in step with one URL, hourly, and fetch the first copy now.
+riptide project add feed --url https://example.com/feed.json --every 1h --start-now
+# Re-crawl a page daily and fetch whatever it offers.
+riptide project add mirror --kind site --url https://example.com/downloads \
+    --every 1d --download -o ~/Mirror
+# The daemon runs due projects; `cron` users can run them from a timer instead.
+riptide project tick
 ```
 
 A job that runs out of budget is **paused**, not failed: the partial file is kept and
@@ -122,6 +131,56 @@ riptide config set speed_limit 4M
 riptide config set quota_bytes 500M
 ```
 
+## Recurring projects
+
+IDM's *periodic synchronization* and its *scheduled site grabber* are the same idea — a
+named definition meant to run again — so Riptide stores both the same way, one JSON
+document per project under `state_dir/projects/`, and selects the behaviour with `--kind`.
+
+```sh
+riptide project add feed --url https://example.com/feed.json --every 1h --start-now
+riptide project add mirror --kind site --url https://example.com/downloads \
+    --every 1d --download -o ~/Mirror
+
+riptide project list           # name, interval, when each next runs, how the last run went
+riptide project show feed
+riptide project run feed       # now, whatever the schedule says
+riptide project tick           # everything that is due — the command for cron
+riptide project disable feed   # stop it running, keep the files
+riptide project remove feed    # forget the schedule, keep the files
+```
+
+A `file` project asks the server whether the copy on disk is still current before moving
+any bytes: it sends `If-None-Match` / `If-Modified-Since`, and a `304 Not Modified` ends
+the run with nothing transferred. Anything else is a new version and is fetched **in full**
+into the engine's working file, then swapped into place, so a reader never sees a
+half-written file and a run that fails cannot damage the copy that was already there.
+
+Three consequences are deliberate and worth knowing:
+
+- **A sync never resumes a partial download across runs.** Bytes left in the working file
+  belong to a version the server has since replaced, and splicing old and new bytes
+  together produces a file that is quietly corrupt. When the remote turns out to have
+  changed, the working file is discarded first. Resume still works *within* a run, so a
+  dropped connection costs only the bytes in flight.
+- **The next run is measured from the end of the previous one**, so a run slower than its
+  own interval cannot queue up a backlog; a daemon that was down for a week runs each
+  project once when it comes back, not once per missed slot.
+- **Running out of quota is not a failure.** The run stops, the project is marked
+  `quota-paused`, and the next interval tries again — the same rule the interactive queue
+  follows.
+
+A `site` project re-runs the grabber and, with `--download`, fetches what it finds. Each
+target gets the same conditional treatment as a `file` project, so a second run of an
+unchanged site costs one request per target and no body bytes. Targets are fetched one at a
+time on purpose: an unattended job should be gentle with the origin. `--max-downloads`
+(500 by default) caps how many a single run will pull from a page that lists thousands.
+
+`riptide daemon` runs due projects itself, up to 30 seconds late, and the control page
+lists them. Everything a project transfers goes through the same engine as an interactive
+download, so it is governed by the same global and per-file speed ceilings, the same
+per-server connection ceiling and the same quota.
+
 ## Browser integration
 
 ```sh
@@ -138,10 +197,12 @@ Scripts can use the daemon directly:
 
 ```sh
 curl -s http://127.0.0.1:1001/api/jobs
-curl -s http://127.0.0.1:1001/api/quota   # bytes used / left in the current window
+curl -s http://127.0.0.1:1001/api/quota      # bytes used / left in the current window
+curl -s http://127.0.0.1:1001/api/projects   # recurring projects and when each next runs
 curl -s -X POST http://127.0.0.1:1001/api/jobs \
      -H 'content-type: application/json' \
      -d '{"url":"https://example.com/big.iso","connections":16}'
+curl -s -X POST http://127.0.0.1:1001/api/projects/feed/run   # run a project now
 ```
 
 ## Architecture
@@ -165,10 +226,11 @@ src/
   net/           client construction, TLS policy, proxy parsing and resolution
   media/         HLS resolver, MPD parser, muxing and remuxing
   grabber.rs     link extraction, filtering, crawl
+  project.rs     recurring projects: periodic file sync, scheduled site crawls, due-time logic
   ftp.rs         passive-mode FTP with REST resume
-  daemon.rs      `MSG#` WebSocket service + JSON HTTP API
+  daemon.rs      `MSG#` WebSocket service + JSON HTTP API + project ticker
 extension/       MV3 browser integration (background, popup, options)
-tests/           end-to-end tests against a real range-serving HTTP server, and daemon protocol tests
+tests/           end-to-end tests against servers that really do byte ranges, conditional requests and SPNEGO, plus daemon protocol tests
 ```
 
 ## How Riptide differs from IDM
@@ -234,10 +296,32 @@ against this implementation (§12 there). The short version:
   was read.
 - **No live-stream sniffing.** A player that fetches its manifest from JavaScript will not be
   detected; paste the manifest URL, or let the extension's page scan find it.
+
+**Limits**
+
 - **A quota pauses between chunks, not inside one.** If the remaining budget cannot fit the
   next chunk the charge is refused outright, so a job can pause with up to one chunk of budget
   unspent. It continues on the next `riptide queue` after the window refills. The window is a
   fixed span from the first byte charged, not a wall-clock bucket.
+
+**Recurring projects**
+
+- **A server with neither `ETag` nor `Last-Modified` cannot be synchronized, only
+  re-downloaded.** Such a run logs a warning and fetches the file again every time, because
+  there is nothing to ask the server about. Riptide does not guess with a size or a
+  timestamp.
+- **The daemon's project ticker polls every 30 seconds**, so a project runs up to half a
+  minute after its scheduled time. Missed slots are not replayed: a project that was
+  overdue by anything runs once and is rescheduled from the end of that run.
+- **A `site` project fetches its targets one at a time.** Per-server ceilings still apply,
+  but a large mirror is slower than the interactive grabber, which is the intended
+  trade-off for an unattended job.
+- **A `site` project never deletes anything.** A target that disappears from the page, or
+  starts 404ing, is reported as a failed target; the local copy is left alone.
+- **Project artifacts are addressed by URL, not by content.** Two different URLs that
+  resolve to the same file name land in the same output path for a `file` project only if
+  the user chose that path; for a `site` project, a URL with no file name of its own gets
+  one derived from its host and path so two index pages cannot collide.
 
 **Whole features IDM has that Riptide does not**
 
@@ -260,13 +344,14 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 201 tests
+cargo test                              # Rust: 239 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 13 tests
 ```
 
-201 Rust tests: 177 unit tests across every module, 9 daemon-protocol tests driving a real
+239 Rust tests: 197 unit tests across every module, 10 daemon-protocol tests driving a real
 WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
-which really does byte ranges, and 6 that stand up a mock `Negotiate` server.
+which really does byte ranges, 6 that stand up a mock `Negotiate` server, and 17 that stand
+up a server which really honours `If-None-Match` and `Range`.
 
 The end-to-end ones assert that
 
@@ -287,12 +372,26 @@ The end-to-end ones assert that
   Kerberos-only server, a wrong password, and a server offering only bare NTLM each fail with a
   message naming the actual problem.
 
+And the project tests assert the properties that only show up *between* runs:
+
+- an unchanged remote is answered `304` and **not one body byte moves**, while the file on disk
+  stays exactly as it was;
+- a changed remote is refetched **in full** — including when a stale working file from the
+  previous version is sitting there, which must never be spliced into the new version;
+- a run that fails leaves **the previous version intact** and records why on the project;
+- a `site` project fetches only what the crawl found, skips targets that are already current on
+  the next run (one conditional request each, no bodies), re-fetches just the one that changed,
+  and survives a target that 404s without losing the others;
+- the daemon's due-sweep path runs exactly the projects whose time has come, persists each
+  result, and reschedules from the end of the run rather than replaying missed slots.
+
 The unit tests pin the parts that are easy to get subtly wrong: the segment table's filing
 and re-splitting, `RateLimiter` burst-then-throttle behaviour, the `ServerLimits` ceiling under
 24 concurrent tasks, RFC 7616 Digest and MS-NLMP NTLMv2 vectors, the SPNEGO DER against the
 octet layout in RFC 4178 Appendix D (independently re-parsed with `openssl asn1parse`),
 `parse_proxy` on IDM's compact
-`mode:value;bypass` strings, HLS/DASH manifest parsing and AES-128 decryption, and — because
+`mode:value;bypass` strings, HLS/DASH manifest parsing and AES-128 decryption, project
+schedule arithmetic and the name-to-file-name boundary, and — because
 the browser extension is a second implementation of the same framing — the **exact
 `encodeURIComponent` output** a browser produces, decoded back verbatim by the daemon.
 

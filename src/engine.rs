@@ -595,6 +595,14 @@ impl Engine {
         }
 
         let status = resp.status();
+        // A conditional request answered `304 Not Modified`: the copy on disk is current.
+        // There is no body and no size to learn, so record that and stop — the caller
+        // (a synchronization project) decides that there is nothing to do.
+        if status == StatusCode::NOT_MODIFIED {
+            self.job.not_modified = true;
+            drop(resp);
+            return Ok(());
+        }
         if status == StatusCode::NOT_FOUND {
             return Err(RiptideError::other(format!("404 Not Found: {url}")));
         }
@@ -724,6 +732,17 @@ impl Engine {
     pub async fn run(&mut self) -> Result<()> {
         self.job.state = JobState::Active;
         self.job.touch();
+
+        // A conditional request that the server answered `304 Not Modified` already told us
+        // the local copy is current; `probe` recorded it. There is nothing to transfer, and
+        // reporting `Done` is the honest answer: the job's goal is met.
+        if self.job.not_modified {
+            self.job.state = JobState::Done;
+            self.job.error = None;
+            self.job.quota_paused = false;
+            self.job.touch();
+            return Ok(());
+        }
 
         let result = match self.job.kind {
             JobKind::Hls | JobKind::Dash => crate::media::download(self).await,

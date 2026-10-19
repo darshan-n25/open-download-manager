@@ -9,6 +9,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::Fetcher;
@@ -51,7 +52,8 @@ const DEFAULT_NOISE: &[&str] = &[
     "blank.gif",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct GrabberConfig {
     /// How many link-hops to follow from the start page.
     pub depth: usize,

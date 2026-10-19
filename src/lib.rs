@@ -12,7 +12,9 @@
 //! * Basic / Digest / Bearer / NTLMv2 credential handling (see [`auth`]);
 //! * HLS and DASH manifest capture and remux (see [`media`]);
 //! * a localhost daemon that speaks a `MSG#`-framed protocol to a browser extension so the
-//!   browser stays dumb and the engine stays powerful (see [`daemon`]).
+//!   browser stays dumb and the engine stays powerful (see [`daemon`]);
+//! * recurring projects: periodic file synchronization and scheduled site crawls
+//!   (see [`project`]).
 
 pub mod auth;
 pub mod cli;
@@ -25,6 +27,7 @@ pub mod grabber;
 pub mod job;
 pub mod media;
 pub mod net;
+pub mod project;
 pub mod quota;
 pub mod scheduler;
 pub mod segment;

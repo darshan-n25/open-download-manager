@@ -16,6 +16,7 @@ use crate::engine::{Engine, ProgressFn, ProgressSample};
 use crate::error::{Result, RiptideError};
 use crate::grabber::{self, GrabberConfig, TargetKind};
 use crate::job::{Job, JobKind, JobState};
+use crate::project::{self, Project, ProjectKind, ProjectRunner, ProjectStore, RunOutcome};
 use crate::scheduler::Scheduler;
 use crate::state::JobStore;
 use crate::util;
@@ -69,6 +70,8 @@ pub enum Command {
     Pause { id: String },
     /// Inspect or edit the configuration.
     Config(ConfigArgs),
+    /// Manage recurring projects: keep a file in sync, or re-crawl a site on a schedule.
+    Project(ProjectArgs),
     /// Print the directory holding job state.
     StateDir,
 }
@@ -308,6 +311,126 @@ pub enum ConfigAction {
     Set { key: String, value: String },
 }
 
+#[derive(Args, Debug)]
+pub struct ProjectArgs {
+    #[command(subcommand)]
+    pub action: ProjectAction,
+}
+
+#[derive(Subcommand, Debug)]
+// Clap's derive requires each variant to hold its own argument struct directly, so `Add`
+// is genuinely much larger than the rest. This enum is built once at startup.
+#[allow(clippy::large_enum_variant)]
+pub enum ProjectAction {
+    /// Create a project. Its first run is one interval away.
+    Add(ProjectAddArgs),
+    /// List projects, when each next runs, and how the last run went.
+    List {
+        /// Print the projects as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one project in full.
+    Show { name: String },
+    /// Run one project now, whatever its schedule says.
+    Run { name: String },
+    /// Run every project that is due. This is the command to put in `cron`.
+    Tick {
+        /// Run every project, due or not.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop a project from running on its own. Its files are kept.
+    Disable { name: String },
+    /// Let a disabled project run again.
+    Enable { name: String },
+    /// Delete a project. Everything it downloaded is kept.
+    Remove { name: String },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProjectKindArg {
+    /// Keep one URL up to date at one local file (IDM's periodic synchronization).
+    File,
+    /// Re-crawl a page on a schedule (IDM's site grabber project).
+    Site,
+}
+
+impl From<ProjectKindArg> for ProjectKind {
+    fn from(k: ProjectKindArg) -> Self {
+        match k {
+            ProjectKindArg::File => ProjectKind::File,
+            ProjectKindArg::Site => ProjectKind::Site,
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct ProjectAddArgs {
+    /// Project name. Also the file name its state is stored under.
+    pub name: String,
+
+    #[command(flatten)]
+    pub net: NetOpts,
+
+    /// The URL to synchronize (`--kind file`) or to crawl (`--kind site`).
+    #[arg(long)]
+    pub url: String,
+
+    /// `file` keeps one URL up to date; `site` re-crawls a page.
+    #[arg(long, value_enum, default_value_t = ProjectKindArg::File)]
+    pub kind: ProjectKindArg,
+
+    /// How often to run, e.g. `30m`, `1h`, `1d`, or a bare number of seconds.
+    #[arg(long, value_name = "INTERVAL")]
+    pub every: String,
+
+    /// Where to write: a file for `--kind file`, a directory for `--kind site`.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+
+    /// Run once straight away instead of waiting for the first interval.
+    #[arg(long)]
+    pub start_now: bool,
+
+    /// Preferred rendition for HLS/DASH targets: `best`, `worst`, or a height such as `720`.
+    #[arg(short = 'q', long, value_name = "QUALITY")]
+    pub quality: Option<String>,
+
+    // ---------------------------------------------------------------- site only
+    /// Link hops to follow from the start page.
+    #[arg(short = 'd', long, default_value_t = 1)]
+    pub depth: usize,
+
+    /// Cap on how many pages the crawl will visit.
+    #[arg(long, value_name = "N")]
+    pub max_pages: Option<usize>,
+
+    /// Keep only URLs matching this wildcard. Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    pub include: Vec<String>,
+
+    /// Drop URLs matching this wildcard. Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    pub exclude: Vec<String>,
+
+    /// Report HTML pages too instead of only media and archives.
+    #[arg(long)]
+    pub pages: bool,
+
+    /// Follow links to other hosts as well.
+    #[arg(long)]
+    pub any_host: bool,
+
+    /// Also fetch what the crawl finds, instead of only recording it.
+    #[arg(long)]
+    pub download: bool,
+
+    /// Cap on how many crawl results one run will fetch.
+    #[arg(long, value_name = "N", default_value_t = project::DEFAULT_MAX_DOWNLOADS)]
+    pub max_downloads: usize,
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -330,6 +453,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Queue(args) => cmd_queue(args, quiet).await,
         Command::Pause { id } => cmd_pause(&id),
         Command::Config(args) => cmd_config(args),
+        Command::Project(args) => cmd_project(args, quiet).await,
         Command::StateDir => {
             println!("{}", Config::load().state_dir.display());
             Ok(())
@@ -353,8 +477,9 @@ fn build_ctx(net: &NetOpts, cfg: &Config) -> Result<crate::job::RequestContext> 
     if let Some(a) = &net.auth {
         ctx.auth = Some(crate::auth::parse_auth_spec(a).ok_or_else(|| {
             RiptideError::other(format!(
-                "cannot parse --auth {a:?}; expected user:pass, digest:user:pass, \
-                 ntlm:user:pass:domain, or bearer:token"
+                "cannot parse --auth {a:?}; expected `user:pass`, `basic:user:pass`, \
+                 `digest:user:pass`, `bearer:token`, `ntlm:DOMAIN\\user:pass`, or \
+                 `negotiate:DOMAIN\\user:pass`"
             ))
         })?);
     }
@@ -409,6 +534,9 @@ fn build_job(
     job.max_retries = args.net.retries.unwrap_or(cfg.max_retries);
     job.speed_limit = args.net.limit.as_deref().and_then(util::parse_size);
     job.quality = args.quality.clone();
+    // The configured segment floor and split threshold are what make "smallest useful
+    // segment" a real setting rather than a description of `Job::new`'s defaults.
+    job.min_chunk = cfg.min_chunk;
     if let Some(when) = &args.scheduled {
         job.scheduled_at = Some(parse_when(when)?);
         job.state = JobState::Scheduled;
@@ -1096,6 +1224,319 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+async fn cmd_project(args: ProjectArgs, quiet: bool) -> Result<()> {
+    let cfg = Config::load();
+    let store = ProjectStore::open_in_state_dir(&cfg.state_dir)?;
+    match args.action {
+        ProjectAction::Add(a) => cmd_project_add(&cfg, &store, a, quiet).await,
+        ProjectAction::List { json } => cmd_project_list(&store, json),
+        ProjectAction::Show { name } => cmd_project_show(&store, &name),
+        ProjectAction::Run { name } => cmd_project_run(&cfg, &store, &name).await,
+        ProjectAction::Tick { force } => cmd_project_tick(&cfg, &store, force, quiet).await,
+        ProjectAction::Enable { name } => cmd_project_toggle(&store, &name, true),
+        ProjectAction::Disable { name } => cmd_project_toggle(&store, &name, false),
+        ProjectAction::Remove { name } => cmd_project_remove(&store, &name),
+    }
+}
+
+async fn cmd_project_add(
+    cfg: &Config,
+    store: &ProjectStore,
+    a: ProjectAddArgs,
+    quiet: bool,
+) -> Result<()> {
+    project::validate_name(&a.name)?;
+    if store.exists(&a.name) {
+        return Err(RiptideError::other(format!(
+            "a project named {:?} already exists; remove it first, or choose another name",
+            a.name
+        )));
+    }
+    let interval_secs = project::parse_interval(&a.every)?;
+    if interval_secs < project::BUSY_INTERVAL_SECS && !quiet {
+        eprintln!(
+            "warning: {:?} will run every {interval_secs}s, which is probably more often \
+             than you meant",
+            a.name
+        );
+    }
+
+    let kind: ProjectKind = a.kind.into();
+    let output = match &a.output {
+        Some(o) => o.clone(),
+        None => match kind {
+            // A file project's default name comes from the URL, so it lands where a plain
+            // `download` of the same URL would have put it.
+            ProjectKind::File => cfg
+                .download_dir
+                .join(util::filename_from_url(&a.url).unwrap_or_else(|| a.name.clone())),
+            ProjectKind::Site => cfg.download_dir.join(&a.name),
+        },
+    };
+
+    let mut p = Project::new(a.name.clone(), kind, a.url.clone(), output, interval_secs);
+    p.ctx = build_ctx(&a.net, cfg)?;
+    p.connections = a.net.connections.unwrap_or(cfg.connections);
+    p.quality = a.quality.clone();
+
+    if kind == ProjectKind::Site {
+        p.grab = GrabberConfig {
+            depth: a.depth,
+            max_pages: a.max_pages.unwrap_or(grabber::DEFAULT_MAX_PAGES),
+            same_host: !a.any_host,
+            include: a.include.clone(),
+            exclude: a.exclude.clone(),
+            media_only: !a.pages,
+        };
+        p.download = a.download;
+        p.max_downloads = a.max_downloads.max(1);
+        if a.download {
+            std::fs::create_dir_all(&p.output).ok();
+        }
+    } else if a.download {
+        return Err(RiptideError::other(
+            "--download only applies to `--kind site`; a `file` project always fetches its URL",
+        ));
+    }
+
+    if a.start_now {
+        p.next_run_ms = Some(util::now_ms());
+    }
+
+    let runner = ProjectRunner::new(cfg.clone());
+    if a.start_now {
+        // Save before running: a crash mid-download should leave the project recorded,
+        // with the error on it, rather than losing the definition entirely.
+        store.save(&p)?;
+        let outcome = runner.run(&mut p).await;
+        store.save(&p)?;
+        report_run(&p.name, outcome, p.last_error.as_deref());
+        if outcome.is_failure() {
+            return Err(RiptideError::other(format!(
+                "project {:?} was created, but its first run did not succeed",
+                p.name
+            )));
+        }
+    } else {
+        store.save(&p)?;
+    }
+
+    if !quiet {
+        println!(
+            "{:?} ({}) every {}, next run {}",
+            p.name,
+            p.kind.as_str(),
+            human_interval(p.interval_secs),
+            p.schedule_summary(util::now_ms()),
+        );
+        println!("  url    {}", p.url);
+        println!("  output {}", p.output.display());
+        if p.next_run_ms.is_some() && !a.start_now {
+            println!(
+                "  run it now with `riptide project run {}`, or let the daemon run it \
+                 when it is due",
+                p.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn human_interval(secs: u64) -> String {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn report_run(name: &str, outcome: RunOutcome, error: Option<&str>) {
+    println!("{name}: {}", outcome.as_str());
+    if let Some(e) = error {
+        eprintln!("  {e}");
+    }
+}
+
+fn cmd_project_list(store: &ProjectStore, json: bool) -> Result<()> {
+    let projects = store.list()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&projects)?);
+        return Ok(());
+    }
+    if projects.is_empty() {
+        println!("no projects");
+        return Ok(());
+    }
+    let now = util::now_ms();
+    // Column widths follow the data, so a long name does not push the table apart.
+    let name_w = projects
+        .iter()
+        .map(|p| p.name.len())
+        .chain(std::iter::once("NAME".len()))
+        .max()
+        .unwrap_or(4);
+    let kind_w = 4; // "kind"
+    println!(
+        "{:<name_w$}  {:<kind_w$}  {:<7}  {:<12}  LAST RUN",
+        "NAME", "KIND", "EVERY", "NEXT",
+    );
+    for p in &projects {
+        println!(
+            "{:<name_w$}  {:<kind_w$}  {:<7}  {:<12}  {}",
+            p.name,
+            p.kind.as_str(),
+            human_interval(p.interval_secs),
+            p.schedule_summary(now),
+            p.last_run_summary(now),
+        );
+    }
+    Ok(())
+}
+
+fn cmd_project_show(store: &ProjectStore, name: &str) -> Result<()> {
+    let p = store.load(name)?;
+    let now = util::now_ms();
+    println!("{} ({})", p.name, p.kind.as_str());
+    println!("  url        {}", p.url);
+    println!("  output     {}", p.output.display());
+    println!("  every      {}", human_interval(p.interval_secs));
+    println!(
+        "  state      {}",
+        if p.enabled { "enabled" } else { "disabled" }
+    );
+    println!("  next run   {}", p.schedule_summary(now));
+    println!("  last run   {}", p.last_run_summary(now));
+    println!("  runs       {}", p.runs);
+    if p.failures > 0 {
+        println!("  failing    {} consecutive run(s)", p.failures);
+    }
+    if let Some(e) = &p.last_error {
+        println!("  error      {e}");
+    }
+    if let Some(n) = p.last_bytes {
+        println!("  bytes      {}", util::human_bytes(n));
+    }
+    if p.kind == ProjectKind::Site {
+        println!("  crawl      depth {}", p.grab.depth);
+        println!("  same host  {}", p.grab.same_host);
+        if !p.grab.include.is_empty() {
+            println!("  include    {}", p.grab.include.join(", "));
+        }
+        if !p.grab.exclude.is_empty() {
+            println!("  exclude    {}", p.grab.exclude.join(", "));
+        }
+        println!(
+            "  download   {}",
+            if p.download {
+                "yes"
+            } else {
+                "no (planning only)"
+            }
+        );
+        if let (Some(f), Some(x), Some(s)) = (p.last_found, p.last_fetched, p.last_skipped) {
+            println!("  last crawl {f} link(s): {x} fetched, {s} already current");
+        }
+    } else {
+        match (&p.validator.etag, &p.validator.last_modified) {
+            (None, None) => println!("  validator  none yet (first run has not happened)"),
+            (etag, lm) => {
+                if let Some(e) = etag {
+                    println!("  etag       {e}");
+                }
+                if let Some(l) = lm {
+                    println!("  modified   {l}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_project_run(cfg: &Config, store: &ProjectStore, name: &str) -> Result<()> {
+    let mut p = store.load(name)?;
+    let runner = ProjectRunner::new(cfg.clone());
+    let outcome = runner.run(&mut p).await;
+    store.save(&p)?;
+    report_run(&p.name, outcome, p.last_error.as_deref());
+    if outcome.is_failure() {
+        return Err(RiptideError::other(format!(
+            "project {name:?} did not succeed"
+        )));
+    }
+    Ok(())
+}
+
+async fn cmd_project_tick(
+    cfg: &Config,
+    store: &ProjectStore,
+    force: bool,
+    quiet: bool,
+) -> Result<()> {
+    let now = util::now_ms();
+    // `--force` means "run it now even though it is not due"; it never means "run the
+    // projects the user switched off".
+    let mut projects = store.list()?;
+    if !force {
+        projects.retain(|p| p.is_due(now));
+    }
+    projects.retain(|p| p.enabled);
+    if projects.is_empty() {
+        if !quiet {
+            println!("no projects due");
+        }
+        return Ok(());
+    }
+
+    let runner = ProjectRunner::new(cfg.clone());
+    let mut failed = Vec::new();
+    for mut p in projects {
+        let outcome = runner.run(&mut p).await;
+        store.save(&p)?;
+        if !quiet {
+            report_run(&p.name, outcome, p.last_error.as_deref());
+        }
+        if outcome.is_failure() {
+            failed.push(p.name);
+        }
+    }
+    if !failed.is_empty() {
+        // A non-zero exit is what makes `cron` able to tell somebody.
+        return Err(RiptideError::other(format!(
+            "{} project(s) failed: {}",
+            failed.len(),
+            failed.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn cmd_project_toggle(store: &ProjectStore, name: &str, enabled: bool) -> Result<()> {
+    let mut p = store.load(name)?;
+    p.enabled = enabled;
+    p.updated_ms = util::now_ms();
+    store.save(&p)?;
+    println!("{name}: {}", if enabled { "enabled" } else { "disabled" });
+    Ok(())
+}
+
+fn cmd_project_remove(store: &ProjectStore, name: &str) -> Result<()> {
+    // Deliberately does not touch what the project downloaded: deleting a schedule should
+    // never be able to delete somebody's files.
+    let p = store.load(name)?;
+    store.delete(name)?;
+    println!("{name}: removed");
+    println!("  kept {}", p.output.display());
+    Ok(())
 }
 
 #[cfg(test)]

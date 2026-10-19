@@ -18,9 +18,11 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use riptide::config::Config;
 use riptide::daemon::{self, encode_frame, msg, parse_frame, Message, PROTOCOL_VERSION};
+use riptide::project::{Project, ProjectKind, ProjectStore};
 
 struct Running {
     addr: std::net::SocketAddr,
+    state_dir: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -43,7 +45,11 @@ async fn start_daemon_with(tweak: impl FnOnce(&mut Config)) -> Running {
         let _ = daemon::serve_on(listener, sched).await;
     });
 
-    Running { addr, _dir: dir }
+    Running {
+        addr,
+        state_dir: cfg.state_dir.clone(),
+        _dir: dir,
+    }
 }
 
 fn ws_url(addr: std::net::SocketAddr) -> String {
@@ -304,6 +310,54 @@ async fn the_control_page_is_served() {
         body.contains("/api/quota"),
         "the control page should show the download budget too"
     );
+    assert!(
+        body.contains("/api/projects"),
+        "the control page should list recurring projects too"
+    );
+}
+
+#[tokio::test]
+async fn the_http_api_lists_projects_and_refuses_names_it_does_not_have() {
+    let d = start_daemon().await;
+
+    let listed: serde_json::Value =
+        serde_json::from_str(&http_get(d.addr, "/api/projects").await).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 0, "nothing yet");
+
+    // Put a project where the daemon looks for them.
+    let store = ProjectStore::open_in_state_dir(&d.state_dir).unwrap();
+    let mut p = Project::new(
+        "nightly",
+        ProjectKind::File,
+        "http://example.test/f.bin",
+        d.state_dir.join("f.bin"),
+        3600,
+    );
+    p.next_run_ms = Some(riptide::util::now_ms() + 600_000);
+    store.save(&p).unwrap();
+
+    let listed: serde_json::Value =
+        serde_json::from_str(&http_get(d.addr, "/api/projects").await).unwrap();
+    let arr = listed.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "nightly");
+    assert_eq!(arr[0]["kind"], "file");
+    // The display strings are derived server-side, so a page does not have to re-implement
+    // "is it due".
+    assert!(
+        arr[0]["next_run_in"].as_str().unwrap().starts_with("in "),
+        "next_run_in should read like a person wrote it: {}",
+        arr[0]["next_run_in"]
+    );
+    assert_eq!(arr[0]["last_run"], "never");
+
+    // An unknown project is a 404 — not a panic, and not a silent success.
+    let (status, _) = http_post(d.addr, "/api/projects/nope/run", "").await;
+    assert_eq!(status, 404);
+
+    // So is an action the API does not define.
+    let (status, _) = http_post(d.addr, "/api/projects/nightly/frobnicate", "").await;
+    assert_eq!(status, 404);
 }
 
 // ---------------------------------------------------------------------------

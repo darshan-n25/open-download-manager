@@ -16,6 +16,7 @@ use crate::engine::{Engine, ProgressFn, SharedLimits};
 use crate::error::Result;
 use crate::job::{Job, JobState};
 use crate::net::ServerLimits;
+use crate::project::ProjectStore;
 use crate::quota::Quota;
 use crate::state::JobStore;
 use crate::throttle::RateLimiter;
@@ -23,6 +24,9 @@ use crate::throttle::RateLimiter;
 pub struct Scheduler {
     pub cfg: Config,
     pub store: JobStore,
+    /// Recurring definitions. Kept here so the CLI, the daemon and its ticker all reach
+    /// the same directory without each re-deriving it from the config.
+    pub projects: ProjectStore,
     /// Shared across every job, so "Maximum download speed" really is a global ceiling.
     pub global: Arc<RateLimiter>,
     /// Shared across every job, so "Max. connections number for a server" is enforced
@@ -40,6 +44,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new(cfg: Config) -> Result<Self> {
         let store = JobStore::open(cfg.state_dir.clone())?;
+        let projects = ProjectStore::open_in_state_dir(&cfg.state_dir)?;
         let global = Arc::new(RateLimiter::new(cfg.speed_limit));
         let servers = Arc::new(ServerLimits::new(cfg.per_server_connections));
         let quota = Arc::new(cfg.persistent_quota());
@@ -47,6 +52,7 @@ impl Scheduler {
         Ok(Scheduler {
             cfg,
             store,
+            projects,
             global,
             servers,
             quota,
@@ -202,6 +208,7 @@ impl Scheduler {
         Scheduler {
             cfg: self.cfg.clone(),
             store: self.store.clone(),
+            projects: self.projects.clone(),
             global: self.global.clone(),
             servers: self.servers.clone(),
             quota: self.quota.clone(),
@@ -212,6 +219,33 @@ impl Scheduler {
 
     pub fn available_slots(&self) -> usize {
         self.slots.available_permits()
+    }
+
+    /// Run every project that is due, oldest first, and return what happened.
+    ///
+    /// Sequentially, on purpose: a scheduled sweep should not compete with itself, and a
+    /// project that is slow is better than a machine running twenty crawls at once.
+    pub async fn run_due_projects(
+        &self,
+        runner: &crate::project::ProjectRunner,
+    ) -> Vec<(String, crate::project::RunOutcome)> {
+        let due = match self.projects.due(crate::util::now_ms()) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot list projects");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::with_capacity(due.len());
+        for mut project in due {
+            tracing::info!(project = %project.name, kind = project.kind.as_str(), "running");
+            let outcome = runner.run(&mut project).await;
+            if let Err(e) = self.projects.save(&project) {
+                tracing::warn!(project = %project.name, error = %e, "cannot save project");
+            }
+            out.push((project.name.clone(), outcome));
+        }
+        out
     }
 }
 

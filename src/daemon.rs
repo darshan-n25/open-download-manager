@@ -22,6 +22,7 @@
 //! guaranteed. The framing, the handshake shape and the subprotocol string are as observed.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,7 +31,15 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::Config;
 use crate::error::{Result, RiptideError};
 use crate::job::{Job, JobKind, JobState, RequestContext};
+use crate::project::ProjectRunner;
 use crate::scheduler::Scheduler;
+
+/// How often the daemon looks for projects whose scheduled time has arrived.
+///
+/// A poll rather than a timer set to the earliest `next_run_ms`: a poll is a read of a few
+/// small files, it needs no coordination when the CLI edits a project behind the daemon's
+/// back, and being up to this late is irrelevant for a job measured in minutes.
+pub const PROJECT_TICK_SECS: u64 = 30;
 
 /// The subprotocol string the shipped Chrome extension requests.
 pub const WS_PROTOCOL: &str = "plugin.v3.internetdownloadmanager.com";
@@ -229,6 +238,8 @@ pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
     // Accepts both a raw byte count and the `2M` shorthand the CLI uses.
     job.speed_limit = m.get("speed_limit").and_then(crate::util::parse_size);
     job.quality = m.get("quality").map(|s| s.to_string());
+    job.min_chunk = cfg.min_chunk;
+    job.max_retries = cfg.max_retries;
 
     let mut ctx = RequestContext {
         user_agent: m.get("user_agent").map(|s| s.to_string()),
@@ -562,6 +573,79 @@ async fn handle_http(stream: &mut TcpStream, sched: Arc<Scheduler>) -> Result<()
                 }
             }
         }
+        ("GET", "/api/projects") => {
+            let projects = sched.projects.list().unwrap_or_default();
+            let now = crate::util::now_ms();
+            // The stored document plus the two derived strings, so a client does not have to
+            // re-implement "is it due" to render a page.
+            let view: Vec<serde_json::Value> = projects
+                .iter()
+                .map(|p| {
+                    let mut v = serde_json::to_value(p).unwrap_or_default();
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert(
+                            "next_run_in".into(),
+                            serde_json::Value::String(p.schedule_summary(now)),
+                        );
+                        obj.insert(
+                            "last_run".into(),
+                            serde_json::Value::String(p.last_run_summary(now)),
+                        );
+                    }
+                    v
+                })
+                .collect();
+            let json = serde_json::to_vec_pretty(&view).unwrap_or_else(|_| b"[]".to_vec());
+            write_response(stream, 200, "OK", "application/json", &json).await
+        }
+        ("POST", p) if p.starts_with("/api/projects/") => {
+            // `POST /api/projects/<name>/run` runs one now, whatever its schedule says.
+            let rest = p.trim_start_matches("/api/projects/");
+            let Some((name, action)) = rest.rsplit_once('/') else {
+                return write_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    b"expected /api/projects/<name>/run",
+                )
+                .await;
+            };
+            if action != "run" {
+                return write_response(stream, 404, "Not Found", "text/plain", b"unknown action")
+                    .await;
+            }
+            let mut project = match sched.projects.load(name) {
+                Ok(p) => p,
+                Err(_) => {
+                    return write_response(
+                        stream,
+                        404,
+                        "Not Found",
+                        "text/plain",
+                        b"no such project",
+                    )
+                    .await;
+                }
+            };
+            let runner = ProjectRunner::with_limits(
+                sched.cfg.clone(),
+                sched.global.clone(),
+                sched.servers.clone(),
+                sched.quota.clone(),
+            );
+            let outcome = runner.run(&mut project).await;
+            let saved = sched.projects.save(&project);
+            let body = serde_json::to_vec(&serde_json::json!({
+                "name": project.name,
+                "outcome": outcome.as_str(),
+                "error": project.last_error,
+                "saved": saved.is_ok(),
+            }))
+            .unwrap_or_default();
+            let status = if outcome.is_failure() { 502 } else { 200 };
+            write_response(stream, status, "OK", "application/json", &body).await
+        }
         ("POST", "/api/jobs") => {
             let parsed: std::result::Result<serde_json::Value, _> =
                 serde_json::from_slice(&req.body);
@@ -658,6 +742,11 @@ WebSocket subprotocol on this port. This page is the plain-HTTP control surface.
 <p id="quota" class="muted"></p>
 <ul id="jobs"></ul>
 
+<h2>Projects</h2>
+<p class="muted">Recurring work: a file kept in sync with a URL, or a site re-crawled on a
+schedule. Created with <code>riptide project add</code>; the daemon runs them when due.</p>
+<ul id="projects"></ul>
+
 <script>
 async function add(){
   const url=document.getElementById('url').value.trim();
@@ -678,6 +767,19 @@ async function refresh(){
     ? `Download quota: ${fmtBytes(q.used)} of ${fmtBytes(q.limit)} used this window`+
       (q.resets_in_secs!=null?`, refills in ${q.resets_in_secs}s`:'')+'.'
     : 'No download quota set.';
+
+  const projects=await (await fetch('/api/projects')).json();
+  document.getElementById('projects').innerHTML = projects.length ? projects.map(pr=>
+    `<li><b>${pr.name}</b> — ${pr.kind}, next ${pr.next_run_in}
+      ${pr.enabled?'':'<span class="muted">(disabled)</span>'}
+      <button onclick="runProject('${pr.name}')">Run now</button><br>
+      <span class="muted">${pr.output} · last ${pr.last_run}</span></li>`
+  ).join('') : '<li class="muted">No projects.</li>';
+}
+async function runProject(name){
+  const r=await fetch(`/api/projects/${encodeURIComponent(name)}/run`,{method:'POST'});
+  document.getElementById('out').textContent=await r.text();
+  refresh();
 }
 function fmtBytes(n){
   const u=['B','KB','MB','GB','TB'];let i=0;
@@ -733,10 +835,40 @@ pub async fn serve_on(listener: TcpListener, sched: Arc<Scheduler>) -> Result<()
     );
     eprintln!("Riptide daemon listening on http://{addr}  (WebSocket subprotocol {WS_PROTOCOL})");
 
+    tokio::spawn(project_ticker(sched.clone()));
+
     loop {
         let (stream, peer) = listener.accept().await?;
         let sched = sched.clone();
         tokio::spawn(async move { handle_conn(stream, peer, sched).await });
+    }
+}
+
+/// Run due projects for as long as the daemon lives.
+///
+/// The runner shares the daemon's limiters, so a project competes for the same bandwidth
+/// budget as an interactive download instead of doubling it.
+async fn project_ticker(sched: Arc<Scheduler>) {
+    let runner = ProjectRunner::with_limits(
+        sched.cfg.clone(),
+        sched.global.clone(),
+        sched.servers.clone(),
+        sched.quota.clone(),
+    );
+    let mut tick = tokio::time::interval(Duration::from_secs(PROJECT_TICK_SECS));
+    // The first tick is immediate, which is what we want: a project whose time passed while
+    // the daemon was down should run soon after it comes back, not a tick later.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        for (name, outcome) in sched.run_due_projects(&runner).await {
+            if outcome.is_failure() {
+                // The detail is on the project; this is the line that makes it visible.
+                tracing::warn!(project = %name, outcome = outcome.as_str(), "project run failed");
+            } else {
+                tracing::info!(project = %name, outcome = outcome.as_str(), "project run finished");
+            }
+        }
     }
 }
 

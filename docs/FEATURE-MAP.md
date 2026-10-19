@@ -85,6 +85,7 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | Retry a queued file every 30 seconds until it starts `[OBSERVED, IDM tips]` | **Done** | the scheduler holds a waiting job and re-checks it | |
 | Pause/resume across restarts | **Done** | `JobState::Paused` + the persisted segment table | Ctrl-C cancels via a flag so jobs land in `Paused`, i.e. resumable. |
 | Shut the machine down when the queue drains `[OBSERVED]` | **Absent** | — | Deliberate: it is a platform-specific power call that a CLI should not make silently. |
+| Recurring work: periodic file synchronization, and scheduled site-grabber projects | **Done** | `src/project.rs`, `riptide project`, the daemon's ticker | One persisted definition per project, `--kind file` or `--kind site`, in `state_dir/projects/`. A `file` project sends `If-None-Match`/`If-Modified-Since` and treats `304` as "nothing to do", so an unchanged sync moves no body bytes; anything else is a new version, fetched in full into the working file and renamed into place, so a failed run cannot damage the copy on disk and a stale partial from an older version is never spliced in. A `site` project re-runs the crawl and fetches only targets that changed, with the same conditional treatment per target. The daemon runs due projects (one 30 s poll), and `riptide project tick` does the same for `cron`. Buys into the same global/per-file rate limits, per-server ceiling and quota as an interactive download. Deltas from IDM: the next run is measured from the end of the previous one, so missed slots are collapsed into a single catch-up run rather than replayed; and there is one project store rather than IDM's several separate queues. |
 | Category folders (`FoldersTree`, `IDMFType.dat` extension map) `[OBSERVED]` | **Partial** | `config.auto_categorize`, `src/config.rs` | Sorts finished files into per-type subfolders using a small built-in extension map. It does **not** read IDM's `IDMFType.dat` or reproduce its folder tree. |
 
 ## 6. Media: HLS, DASH, remuxing
@@ -119,7 +120,7 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | IDM behaviour (evidence) | Riptide | Where | Notes |
 | --- | --- | --- | --- |
 | Link extraction from a page, driven out-of-process by `IDMGrHlp.exe` `[OBSERVED]` | **Done — in-process** | `src/grabber.rs` | A BFS crawl inside the daemon/CLI rather than a helper process. |
-| `GrabberSts\{IncludeFilters,ExcludeFilters,Projects}`, `sprojects*.dat`, `surlexclist.dat` `[OBSERVED]` | **Partial** | `GrabberConfig` include/exclude globs, `media_only` | Project and allow-list *files* are Riptide's own JSON config, not IDM's seeds. |
+| `GrabberSts\{IncludeFilters,ExcludeFilters,Projects}`, `sprojects*.dat`, `surlexclist.dat` `[OBSERVED]` | **Partial** | `GrabberConfig` include/exclude globs, `media_only`, `src/project.rs` | Crawl filters are Riptide's own flags, and a scheduled grabber is a [`Project`](../src/project.rs) stored as JSON under `state_dir/projects/`. Neither reads IDM's `.dat` seeds, and IDM's `surlexclist.dat` (an allow-list of seed URLs) has no equivalent. |
 | Depth-limited crawl | **Done** | `--depth` | Test: `the_grabber_finds_media_links_and_skips_trackers` asserts exactly one level per depth increment. |
 | Page count limit | **Done** | `--max-pages` | |
 | Media/archive classification with an extension map | **Done** | `classify`, plus the built-in media/archive extension sets | `.txt`/images/unknown types are intentionally not reported. |
@@ -187,11 +188,11 @@ weak evidence but the only kind available without a disassembler here.
 | One click: HTTP, FTP, HTTPS **and MMS** | `mms://`, `mmsPacketSize`, `mmsIndex`, `StImmMsg`, `send mms cmd`, `MMSCn:ProcRpl`, `Unk err in MMSCn:ProcWR` `[OBSERVED]` | **Absent** | IDM really does implement MMS (`MMSCn` = MMS connection). Riptide does not. MMS is a dead protocol — Windows Media Services dropped it in 2008 and `mms://` links are effectively extinct — so this is recorded as a gap rather than planned work. If you have a live MMS source, Riptide cannot fetch it. |
 | All popular browsers | shipped CRX + native host `[OBSERVED]` | **Partial** | Chrome/Edge (MV3) and Firefox (an alternate manifest). No Safari, Opera, or IE. |
 | Video panel: grab media from web players | `CM3UParser`, `CMp4DashReader` `[OBSERVED]` | **Partial** | HLS/DASH manifests and page `<video>` sources. No browser-side request sniffing, so a player that fetches its manifest from JavaScript needs you to paste the manifest URL. |
-| Built-in scheduler: connect at a set time, download, **disconnect/hang up the modem**, or **shut the computer down** when done | `Shut down`, `Shut down now`, `Hang up modem`, `Hang up now`, `Internet Download Manager has finished queue processing. According to scheduler settings IDM is going to hang up your modem.` `[OBSERVED]` | **Partial** | Scheduled start and queue width are done. Shutdown, modem hang-up, and "disconnect when done" are **Absent** — they are platform power/dial-up calls a CLI should not make silently, and dial-up is long gone. |
-| **Periodic synchronization of files**; several separate queues | `Periodic synchronization`, `synchroniz*` `[OBSERVED]` | **Absent** | Re-downloading a URL on a schedule and keeping a local mirror in step is a real feature with no Riptide equivalent. One queue, not several. |
+| Built-in scheduler: connect at a set time, download, **disconnect/hang up the modem**, or **shut the computer down** when done | `Shut down`, `Shut down now`, `Hang up modem`, `Hang up now`, `Internet Download Manager has finished queue processing. According to scheduler settings IDM is going to hang up your modem.` `[OBSERVED]` | **Partial** | Scheduled start, queue width, and recurring projects (§5) are done. Shutdown, modem hang-up, and "disconnect when done" are **Absent** — they are platform power/dial-up calls a CLI should not make silently, and dial-up is long gone. |
+| **Periodic synchronization of files**; several separate queues | `Periodic synchronization`, `synchroniz*` `[OBSERVED]` | **Done** | `riptide project add --kind file`: a persisted URL↔path pair that asks the server whether the copy on disk is current (`If-None-Match`/`If-Modified-Since`) and refetches in full only when it is not. One project store rather than several separate queues — the distinction in IDM is a UI convenience, not a scheduling difference. |
 | Spider/grabber: all files matching filters | `GrabberSts`, `sprojects.dat`, `surlexclist.dat` `[OBSERVED]` | **Done** | §8. |
 | Grabber: **complete web sites for offline browsing**, rewriting links to local files | `Complete start page with all pictures, styles, and scripts for offline browsing`, `Convert the links in downloaded html files to the local files for offline browsing` `[OBSERVED]` | **Absent** | Riptide's grabber *finds and downloads* targets; it does not archive a page (CSS, JS, images) or rewrite HTML to point at the local copies. |
-| Grabber projects on a schedule, periodically | `sprojects.dat`, `Periodic synchronization` `[OBSERVED]` | **Absent** | No project concept and no recurring grabber runs. |
+| Grabber projects on a schedule, periodically | `sprojects.dat`, `Periodic synchronization` `[OBSERVED]` | **Done** | `riptide project add --kind site`: re-runs the crawl on an interval and, with `--download`, fetches what it finds — each target getting the same conditional treatment as a `file` project, so an unchanged site costs one request per target and no bodies. Run by the daemon when due, or by `cron` via `project tick`. |
 | Download categories | `IDMFType.dat`, `FoldersTree` `[OBSERVED]` | **Partial** | §5. |
 | "Download All" — add every link on the page | grabber's include/exclude filters `[OBSERVED]` | **Partial** | `riptide grab --download` does this from the CLI and from the popup's page scan. |
 | **Download limits**: quotas in megabytes per hour | `Download limits`, `Download limits exceeded!` `[OBSERVED]` | **Done** | Two independent mechanisms, both from the binary's own vocabulary. **Rate limits** in bytes/second, global and per file (`Speed Limiter`, `Use Speed Limiter`, `Remember Speed Limiter settings for this file`). **A quota over a fixed window** — `quota_bytes` of `quota_window_secs`, e.g. "no more than 500 MB per hour" — enforced on every byte written, by one process-wide budget shared across jobs, the media remuxer, FTP, and crawls. Exhaustion **pauses** the job rather than failing it: progress is kept, the reason says how long until the window refills, and `riptide queue` continues it. The window is remembered in `state_dir/quota.json`, so a restart does not hand back a fresh budget. Two deliberate divergences: the window is a fixed span from the first byte charged rather than IDM's per-hour bucket, and a charge too large for the remaining budget is refused outright rather than partially written, so a job can pause with up to one chunk of budget unspent. |
@@ -213,6 +214,7 @@ download engine:
 1. **MMS**, which is genuinely implemented and genuinely obsolete.
 2. **Periodic file synchronization** and **scheduled grabber projects** — a whole
    "keep this mirror fresh" mode that Riptide has no answer for.
+   *Now implemented* — see the "Recurring work" row in §5.
 3. **Download quotas over a time window**, as opposed to instantaneous rate limits.
    *Now implemented* — see the "Download limits" row above.
 4. **Offline site archiving with link rewriting**, as opposed to link harvesting.
@@ -222,24 +224,33 @@ terminal-first tool has no place for.
 
 ## 13. What "tested" means here
 
-`cargo test` runs 201 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
+`cargo test` runs 239 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
 more against the extension's framing. The distinction that matters in this document:
 
 - **Unit tests** prove an algorithm in isolation (parsers, KDFs, the segment table, the
-  semaphores, the JS framing).
-- **Protocol tests** (`tests/daemon.rs`) drive the daemon over a real WebSocket.
-- **End-to-end tests** (`tests/segmented.rs`) stand up a real HTTP server that really does
+  semaphores, the JS framing, project schedule arithmetic).
+- **Protocol tests** (`tests/daemon.rs`) drive the daemon over a real WebSocket and its JSON API.
+- **End-to-end tests** (`tests/segmented.rs`, `tests/projects.rs`) stand up real HTTP servers
+  that really do byte ranges and conditional requests, and check the bytes on disk.
   byte ranges and check the bytes on disk; `tests/negotiate.rs` stands up a mock RFC 4559 server
   that issues an NTLMSSP challenge inside SPNEGO and re-derives the client's NTProofStr.
 - **Live checks** run the release binary against a separately written server on this machine —
   useful for catching build-configuration and CLI-level mistakes that in-process tests cannot
-  see, but still not an interop test against anyone else's implementation.
+  see, but still not an interop test against anyone else's implementation. The recurring-project
+  feature was checked this way end to end: a `file` project downloaded 3 MiB byte-identically,
+  the second run transferred **zero** body bytes and had its `304` counted by the server, a
+  changed remote replaced the file exactly even with a stale working file planted on disk, a
+  `site` project fetched its targets and then skipped both on the next run, and the daemon's own
+  ticker ran the project unprompted once its interval elapsed.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
-Windows host, a PAC file, an FTPS server, `ffmpeg`, an MMS source, or a live HLS/DASH origin.
-Those rows are labelled **Unverified**, **Partial**, **Absent** or **Refused** above and should
-be treated that way. The mock `Negotiate` server in `tests/negotiate.rs` is written from the
-specifications too, so agreement with it proves conformance to those documents, not to IIS.
+Windows host, a PAC file, an FTPS server, `ffmpeg`, an MMS source, a live HLS/DASH origin, a
+scheduler other than a self-written `cron`-shaped one, or a real web server other than the ones
+written for these tests. Those rows are labelled **Unverified**, **Partial**, **Absent** or
+**Refused** above and should be treated that way. The mock `Negotiate` server in
+`tests/negotiate.rs` and the conditional-`GET` server in `tests/projects.rs` were written from
+the specifications too, so agreement with them proves conformance to those documents, not to
+IIS or to nginx.
 
 ## 14. Sources
 
