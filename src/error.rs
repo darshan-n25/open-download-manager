@@ -43,6 +43,17 @@ pub enum RiptideError {
     #[error("not supported: {0}")]
     Unsupported(String),
 
+    /// The downloaded bytes did not match the expected digest. The working file has already
+    /// been removed by the time this is returned, so nothing is left that could be mistaken
+    /// for a good download.
+    #[error("{algorithm} checksum mismatch for {path}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        algorithm: String,
+        expected: String,
+        actual: String,
+        path: String,
+    },
+
     #[error("no such job: {0}")]
     NoSuchJob(String),
 

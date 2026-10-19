@@ -53,7 +53,8 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Proxies | `http`, `https`, `socks5`, IDM's compact `mode:value;bypass` strings, Tor presets |
 | Queue | Persistent job store, configurable width, scheduled starts, pause/resume across restarts |
 | Limits | Global and per-file rate limits, a per-server connection cap, and a bytes-per-window budget (`--quota 500M --quota-window 1h`) that pauses jobs instead of failing them |
-| Media | HLS (`EXT-X-*`, byteranges, AES-128 keys, master playlists) and DASH (SegmentTemplate, SegmentTimeline, SegmentList); separate audio+video tracks are muxed into one file |
+| Integrity | Optional `--checksum sha256:<hex>` (also `sha512`, `sha1`, `md5`, or a bare digest) checked against the working file **before** it is renamed into place: a mismatch fails the job, removes the working file, and never touches the output |
+| Media | HLS (`EXT-X-*`, byteranges, AES-128 keys, master playlists) and DASH (SegmentTemplate, SegmentTimeline, SegmentList); separate audio+video tracks are muxed into one file; an MPEG-TS stream `ffmpeg` cannot remux is kept as `.ts` rather than turned into a broken `.mp4` |
 | FTP | Passive mode, `SIZE`, `REST`-based resume, anonymous defaults |
 | Grabber | BFS crawl with depth/page limits, include/exclude wildcards, media/archive classification, tracker filtering |
 | Archiving | `grab --archive` (or a `site` project with `--archive`) keeps a page and everything it needs to render — stylesheets, scripts, images, fonts — rewriting the markup to local relative paths; every URL gets a path decided by the URL alone, and anything it could not hold keeps pointing at the live site |
@@ -69,7 +70,7 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 272 tests: unit + protocol + end-to-end
+cargo test         # 292 tests: unit + protocol + end-to-end
 ```
 
 ## Use
@@ -113,6 +114,11 @@ riptide queue --quota 500M --quota-window 1h
 # ...or make it the standing policy.
 riptide config set quota_bytes 500M
 riptide config set quota_window_secs 3600
+
+# Only publish the file if its bytes are the ones you expect.
+riptide download https://example.com/ubuntu.iso --checksum sha256:9f86d081884c7d65...
+# A bare digest works too, and its length says which algorithm it is.
+riptide download https://example.com/ubuntu.iso --checksum 9f86d081884c7d65...
 
 # Keep a file in step with one URL, hourly, and fetch the first copy now.
 riptide project add feed --url https://example.com/feed.json --every 1h --start-now
@@ -266,6 +272,7 @@ src/
   segment.rs     segment planning and runtime splitting (IDM's ChLst analogue)
   engine.rs      the transfer engine: probe, ranged workers, retry, re-split, single-stream fallback
   storage.rs     preallocated sparse sink with positional writes + atomic finalize
+  checksum.rs    md5/sha1/sha256/sha512 digests, verified before the final rename
   state.rs       crash-safe job store (temp file + fsync + rename per job)
   throttle.rs    global / per-file token-bucket rate limiting
   quota.rs       bytes-per-window budget ("Download limits"), persisted across restarts
@@ -296,7 +303,7 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 | Never lose media again, and say so honestly when it cannot | The video panel is the reason people stay; protected streams and YouTube changes are the top failures | HLS/DASH capture and muxing; no DRM circumvention and no per-site signature layer, by design |
 | Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
 | BitTorrent and magnet links | The single most-cited reason to keep a second app installed | Deliberately absent — a second engine, not a mode of this one |
-| Checksum verification | Listed as a headline feature by neighbouring projects | **Gap, and the cheapest one** |
+| Checksum verification | Listed as a headline feature by neighbouring projects | `--checksum sha256:…`, verified before the rename |
 | Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick`; **no daemon auth yet** |
 | No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
 | Offline copies of sites | IDM advertises it; the strings are in the binary | `grab --archive`, `site --archive` |
@@ -306,15 +313,26 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 [`docs/ROADMAP.md`](docs/ROADMAP.md) re-checks the four limitations this project has carried
 and ranks what to build next. The ranking, in short:
 
-1. **Checksum verification** (`--checksum sha256:…`) — the cheapest real gap; slots into the
-   existing temp-then-`rename` path so a mismatch never becomes the output.
-2. **Daemon authentication** — a bearer token, which is the blocker on binding the daemon
+**Done since that list was written:**
+
+1. **Checksum verification** (`--checksum sha256:…`, also `sha512`/`sha1`/`md5`) — checks the
+   working file before the rename, so a mismatch never becomes the output and never replaces a
+   good file. Works for `download`, `grab --download`, a `file` project, and the daemon's
+   `POST /api/jobs`.
+2. **MPEG-TS remux hardening** (was item 6) — a failing `ffmpeg` now falls back to keeping the
+   raw `.ts`, where before only a *missing* `ffmpeg` did.
+
+**Still to build, in the order the roadmap ranks them:**
+
+1. **Daemon authentication** — a bearer token, which is the blocker on binding the daemon
    anywhere but loopback.
-3. **Linux + macOS + Windows support for real** — the loudest ask in the ecosystem; today only
+2. **Linux + macOS + Windows support for real** — the loudest ask in the ecosystem; today only
    `x86_64-unknown-linux-gnu` is built and there is no CI.
-4. **Headless packaging** — static binaries and a container image for NAS use.
-5. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
+3. **Headless packaging** — static binaries and a container image for NAS use.
+4. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
    the queue and state but deliberately **not** a mode of the HTTP engine.
+5. **Finishing the MPEG-TS remux verification** — a host with a working `ffmpeg` and a real
+   transport-stream fixture, to prove the *successful* remux as well as the fallback.
 
 The same document records what verification changed on 2026-10-19: ffmpeg turned out to be
 installed (but crashes on MPEG-TS input, so the remux path still cannot be verified), and the
@@ -377,13 +395,28 @@ against this implementation (§12 there). The short version:
 
 **Media**
 
-- **MPEG-TS remux needs `ffmpeg` on `PATH`.** Without it the `.ts` segments are kept and a
-  warning is printed, rather than emitting a broken `.mp4`. Set `RIPTIDE_FFMPEG` to a specific
-  binary to override the lookup. This path has never been executed here.
+- **MPEG-TS remux needs `ffmpeg` on `PATH`.** When `ffmpeg` is missing **or fails**, the raw
+  `.ts` is kept and a warning is printed, rather than emitting a broken `.mp4` or losing the
+  download. Set `RIPTIDE_FFMPEG` to a specific binary to override the lookup. The remux to a
+  *valid* `.mp4` has never been executed here — this host's `ffmpeg` segfaults on every
+  MPEG-TS input — so what is tested is that no input can make the capture *fail*.
 - **Live HLS playlists are not re-polled** — a capture covers the manifest as it stood when it
   was read.
 - **No live-stream sniffing.** A player that fetches its manifest from JavaScript will not be
   detected; paste the manifest URL, or let the extension's page scan find it.
+
+**Integrity**
+
+- **One checksum describes one file.** `--checksum` applies to a single download: it is refused
+  for multiple URLs, for a `site` project, and for `--archive`, rather than silently checking
+  the first file and ignoring the rest.
+- **Media output is checked after it is assembled**, not before a rename — HLS/DASH write their
+  output directly instead of renaming a working file — so a mismatch removes the file just
+  built instead of preventing it from appearing.
+- **A checksum is an extra gate, not a substitute for HTTPS.** It proves the bytes match an
+  expectation you already have from somewhere else; it does not tell you where to get that
+  expectation. Riptide never fetches a `.sha256` sidecar or trusts a digest served over the
+  same connection.
 
 **Limits**
 
@@ -451,15 +484,16 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 272 tests
+cargo test                              # Rust: 292 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 13 tests
 ```
 
-272 Rust tests: 220 unit tests across every module, 10 daemon-protocol tests driving a real
+292 Rust tests: 234 unit tests across every module, 10 daemon-protocol tests driving a real
 WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
-which really does byte ranges, 6 that stand up a mock `Negotiate` server, 17 that stand up a
-server which really honours `If-None-Match` and `Range`, and 10 that archive a small site and
-then read their own output back to check that every rewritten reference resolves.
+which really does byte ranges, 6 that stand up a mock `Negotiate` server, 6 that verify
+checksums end-to-end against a real HTTP server, 17 that stand up a server which really
+honours `If-None-Match` and `Range`, and 10 that archive a small site and then read their own
+output back to check that every rewritten reference resolves.
 
 The end-to-end ones assert that
 
@@ -473,6 +507,9 @@ The end-to-end ones assert that
 - a **download quota** stops a job mid-transfer as `paused` (not `failed`), keeps the partial
   file, and a later run finishes it byte-identically; and that a **restarted** process does not
   hand back a fresh budget;
+- a **checksum** that matches publishes the file byte-identically on both the segmented and the
+  single-stream path, and a checksum that does not match fails the job, removes the working
+  file, publishes nothing, and leaves an **existing good file untouched**;
 - the grabber follows exactly one level per `depth` and filters trackers;
 - a **`Negotiate` job completes a real SPNEGO handshake** against a mock server that unwraps the
   token, issues an NTLMSSP challenge inside a `NegTokenResp`, and verifies the client's NTProofStr
@@ -516,6 +553,12 @@ octet layout in RFC 4178 Appendix D (independently re-parsed with `openssl asn1p
 schedule arithmetic and the name-to-file-name boundary, and — because
 the browser extension is a second implementation of the same framing — the **exact
 `encodeURIComponent` output** a browser produces, decoded back verbatim by the daemon.
+
+Two more are worth naming because they are about *refusing* rather than computing: the
+**checksum parser** (all four algorithms against published vectors, the bare-digest length
+inference, and every malformed spec), and the **media fallback** — an MPEG-TS remux is driven
+with an `ffmpeg` that is absent, one that exits non-zero, and whatever `ffmpeg` the host
+actually has, and in every case publishing must succeed and the raw track must survive.
 
 The extension's own framing is tested from Node (`extension/tests/protocol.test.mjs`),
 including the shipped IDM sample frame `MSG#0#17#1#0:9:` and a real `HELLO_ACK` captured from

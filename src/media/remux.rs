@@ -2,9 +2,9 @@
 //!
 //! Fragmented MP4 (`fMP4`) segments concatenate directly into a valid MP4 — the
 //! initialisation segment carries the headers and each media segment carries fragments.
-//! MPEG-TS does not: it needs a real remux, so an external `ffmpeg` is used when present,
-//! and when it is absent Riptide keeps the `.ts` rather than silently producing a broken
-//! `.mp4`.
+//! MPEG-TS does not: it needs a real remux, so an external `ffmpeg` is used when present.
+//! When `ffmpeg` is **absent, or present and failing**, Riptide keeps the raw `.ts` rather
+//! than silently producing a broken `.mp4` or losing the download.
 //!
 //! This matters because IDM's own changelog is full of "some MP4 could not be assembled,
 //! resulting in separate audio and video tracks" and "TS videos stopped at 99%". Riptide
@@ -75,22 +75,39 @@ fn without_remux(out: &Path, container: &str) -> PathBuf {
     }
 }
 
+/// Keep the raw track when a remux cannot be done.
+///
+/// Used for both failure modes — `ffmpeg` missing and `ffmpeg` present but failing — because
+/// from the user's side they are the same event: the container conversion did not happen.
+/// The bytes handed back are the track that was meant to be converted, copied verbatim, so
+/// the result is always playable even if it is not the container that was asked for. Any
+/// partial `out` a failing `ffmpeg` left behind is removed first, so a truncated file cannot
+/// be mistaken for a finished one.
+fn keep_raw(track: &Path, out: &Path, container: &str, why: &str) -> Result<u64> {
+    let fallback = without_remux(out, container);
+    if fallback != out {
+        let _ = std::fs::remove_file(out);
+    }
+    tracing::warn!(
+        track = %track.display(),
+        keeping = %fallback.display(),
+        reason = why,
+        "not remuxing; keeping the raw track instead of producing a broken container"
+    );
+    copy_file(track, &fallback)
+}
+
 /// Publish a single track (video only, or audio only) as the final file.
 pub fn publish_single(track: &Path, out: &Path, container: &str) -> Result<u64> {
     match container {
         // Fragmented MP4 already is an MP4.
         "mp4" => copy_file(track, out),
         "ts" => match find_ffmpeg() {
-            Some(ffmpeg) => remux_ts(&ffmpeg, track, out),
-            None => {
-                let fallback = without_remux(out, container);
-                tracing::warn!(
-                    path = %fallback.display(),
-                    "ffmpeg not found; keeping MPEG-TS instead of remuxing to MP4 \
-                     (set RIPTIDE_FFMPEG or install ffmpeg)"
-                );
-                copy_file(track, &fallback)
-            }
+            Some(ffmpeg) => match remux_ts(&ffmpeg, track, out) {
+                Ok(n) => Ok(n),
+                Err(e) => keep_raw(track, out, container, &e.to_string()),
+            },
+            None => keep_raw(track, out, container, "ffmpeg not found"),
         },
         _ => copy_file(track, out),
     }
@@ -99,15 +116,12 @@ pub fn publish_single(track: &Path, out: &Path, container: &str) -> Result<u64> 
 /// Mux a separate video track and audio track into one file.
 pub fn mux(video: &Path, audio: &Path, out: &Path, container: &str) -> Result<u64> {
     let Some(ffmpeg) = find_ffmpeg() else {
-        let fallback = without_remux(out, container);
-        tracing::warn!(
-            video = %video.display(),
-            audio = %audio.display(),
-            "ffmpeg not found; cannot merge separate video and audio tracks. \
-             Writing the video track only — install ffmpeg or set RIPTIDE_FFMPEG \
-             to get a single merged file"
+        return keep_raw(
+            video,
+            out,
+            container,
+            "ffmpeg not found; cannot merge separate video and audio tracks",
         );
-        return copy_file(video, &fallback);
     };
 
     if let Some(parent) = out.parent() {
@@ -153,9 +167,12 @@ pub fn mux(video: &Path, audio: &Path, out: &Path, container: &str) -> Result<u6
             .status()
             .map_err(|e| RiptideError::other(format!("failed to run ffmpeg: {e}")))?;
         if !status.success() || !out.exists() {
-            return Err(RiptideError::other(
+            return keep_raw(
+                video,
+                out,
+                container,
                 "ffmpeg could not merge the video and audio tracks",
-            ));
+            );
         }
     }
 
@@ -234,6 +251,54 @@ pub fn sniff_container(path: &Path) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// `std::env` is process-wide, and `cargo test` runs tests on threads. Every test that
+    /// touches `RIPTIDE_FFMPEG` or `PATH` holds this lock, or it races the others.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A test that panicked while holding the lock must not wedge the rest of the suite.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sets an environment variable and restores it when dropped, panics included.
+    struct EnvVar(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvVar {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            EnvVar(key, prev)
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            EnvVar(key, prev)
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => std::env::set_var(self.0, v),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+
+    /// An executable `ffmpeg` that always exits non-zero, standing in for the build on a
+    /// host whose ffmpeg cannot handle the input (which is exactly what this machine has).
+    #[cfg(unix)]
+    fn failing_ffmpeg(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("ffmpeg-broken");
+        std::fs::write(&p, b"#!/bin/sh\nexit 1\n").unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p
+    }
+
     #[test]
     fn concat_is_byte_exact_and_ordered() {
         let dir = tempfile::tempdir().unwrap();
@@ -283,36 +348,94 @@ mod tests {
 
     #[test]
     fn ts_without_ffmpeg_falls_back_to_a_ts_extension() {
+        let _g = env_guard();
         // Point RIPTIDE_FFMPEG at a nonexistent file and clear PATH so lookup fails.
         let dir = tempfile::tempdir().unwrap();
         let track = dir.path().join("track.bin");
         std::fs::write(&track, b"\x47segment").unwrap();
         let out = dir.path().join("movie.mp4");
 
-        let prev_ffmpeg = std::env::var_os("RIPTIDE_FFMPEG");
-        let prev_path = std::env::var_os("PATH");
-        std::env::set_var("RIPTIDE_FFMPEG", dir.path().join("nope-ffmpeg"));
-        std::env::set_var("PATH", "");
+        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", dir.path().join("nope-ffmpeg"));
+        let _path = EnvVar::set("PATH", "");
 
         let result = publish_single(&track, &out, "ts");
 
-        match prev_ffmpeg {
-            Some(v) => std::env::set_var("RIPTIDE_FFMPEG", v),
-            None => std::env::remove_var("RIPTIDE_FFMPEG"),
-        }
-        match prev_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
+        // ffmpeg is absent by construction, so the raw track is kept under the `.ts` name.
+        let n = result.unwrap();
+        assert_eq!(n, 8);
+        assert!(!out.exists());
+        assert_eq!(
+            std::fs::read(out.with_extension("ts")).unwrap(),
+            b"\x47segment"
+        );
+    }
 
-        // Either a real ffmpeg existed (unlikely with PATH emptied) or we fell back.
-        if let Ok(n) = result {
-            let ts = out.with_extension("ts");
-            assert!(
-                ts.exists() || out.exists(),
-                "some output must exist (n={n})"
-            );
-        }
+    #[cfg(unix)]
+    #[test]
+    fn a_present_but_failing_ffmpeg_still_keeps_the_raw_ts() {
+        let _g = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let track = dir.path().join("track.bin");
+        std::fs::write(&track, b"\x47first-chunk-of-ts").unwrap();
+        let out = dir.path().join("movie.mp4");
+
+        // A real, executable `ffmpeg` that always fails — the broken-build case that a
+        // missing binary does not cover.
+        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", failing_ffmpeg(dir.path()));
+        // Leave a stale partial output to prove it is cleaned up, not published.
+        std::fs::write(&out, b"truncated garbage from a crashed remux").unwrap();
+
+        let n = publish_single(&track, &out, "ts").unwrap();
+
+        assert_eq!(n, 18, "the raw track's byte count");
+        assert!(
+            !out.exists(),
+            "the incomplete `.mp4` a failing ffmpeg left behind must be removed"
+        );
+        let ts = out.with_extension("ts");
+        assert_eq!(std::fs::read(&ts).unwrap(), b"\x47first-chunk-of-ts");
+        assert!(track.exists(), "the raw track is never consumed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_ffmpeg_still_salvages_the_video_track_from_a_mux() {
+        let _g = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("v.bin");
+        let audio = dir.path().join("a.bin");
+        std::fs::write(&video, b"\x47video-track").unwrap();
+        std::fs::write(&audio, b"\x47audio-track").unwrap();
+        let out = dir.path().join("movie.mp4");
+
+        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", failing_ffmpeg(dir.path()));
+        let n = mux(&video, &audio, &out, "ts").unwrap();
+
+        // Same outcome as an absent ffmpeg: the video track is kept rather than an error.
+        assert_eq!(n, 12);
+        assert!(!out.exists());
+        assert_eq!(
+            std::fs::read(out.with_extension("ts")).unwrap(),
+            b"\x47video-track"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_ffmpeg_loses_nothing_when_the_container_is_not_ts() {
+        let _g = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let video = dir.path().join("v.bin");
+        let audio = dir.path().join("a.bin");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::write(&audio, b"audio").unwrap();
+        let out = dir.path().join("movie.mp4");
+
+        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", failing_ffmpeg(dir.path()));
+        // `mp4` has no separate fallback name: the track is written to `out` itself.
+        let n = mux(&video, &audio, &out, "mp4").unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(std::fs::read(&out).unwrap(), b"video");
     }
 
     #[test]
@@ -332,17 +455,39 @@ mod tests {
     }
 
     #[test]
+    fn a_real_ffmpeg_can_never_lose_an_mpeg_ts_track() {
+        let _g = env_guard();
+        // Deliberately no `RIPTIDE_FFMPEG` override: whatever ffmpeg this host has is used,
+        // which is the point — the test is about the host, not about a fixture.
+        let _ffmpeg = EnvVar::unset("RIPTIDE_FFMPEG");
+
+        let dir = tempfile::tempdir().unwrap();
+        let track = dir.path().join("track.ts");
+        // Not a valid transport stream, so a *working* ffmpeg will refuse it. Together with
+        // the cases above that covers every ffmpeg a host can have: absent, broken, or
+        // working but handed bytes it cannot convert.
+        std::fs::write(&track, b"\x47not-really-a-transport-stream").unwrap();
+        let out = dir.path().join("movie.mp4");
+
+        let n = publish_single(&track, &out, "ts").expect("publishing must not fail");
+
+        assert!(n > 0, "something must be written");
+        let ts = out.with_extension("ts");
+        assert!(
+            out.exists() || ts.exists(),
+            "a usable file must exist, whether the remux worked or the raw track was kept"
+        );
+        assert!(track.exists(), "the raw track is never consumed");
+    }
+
+    #[test]
     fn ffmpeg_discovery_respects_the_env_override() {
+        let _g = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("ffmpeg");
         std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
 
-        let prev = std::env::var_os("RIPTIDE_FFMPEG");
-        std::env::set_var("RIPTIDE_FFMPEG", &fake);
+        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", &fake);
         assert_eq!(find_ffmpeg().as_deref(), Some(fake.as_path()));
-        match prev {
-            Some(v) => std::env::set_var("RIPTIDE_FFMPEG", v),
-            None => std::env::remove_var("RIPTIDE_FFMPEG"),
-        }
     }
 }

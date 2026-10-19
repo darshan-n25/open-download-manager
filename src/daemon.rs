@@ -238,6 +238,9 @@ pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
     // Accepts both a raw byte count and the `2M` shorthand the CLI uses.
     job.speed_limit = m.get("speed_limit").and_then(crate::util::parse_size);
     job.quality = m.get("quality").map(|s| s.to_string());
+    if let Some(spec) = m.get("checksum") {
+        job.checksum = Some(crate::checksum::Checksum::parse(spec)?);
+    }
     job.min_chunk = cfg.min_chunk;
     job.max_retries = cfg.max_retries;
 
@@ -706,6 +709,7 @@ fn message_from_json(url: &str, v: &serde_json::Value) -> Message {
         ("proxy", "proxy"),
         ("auth", "auth"),
         ("speed_limit", "speed_limit"),
+        ("checksum", "checksum"),
     ] {
         if let Some(v) = v.get(json_key) {
             let s = match v {
@@ -882,6 +886,21 @@ pub async fn serve(cfg: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_checksum_survives_the_json_api_and_a_bad_one_is_refused() {
+        let cfg = crate::config::Config::default();
+        let good =
+            crate::checksum::Checksum::of_bytes(crate::checksum::Algorithm::Sha256, b"payload");
+        let v = serde_json::json!({ "url": "https://h/a.bin", "checksum": good.spec() });
+        let m = message_from_json(v["url"].as_str().unwrap(), &v);
+        let job = job_from_message(&cfg, &m).unwrap();
+        assert_eq!(job.checksum.as_ref(), Some(&good));
+
+        let bad = serde_json::json!({ "url": "https://h/a.bin", "checksum": "not-a-digest" });
+        let m = message_from_json(bad["url"].as_str().unwrap(), &bad);
+        assert!(job_from_message(&cfg, &m).is_err());
+    }
 
     #[test]
     fn frames_round_trip() {

@@ -57,6 +57,25 @@ pub fn part_dir_for(out: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The file [`remux::publish_single`]/[`remux::mux`] actually wrote for `out`.
+///
+/// Normally that is `out` itself. When an MPEG-TS track could not be remuxed, the remux layer
+/// keeps the raw `.ts` beside the requested name instead of producing a broken `.mp4` (see
+/// `remux::publish_single`), so the published file is the `.ts` sibling. Checksumming has to
+/// look at the bytes that were really produced, not at the name that was asked for.
+fn published_path(out: &Path, container: &str) -> PathBuf {
+    if out.exists() {
+        return out.to_path_buf();
+    }
+    if container == "ts" {
+        let ts = out.with_extension("ts");
+        if ts.exists() {
+            return ts;
+        }
+    }
+    out.to_path_buf()
+}
+
 /// Fetch every segment of `spec` (and its audio track) and produce `out`.
 pub async fn fetch_and_mux(engine: &Engine, spec: &MediaSpec, out: &Path) -> Result<u64> {
     let dir = part_dir_for(out);
@@ -97,6 +116,12 @@ pub async fn fetch_and_mux(engine: &Engine, spec: &MediaSpec, out: &Path) -> Res
     // Per-segment files have served their purpose; resuming is handled by the manifest
     // plan, so clear them out.
     let _ = tokio::fs::remove_dir_all(&dir).await;
+
+    // Media is assembled at its final path rather than renamed onto it, so the checksum is
+    // checked here instead of at a rename, and a mismatch removes the file just assembled.
+    engine
+        .verify_checksum(&published_path(out, &spec.container))
+        .await?;
 
     if let Some(cb) = progress {
         cb(crate::engine::ProgressSample {

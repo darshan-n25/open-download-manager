@@ -162,6 +162,13 @@ pub struct DownloadArgs {
     #[arg(short = 'q', long)]
     pub quality: Option<String>,
 
+    /// Expected checksum of the finished file, `sha256:<hex>` (or a bare hex digest).
+    ///
+    /// The download is published only if the bytes match: the check runs on the working
+    /// file before it is renamed into place, and a mismatch fails the job and removes it.
+    #[arg(long, value_name = "ALG:HEX")]
+    pub checksum: Option<String>,
+
     /// Force the transfer kind instead of guessing from the URL.
     #[arg(long, value_enum)]
     pub kind: Option<KindArg>,
@@ -229,6 +236,11 @@ pub struct GrabArgs {
     /// Directory for `--download`, or the archive root for `--archive`.
     #[arg(short = 'o', long)]
     pub output_dir: Option<PathBuf>,
+
+    /// Expected checksum for each downloaded link, `sha256:<hex>`. Only meaningful with
+    /// `--download` on a single link.
+    #[arg(long, value_name = "ALG:HEX")]
+    pub checksum: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -409,6 +421,11 @@ pub struct ProjectAddArgs {
     #[arg(short = 'q', long, value_name = "QUALITY")]
     pub quality: Option<String>,
 
+    /// Expected checksum of the file, `sha256:<hex>` (or a bare hex digest). `file` projects
+    /// only. Checked before each run publishes the file.
+    #[arg(long, value_name = "ALG:HEX")]
+    pub checksum: Option<String>,
+
     // ---------------------------------------------------------------- site only
     /// Link hops to follow from the start page.
     #[arg(short = 'd', long, default_value_t = 1)]
@@ -552,6 +569,9 @@ fn build_job(
     job.max_retries = args.net.retries.unwrap_or(cfg.max_retries);
     job.speed_limit = args.net.limit.as_deref().and_then(util::parse_size);
     job.quality = args.quality.clone();
+    if let Some(spec) = &args.checksum {
+        job.checksum = Some(crate::checksum::Checksum::parse(spec)?);
+    }
     // The configured segment floor and split threshold are what make "smallest useful
     // segment" a real setting rather than a description of `Job::new`'s defaults.
     job.min_chunk = cfg.min_chunk;
@@ -610,6 +630,13 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
     if urls.is_empty() {
         return Err(RiptideError::other(
             "nothing to download: pass a URL or --input-file",
+        ));
+    }
+
+    if args.checksum.is_some() && urls.len() > 1 {
+        return Err(RiptideError::other(
+            "--checksum applies to a single download; one digest cannot describe several \
+             files",
         ));
     }
 
@@ -765,6 +792,13 @@ fn archive_root_name(url: &str) -> String {
 async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
     let mut cfg = Config::load();
 
+    if args.checksum.is_some() && args.archive {
+        return Err(RiptideError::other(
+            "--checksum does not apply to --archive: an archive is many files, and one \
+             digest cannot describe them",
+        ));
+    }
+
     let gcfg = GrabberConfig {
         depth: args.depth,
         max_pages: args.max_pages.unwrap_or(grabber::DEFAULT_MAX_PAGES),
@@ -869,6 +903,21 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
         return Ok(());
     }
 
+    if args.checksum.is_some() {
+        if !args.download {
+            return Err(RiptideError::other(
+                "--checksum has no effect without --download",
+            ));
+        }
+        if targets.len() != 1 {
+            return Err(RiptideError::other(format!(
+                "--checksum needs a single download, but the crawl found {} links; run \
+                 `riptide download --checksum … <url>` on the one you want",
+                targets.len()
+            )));
+        }
+    }
+
     for t in &targets {
         println!("{}\t{}", t.kind.as_str(), t.url);
     }
@@ -900,6 +949,7 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
             output: None,
             input_file: None,
             quality: None,
+            checksum: args.checksum.clone(),
             kind: None,
             scheduled: None,
             jobs: None,
@@ -1378,6 +1428,15 @@ async fn cmd_project_add(
     p.ctx = build_ctx(&a.net, cfg)?;
     p.connections = a.net.connections.unwrap_or(cfg.connections);
     p.quality = a.quality.clone();
+    if let Some(spec) = &a.checksum {
+        if kind != ProjectKind::File {
+            return Err(RiptideError::other(
+                "--checksum applies to `--kind file`; a `site` project downloads many files, \
+                 and one digest cannot describe them",
+            ));
+        }
+        p.checksum = Some(crate::checksum::Checksum::parse(spec)?);
+    }
 
     if kind == ProjectKind::Site {
         p.grab = GrabberConfig {
@@ -1521,6 +1580,9 @@ fn cmd_project_show(store: &ProjectStore, name: &str) -> Result<()> {
     }
     if let Some(n) = p.last_bytes {
         println!("  bytes      {}", util::human_bytes(n));
+    }
+    if let Some(ck) = &p.checksum {
+        println!("  checksum   {}", ck.spec());
     }
     if p.kind == ProjectKind::Site {
         println!("  crawl      depth {}", p.grab.depth);
@@ -1755,6 +1817,7 @@ mod tests {
             output: None,
             input_file: None,
             quality: Some("720".into()),
+            checksum: None,
             kind: None,
             scheduled: None,
             jobs: None,
@@ -1779,6 +1842,7 @@ mod tests {
             output: None,
             input_file: None,
             quality: None,
+            checksum: None,
             kind: None,
             scheduled: None,
             jobs: None,
@@ -1799,6 +1863,7 @@ mod tests {
             output: None,
             input_file: None,
             quality: None,
+            checksum: None,
             kind: None,
             scheduled: None,
             jobs: None,
@@ -1823,6 +1888,7 @@ mod tests {
             output: Some(PathBuf::from("/tmp/out")),
             input_file: None,
             quality: None,
+            checksum: None,
             kind: None,
             scheduled: None,
             jobs: None,

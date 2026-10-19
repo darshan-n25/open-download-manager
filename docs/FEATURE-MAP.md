@@ -52,7 +52,8 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | Truncated responses must not produce a corrupt file | **Done** | `Segment` state + final `all_done()` gate | The same test asserts the job fails and nothing is published as the final name. |
 | Writing directly at final offsets instead of assembling at the end | **Done — and different** | `src/storage.rs` `Sink::write_at` | IDM merges parts at the end, which is its single most-complained-about behaviour. Riptide preallocates a sparse file, writes each chunk at its final offset, then `rename`s. Completion is O(1). |
 | `"Change chunk size to %ld"` applied to the persisted plan | **Done** | `job.segments` | The live segment table is snapshotted into the job record on every run, so a resume continues the *current* split rather than replanning. |
-| File-integrity/error detection on resume | **Done** | validator (`ETag`/`Last-Modified`) + `Content-Range` cross-check | No hashes: IDM does not publish a per-file checksum, and inventing one would need a side-channel. |
+| File-integrity/error detection on resume | **Done** | validator (`ETag`/`Last-Modified`) + `Content-Range` cross-check | No hashes: IDM does not publish a per-file checksum, and inventing one would need a side-channel. A user-supplied checksum is a separate feature, below. |
+| A checksum published next to a download | **Done** | `src/checksum.rs`, `Engine::verify_checksum`, `--checksum` | `md5`, `sha1`, `sha256`, `sha512`; `sha256:<hex>` (or `=`, or `sha-256`), or a bare digest whose length identifies the algorithm. Checked against the working file **before** the rename, so a mismatch fails the job, deletes the working file, and leaves an existing output untouched. Available on `download`, `grab --download`, a `file` project (and `project show` prints it), and the daemon's `POST /api/jobs`. Refused — with a reason — for several URLs, `grab --archive`, and `site` projects, because one digest cannot describe many files. |
 
 ## 3. Authentication and credentials
 
@@ -100,8 +101,8 @@ Where a row says "tested", the test is in this repository and `cargo test` runs 
 | `-tmp_dashinit`, `init_segment` temporary file handling `[OBSERVED]` | **Done** | the init segment is written first, in order, into the output | |
 | `#ANVATO-SEGMENT-INFO:` Anvato support `[OBSERVED]` | **Absent** | — | An Anvato-specific sidecar convention. Not parsed. |
 | `idmvconv.dll` conversion, `IDMVMPrs*.dll` parser plugins `[OBSERVED]` | **Partial** | `src/media/remux.rs` | Riptide concatenates fMP4 segments directly, and shells out to `ffmpeg` only when it must. **It does not convert codecs or containers beyond MPEG-TS → MP4.** |
-| Remux MPEG-TS to MP4 | **Partial** | `src/media/remux.rs` | Needs `ffmpeg` on `PATH` (override with `RIPTIDE_FFMPEG`). Without it, the `.ts` is kept and a warning is printed rather than emitting a broken `.mp4`. **This path was never executed in development** — `ffmpeg` was not installed. |
-| Muxing a separate video track with a separate audio track | **Partial** | `media::mux` | Same `ffmpeg` dependency; without it, the video track is written alone with a warning. |
+| Remux MPEG-TS to MP4 | **Partial** | `src/media/remux.rs` | Needs `ffmpeg` on `PATH` (override with `RIPTIDE_FFMPEG`). When it is **missing or fails**, the `.ts` is kept and a warning names the reason, rather than emitting a broken `.mp4` or failing the job; any partial `out` a failing `ffmpeg` left is removed. **A successful remux has never run here**: this host's `ffmpeg` 7.0.2-static segfaults on every MPEG-TS input, which is exactly why the failure path was hardened. |
+| Muxing a separate video track with a separate audio track | **Partial** | `media::mux` | Same `ffmpeg` dependency and the same fallback: without a working `ffmpeg`, the video track is written alone with a warning rather than the job failing. |
 | Live/`EVENT` playlists that keep growing | **Partial** | parsing stops at `#EXT-X-ENDLIST` and does not poll | A live stream is captured as far as the manifest describes at the moment of resolution. No re-polling for new segments. |
 
 ## 7. FTP
@@ -236,13 +237,15 @@ gaps; the third is answered by construction.
 
 ## 13. What "tested" means here
 
-`cargo test` runs 272 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
+`cargo test` runs 292 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13
 more against the extension's framing. The distinction that matters in this document:
 
 - **Unit tests** prove an algorithm in isolation (parsers, KDFs, the segment table, the
-  semaphores, the JS framing, project schedule arithmetic).
+  semaphores, the JS framing, project schedule arithmetic, checksum digests against published
+  vectors).
 - **Protocol tests** (`tests/daemon.rs`) drive the daemon over a real WebSocket and its JSON API.
-- **End-to-end tests** (`tests/segmented.rs`, `tests/projects.rs`, `tests/archive.rs`) stand up
+- **End-to-end tests** (`tests/segmented.rs`, `tests/projects.rs`, `tests/archive.rs`,
+  `tests/checksum.rs`) stand up
   real HTTP servers that really do byte ranges and conditional requests, and check the bytes on
   disk; `tests/negotiate.rs` stands up a mock RFC 4559 server that issues an NTLMSSP challenge
   inside SPNEGO and re-derives the client's NTProofStr. The archive suite additionally reads its
@@ -257,12 +260,19 @@ more against the extension's framing. The distinction that matters in this docum
   `site` project fetched its targets and then skipped both on the next run, and the daemon's own
   ticker ran the project unprompted once its interval elapsed. Archiving was checked the same
   way against the same separately written conditional-`GET` server, and the resulting mirror was
-  opened from disk with the server stopped.
+  opened from disk with the server stopped. Checksum verification was checked the same way, and
+  notably *had* to be: the first daemon run against the release binary published a mismatched
+  file because the binary predated the change — a live check catching exactly the class of
+  mistake it exists for. After rebuilding, a correct digest published byte-identically, a wrong
+  one published nothing and left the job `failed` with the mismatch recorded, a malformed spec
+  was a `400`, and the refused combinations all exited non-zero with an explanation.
 
 Nothing in this repository has been run against: a real Kerberos realm, an NTLM-protected
-Windows host, a PAC file, an FTPS server, `ffmpeg` (a build is present on this host now, but it
-segfaults on every MPEG-TS input, so the remux path is *still* unverified — the reason changed,
-not the verdict; see [`ROADMAP.md`](ROADMAP.md)), an MMS source, a live HLS/DASH origin, a
+Windows host, a PAC file, an FTPS server, a *successful* `ffmpeg` MPEG-TS remux (a build is
+present on this host now, but it segfaults on every MPEG-TS input, so the remux path is *still*
+unverified — the reason changed, not the verdict; the failure and fallback paths, by contrast,
+are now tested against an absent, a broken, and the host's own `ffmpeg`; see
+[`ROADMAP.md`](ROADMAP.md)), an MMS source, a live HLS/DASH origin, a
 scheduler other than a self-written `cron`-shaped one, or a real web server other than the ones
 written for these tests. Those rows are labelled **Unverified**, **Partial**, **Absent** or
 **Refused** above and should be treated that way. The mock `Negotiate` server in

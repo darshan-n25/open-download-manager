@@ -9,6 +9,9 @@ Two things live here:
    trusted or re-run rather than taken on faith.
 2. **A ranked roadmap** for what to build next, including the requests the
    [community survey](COMMUNITY-REQUESTS.md) surfaced.
+3. **What has shipped from it.** Items 1 (checksum verification) and 6 (MPEG-TS remux
+   hardening) were both built on 2026-10-19; their entries in the roadmap table carry a status
+   and a shared section describes what actually landed and how it is tested.
 
 Every claim here is tagged the same way the reverse-engineering report tags its own:
 `OBSERVED` (a command was run, here is its output), `INFERRED`, or `UNKNOWN`.
@@ -78,12 +81,16 @@ Two consequences, both now roadmap items:
   the only ffmpeg present is broken on its input format. `remux_ts()` runs ffmpeg twice (with
   and without `-bsf:a aac_adtstoasc`); both attempts crash, so it returns
   `“ffmpeg could not remux the MPEG-TS stream”`.
-- **A *present but broken* ffmpeg is handled worse than an *absent* one.** `publish_single`
-  (`src/media/remux.rs:83`) only keeps the `.ts` when `find_ffmpeg()` returns `None`. When
-  ffmpeg exists but fails, it propagates an error instead. Nothing is destroyed — the raw
+- **A *present but broken* ffmpeg was handled worse than an *absent* one.** `publish_single`
+  (`src/media/remux.rs:83`) only kept the `.ts` when `find_ffmpeg()` returned `None`. When
+  ffmpeg exists but fails, it propagated an error instead. Nothing was destroyed — the raw
   track is a separate file and is left untouched, which is the important property — but the
-  job reports failure where the documented behaviour is *“a failed mux is recoverable”*. This
-  is a real, found-by-verification gap. See roadmap item 6.
+  job reported failure where the documented behaviour is *“a failed mux is recoverable”*. This
+  was a real, found-by-verification gap. See roadmap item 6.
+
+  > **Fixed 2026-10-19 (roadmap item 6).** Both failure modes now take the same fallback, and
+  > a partial `out` left by a failing `ffmpeg` is removed. See
+  > [Item 6 — what shipped](#item-6--what-shipped).
 
 fMP4 is unaffected: it is a plain byte concatenation (`concat`, `src/media/remux.rs:40`) with
 no external process, and it is covered by unit tests.
@@ -191,15 +198,67 @@ architecture, not by evidence. Roadmap item 3 is what turns it into evidence.
 Ranked by (value × cheapness), not by size. Positions 1–5 are the items asked for; 6–7 are
 what the verification above turned up.
 
-| # | Item | Why | Cost | Notes |
-| --- | --- | --- | --- | --- |
-| 1 | **Checksum verification** (`--checksum sha256:…`) | The cheapest real gap; every neighbouring project lists it and the [survey](COMMUNITY-REQUESTS.md) ranks it second | Small | The temp-then-`rename` path already exists (`storage.rs`), so this is a pre-rename hook: hash the temp file, and on mismatch delete the temp and fail the job. Nothing partially-written ever becomes the output. Support at least `sha256:` and `sha512:`; make it work for `grab`, `project` and the daemon API alike |
-| 2 | **Daemon authentication** | The daemon binds `127.0.0.1:1001` and has **no** token (`src/config.rs:69`), which is the blocker on every NAS / headless / remote-control request in the survey | Small–medium | A bearer token in `Config`, compared in constant time, required on every route once set; a `--token-file`/env source so it is not in the process arguments. With a token the daemon can then safely bind off-loopback |
-| 3 | **Linux + macOS + Windows support, for real** | The single most-repeated ask; today only `x86_64-unknown-linux-gnu` is built and no CI exists (Part 2) | Medium | A CI matrix (`ubuntu`, `macos`, `windows`) running `cargo test` + clippy + fmt; install the other targets; actually exercise the Windows `write_all_at` branch. Static musl builds for Linux come with item 4 |
-| 4 | **Headless packaging** | Static binaries + a container image for drop-in NAS use | Small once 3 exists | Mostly build wiring, no new logic: `x86_64-unknown-linux-musl` release artefacts, a `scratch`/`distroless` image, and the daemon as the entrypoint. The extension is optional in this mode — the HTTP API is the interface |
-| 5 | **BitTorrent as a sibling binary** | The most-requested feature in the whole ecosystem, and IDM lacks it too (verified: no BitTorrent protocol strings in `IDMan.exe`) | Large | A **separate** binary (`riptide-bt`) that shares the queue, state store, quota and scheduler with the HTTP engine — explicitly **not** a mode inside it. Different wire protocol, different peer model, different failure modes; folding it into the HTTP engine would put both at risk |
-| 6 | **MPEG-TS remux hardening** | Found during this verification: a *present but broken* ffmpeg fails the job instead of falling back (§Claim 2) | Small | On any ffmpeg failure in `publish_single`/`mux`, fall back to the same keep-`.ts` copy used when ffmpeg is absent, and say so in the warning. Keep the raw track in every case |
-| 7 | **Verify the TS path against a working ffmpeg** | The path has still never run end to end; the available build crashes on MPEG-TS input | Small | Either a working ffmpeg on the test host, or an `#[ignore]`d test gated on `find_ffmpeg()` plus a real TS fixture, so a host with a good ffmpeg covers it and a host without does not silently skip |
+| # | Item | Status | Why | Cost | Notes |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **Checksum verification** (`--checksum sha256:…`) | ✅ **shipped 2026-10-19** | The cheapest real gap; every neighbouring project lists it and the [survey](COMMUNITY-REQUESTS.md) ranks it second | Small | The temp-then-`rename` path already exists (`storage.rs`), so this is a pre-rename hook: hash the temp file, and on mismatch delete the temp and fail the job. Nothing partially-written ever becomes the output. Support at least `sha256:` and `sha512:`; make it work for `grab`, `project` and the daemon API alike |
+| 2 | **Daemon authentication** | planned | The daemon binds `127.0.0.1:1001` and has **no** token (`src/config.rs:69`), which is the blocker on every NAS / headless / remote-control request in the survey | Small–medium | A bearer token in `Config`, compared in constant time, required on every route once set; a `--token-file`/env source so it is not in the process arguments. With a token the daemon can then safely bind off-loopback |
+| 3 | **Linux + macOS + Windows support, for real** | planned | The single most-repeated ask; today only `x86_64-unknown-linux-gnu` is built and no CI exists (Part 2) | Medium | A CI matrix (`ubuntu`, `macos`, `windows`) running `cargo test` + clippy + fmt; install the other targets; actually exercise the Windows `write_all_at` branch. Static musl builds for Linux come with item 4 |
+| 4 | **Headless packaging** | planned | Static binaries + a container image for drop-in NAS use | Small once 3 exists | Mostly build wiring, no new logic: `x86_64-unknown-linux-musl` release artefacts, a `scratch`/`distroless` image, and the daemon as the entrypoint. The extension is optional in this mode — the HTTP API is the interface |
+| 5 | **BitTorrent as a sibling binary** | planned | The most-requested feature in the whole ecosystem, and IDM lacks it too (verified: no BitTorrent protocol strings in `IDMan.exe`) | Large | A **separate** binary (`riptide-bt`) that shares the queue, state store, quota and scheduler with the HTTP engine — explicitly **not** a mode inside it. Different wire protocol, different peer model, different failure modes; folding it into the HTTP engine would put both at risk |
+| 6 | **MPEG-TS remux hardening** | ✅ **shipped 2026-10-19** | Found during this verification: a *present but broken* ffmpeg fails the job instead of falling back (§Claim 2) | Small | On any ffmpeg failure in `publish_single`/`mux`, fall back to the same keep-`.ts` copy used when ffmpeg is absent, and say so in the warning. Keep the raw track in every case |
+| 7 | **Verify the TS path against a working ffmpeg** | ◐ **partly covered 2026-10-19** | The path has still never run end to end; the available build crashes on MPEG-TS input | Small | Either a working ffmpeg on the test host, or an `#[ignore]`d test gated on `find_ffmpeg()` plus a real TS fixture, so a host with a good ffmpeg covers it and a host without does not silently skip |
+
+### Item 1 — what shipped
+
+`src/checksum.rs` holds `Algorithm` (`md5`, `sha1`, `sha256`, `sha512`) and `Checksum`
+(algorithm + lowercase hex digest). `Checksum::parse` accepts `sha256:<hex>` (with `:` or `=`,
+case-insensitive, `sha-256` too) and a **bare** hex digest, whose length identifies the
+algorithm unambiguously — 32/40/64/128 characters — and which is refused at any other length,
+because guessing an algorithm would make a mismatch mean nothing.
+
+Verification happens in `Engine::verify_checksum`, called *before* every rename:
+
+| Path | Where | On mismatch |
+| --- | --- | --- |
+| HTTP, segmented (`run_segmented`) | `src/engine.rs` — before `sink.finalize` | working `.part` deleted, job fails, output untouched |
+| HTTP, single-stream (`run_single`) | `src/engine.rs` — before `sink.finalize` | same |
+| FTP (`src/ftp.rs`, both the resume-complete and the normal path) | before `sink.finalize` | same |
+| HLS/DASH | `src/media/mod.rs`, on the assembled file | the assembled file is deleted |
+
+The `--checksum` flag is on `download`, `grab --download`, `project add` (`file` kind only, and
+`project show` prints it), and the daemon's `POST /api/jobs` JSON (`message_from_json` maps
+`checksum` through). It is **refused** — with an explanation, not silently ignored — for
+multiple URLs, for `grab --archive`, and for a `site` project: one digest cannot describe many
+files.
+
+Two details worth recording, because they are the reason it is a pre-rename hook and not a
+post-download check:
+
+- The working file, not the output, is hashed. A failed checksum therefore never touches an
+  existing good file — proven by an end-to-end test that plants one and asserts it is verbatim
+  afterwards.
+- The working file is **deleted** on mismatch. Leaving a known-bad `.part` behind would let a
+  later resume finish a corrupt download and call it complete.
+
+Evidence: 9 unit tests in `src/checksum.rs` (published vectors for all four algorithms, the
+length inference, every malformed spec, streaming a >64 KiB file, serde round-trip) plus
+`tests/checksum.rs` — 6 end-to-end tests against a real HTTP server with range support.
+
+### Item 6 — what shipped
+
+`src/media/remux.rs` gained `keep_raw`: one fallback used by **both** failure modes, because
+from the user's side they are the same event. `publish_single` and `mux` now fall back when
+`ffmpeg` is absent **or** fails, and `keep_raw` removes any partial `out` a failing `ffmpeg`
+left behind so a truncated file cannot be mistaken for a finished one. Where the mux previously
+returned an error, it now keeps the video track, exactly as it already did when `ffmpeg` was
+missing.
+
+Evidence: 4 unit tests, one of which uses **whatever `ffmpeg` the host actually has** (via
+`EnvVar::unset("RIPTIDE_FFMPEG")`) and asserts that publishing an MPEG-TS track can never fail
+and the raw track always survives — so absent, broken, and working-but-handed-bad-input are all
+covered, and item 7's "host with a good ffmpeg" case degrades to this same assertion rather
+than silently skipping. The unit tests that mutate `RIPTIDE_FFMPEG`/`PATH` now hold a process
+lock, because `cargo test` runs them on threads.
 
 **Explicitly not planned**, for the same reasons they were dropped from IDM’s design
 ([README](../README.md#how-riptide-differs-from-idm)): kernel filter drivers, redirecting the
@@ -236,4 +295,38 @@ grep -riE "playwright|puppeteer|selenium|chromedriver|geckodriver" \
 # Platform support
 rustup target list --installed
 ls .github/workflows 2>/dev/null || echo "no CI"
+```
+
+## Part 5 — Reproducing items 1 and 6
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Item 1 — the checksum module and its end-to-end guarantee
+cargo test --lib checksum
+cargo test --test checksum
+
+# A real transfer, checked and unchecked, against a plain HTTP server.
+# (python's http.server does not do ranges, so this exercises the single-stream path.)
+mkdir -p /tmp/ck && head -c 300000 /dev/urandom > /tmp/ck/data.bin
+(cd /tmp/ck && python3 -m http.server 18099 &) ; sleep 1
+GOOD=$(sha256sum /tmp/ck/data.bin | cut -d' ' -f1)
+riptide download --checksum "sha256:$GOOD" -o /tmp/ck/ok.bin http://127.0.0.1:18099/data.bin
+cmp /tmp/ck/ok.bin /tmp/ck/data.bin                     # identical
+riptide download --checksum "sha256:$(printf '0%.0s' {1..64})" \
+    -o /tmp/ck/bad.bin http://127.0.0.1:18099/data.bin   # fails, publishes nothing
+ls /tmp/ck/bad.bin /tmp/ck/bad.bin.part                  # neither exists
+
+# Refused combinations, each with an explanation rather than a silent ignore.
+riptide download --checksum "sha256:$GOOD" -o /tmp/ck/ http://127.0.0.1:18099/data.bin \
+    http://127.0.0.1:18099/data.bin
+riptide grab --archive --checksum "sha256:$GOOD" http://127.0.0.1:18099/
+
+# The daemon API takes the same field; an unparsable one is a 400, a mismatch is a failed job.
+riptide daemon --addr 127.0.0.1:18098 &
+curl -s -X POST http://127.0.0.1:18098/api/jobs -H 'content-type: application/json' \
+     -d "{\"url\":\"http://127.0.0.1:18099/data.bin\",\"checksum\":\"nonsense\"}"   # 400
+
+# Item 6 — every kind of ffmpeg, including the broken one on this host
+cargo test --lib media::remux
 ```

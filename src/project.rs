@@ -158,6 +158,10 @@ pub struct Project {
     pub connections: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<String>,
+    /// `File`: expected digest of the output. Checked on every run before the file is
+    /// published, so a sync that pulls corrupt bytes fails instead of replacing a good file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<crate::checksum::Checksum>,
 
     /// `Site`: how to crawl.
     #[serde(default)]
@@ -238,6 +242,7 @@ impl Project {
             ctx: crate::job::RequestContext::default(),
             connections: default_connections(),
             quality: None,
+            checksum: None,
             grab: GrabberConfig::default(),
             download: false,
             archive: false,
@@ -900,6 +905,7 @@ impl ProjectRunner {
         job.min_chunk = self.cfg.min_chunk;
         job.max_retries = self.cfg.max_retries;
         job.quality = project.quality.clone();
+        job.checksum = project.checksum.clone();
         job.output_provisional = false;
         job
     }

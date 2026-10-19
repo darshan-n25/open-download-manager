@@ -916,6 +916,7 @@ impl Engine {
         self.emit_progress();
         sink.sync().await?;
         sink.truncate_to(total)?;
+        self.verify_checksum(sink.path()).await?;
         sink.finalize(&self.job.output)?;
         Ok(())
     }
@@ -1048,6 +1049,7 @@ impl Engine {
         }
         self.emit_progress();
         sink.sync().await?;
+        self.verify_checksum(sink.path()).await?;
         sink.finalize(&self.job.output)?;
         Ok(())
     }
@@ -1089,6 +1091,26 @@ impl Engine {
                 speed_bps: 0.0,
             });
         }
+    }
+
+    /// Check the finished bytes against `job.checksum` before they are published.
+    ///
+    /// `path` is the working file — the `.part` sibling for HTTP/FTP, or the assembled file
+    /// for HLS/DASH. On a mismatch the file is **removed** and the job fails, so a download
+    /// that fails its checksum never becomes the output and is never resumed into a file
+    /// that looks complete. Doing this before the rename is what makes the guarantee atomic:
+    /// the output path is only ever written by a rename of verified bytes.
+    pub async fn verify_checksum(&self, path: &Path) -> Result<()> {
+        let Some(ck) = &self.job.checksum else {
+            return Ok(());
+        };
+        let digest = crate::checksum::verify_file(ck, path).await?;
+        tracing::info!(
+            algorithm = ck.algorithm.as_str(),
+            digest = %digest,
+            "checksum verified"
+        );
+        Ok(())
     }
 
     /// Fetch a whole small resource into memory (manifests, encryption keys).

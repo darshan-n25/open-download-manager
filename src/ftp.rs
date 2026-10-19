@@ -277,6 +277,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
         Some(t) if existing >= t && t > 0 => {
             // Already complete on disk.
             let sink = Sink::create(&part, Some(t))?;
+            engine.verify_checksum(&part).await?;
             sink.finalize(&engine.job().output.clone())?;
             engine.job_mut().downloaded = t;
             return Ok(());
@@ -361,6 +362,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
     engine.job_mut().downloaded = pos;
 
     sink.sync().await?;
+    engine.verify_checksum(&part).await?;
     sink.finalize(&engine.job().output.clone())?;
     Ok(())
 }
