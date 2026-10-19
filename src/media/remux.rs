@@ -480,6 +480,50 @@ mod tests {
         assert!(track.exists(), "the raw track is never consumed");
     }
 
+    /// The success path: a transport stream that a *working* ffmpeg can actually remux
+    /// becomes an `.mp4`. This host's ffmpeg segfaults on every TS input, so the
+    /// assertion cannot be checked here and the test is ignored by default; a host (or
+    /// CI runner) with a working ffmpeg runs it with `cargo test -- --ignored`.
+    ///
+    /// It is the complement of `a_present_but_failing_ffmpeg_still_keeps_the_raw_ts` and
+    /// `a_real_ffmpeg_can_never_lose_an_mpeg_ts_track`: those prove the fallback never
+    /// loses data, this one proves the remux actually happens when it can.
+    #[ignore]
+    #[test]
+    fn a_working_ffmpeg_remuxes_a_transport_stream_to_mp4() {
+        let _g = env_guard();
+        let _ffmpeg = EnvVar::unset("RIPTIDE_FFMPEG");
+        if find_ffmpeg().is_none() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let track = std::path::Path::new("tests/fixtures/remux/sample.ts");
+        assert!(track.exists(), "the TS fixture must be present");
+        let out = dir.path().join("movie.mp4");
+
+        let n = publish_single(track, &out, "ts").expect("publishing must not fail");
+
+        assert!(n > 0, "something must be written");
+        assert!(
+            out.exists(),
+            "a working ffmpeg must produce the remuxed `.mp4`, not fall back to `.ts`"
+        );
+        // The remuxed container is smaller or at least different from the raw TS; either way
+        // it must not be byte-identical to the input (that would mean no remux happened).
+        let produced = std::fs::read(&out).unwrap();
+        let raw = std::fs::read(track).unwrap();
+        assert_ne!(
+            produced, raw,
+            "the output must not be a verbatim copy of the raw transport stream"
+        );
+        // And it should look like an MP4.
+        assert!(
+            looks_like_mp4(&produced[..produced.len().min(32)]),
+            "the remuxed file must be an MP4"
+        );
+    }
+
     #[test]
     fn ffmpeg_discovery_respects_the_env_override() {
         let _g = env_guard();
