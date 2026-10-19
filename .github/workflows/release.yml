@@ -1,0 +1,214 @@
+name: Release
+
+# What "headless" ends with: something to download that is not a source tree.
+#
+# On a `v*` tag this builds the binary for every platform Riptide claims to support, attaches
+# the archives to a GitHub Release, and pushes the container image to GHCR. The Linux
+# archives are static musl builds, which is what makes them usable on a NAS, an Alpine
+# container or a router without a package manager in sight.
+#
+# Not executed: this repository has no git remote yet, so no tag has ever been pushed. The
+# same steps run in `ci.yml` on every commit — except the two that publish, which by
+# definition only a real release does.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (a release is created only for a pushed tag)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The binaries
+  # ---------------------------------------------------------------------------
+  artifacts:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static, so it runs on a glibc-less Linux: Alpine, a `scratch` image, a NAS.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            packages: musl-tools
+            cc: musl-gcc
+            archive: tar.gz
+            binary: riptide
+          # Every modern ARM Linux box that is not musl.
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            packages: gcc-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            archive: tar.gz
+            binary: riptide
+          # Both halves of the macOS world, from the arm64 runner.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            packages: ""
+            cc: ""
+            archive: tar.gz
+            binary: riptide
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            packages: ""
+            cc: ""
+            archive: tar.gz
+            binary: riptide
+          # `packages: ""` rather than no key at all: an absent matrix value is not the empty
+          # string, so `if: matrix.packages != ''` would be true and the step would run `apt`
+          # with nothing to install.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            packages: ""
+            cc: ""
+            archive: zip
+            binary: riptide.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cross C toolchain (for ring)
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Build
+        shell: bash
+        env:
+          # `cc` looks for `x86_64-linux-musl-gcc`, which `musl-tools` does not provide; it
+          # provides `musl-gcc`. Only the target-specific names are set, so build scripts and
+          # proc macros (built for the host) keep the host compiler.
+          CC_x86_64_unknown_linux_musl: ${{ matrix.cc }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.cc }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cc }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin riptide
+
+      # The claim the Linux archive makes is "static"; `ldd` is the one-line proof, and a
+      # release is a bad place to discover it is not true.
+      - name: Prove the Linux builds are static
+        if: contains(matrix.target, 'linux')
+        run: |
+          bin=target/${{ matrix.target }}/release/riptide
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "::error::$bin links against shared libraries"
+            exit 1
+          fi
+
+      - name: What was built
+        shell: bash
+        run: target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          name="riptide-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          case "${{ matrix.archive }}" in
+            tar.gz) tar -C dist -czf "dist/$name.tar.gz" "$name" ;;
+            # `tar -a` picks the format from the extension, so this needs no 7-Zip. bsdtar
+            # on the Windows runner and GNU tar on Linux both understand it.
+            zip)    tar -C dist -a -cf "dist/$name.zip" "$name" ;;
+          esac
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: riptide-${{ matrix.target }}
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The container image
+  # ---------------------------------------------------------------------------
+  image:
+    name: image (ghcr.io)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The image is multi-architecture, and building it on an amd64 runner means the arm64
+      # half runs under emulation. That is slow (the build stage compiles `ring`'s assembly)
+      # but simple; a native arm64 runner or a cross-compiling build stage would both be
+      # faster, and neither is worth the extra moving parts until a release actually needs it.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+
+  # ---------------------------------------------------------------------------
+  # The release note
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: [artifacts, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # `gh` rather than a third-party action: one less thing to trust with a write token.
+      # The notes are generated from the commits and labels since the previous tag, so the
+      # release body does not have to be maintained by hand in two places.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            dist/*

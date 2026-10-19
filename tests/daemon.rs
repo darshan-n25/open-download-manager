@@ -56,7 +56,7 @@ async fn start_daemon_full(
     cfg.auto_categorize = false;
     tweak(&mut cfg);
 
-    let (listener, sched) = daemon::bind(&cfg).await.unwrap();
+    let (listener, sched, _stop) = daemon::bind(&cfg).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = daemon::serve_on(listener, sched, auth).await;

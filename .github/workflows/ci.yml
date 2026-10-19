@@ -10,12 +10,17 @@ name: CI
 #                 run in the matrix: static musl, aarch64 Linux and Windows (GNU). Each
 #                 needs a cross C toolchain only because `ring` is C and assembly.
 #   static      — builds the fully static Linux binary and proves it is static.
+#   image       — builds `deploy/Dockerfile`, runs it, and stops it with SIGTERM the way
+#                 `docker stop` does. This is the only place the image is exercised at all:
+#                 the authoring machine has no container runtime.
+#   portability — compiles the platform module for all seven targets from one host.
 #
 # This file has not been executed yet: the repository it lives in has no git remote and
 # its author's machine is an x86_64 Linux box with no passwordless package install, so the
 # non-Linux jobs here are written, reviewed and *unrun*. Everything they cover that could
 # be checked without a second machine is checked by `scripts/check-portability.sh`, which
-# compiles the platform module for all seven targets on any host.
+# compiles the platform module for all seven targets on any host, and by
+# `scripts/check-headless.sh`, which runs the static binary in a one-file rootfs.
 
 on:
   push:
@@ -164,6 +169,46 @@ jobs:
         with:
           name: riptide-linux-x86_64-musl
           path: target/x86_64-unknown-linux-musl/release/riptide
+
+  # The image is the one deliverable that cannot be checked by reading it: a `scratch` runtime
+  # has no shell to debug in, and an entrypoint that cannot start is invisible until someone
+  # pulls the image. So it is built *and run* here.
+  image:
+    name: container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build --file deploy/Dockerfile --tag riptide:ci .
+
+      - name: Run it, then stop it the way Docker does
+        run: |
+          docker run --detach --name riptide --network host riptide:ci
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:1001/health && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:1001/health
+          echo
+          # `docker stop` sends SIGTERM and allows ten seconds. The container should exit 0
+          # rather than 143: a process killed by the signal has no exit code at all.
+          docker stop --time 15 riptide
+          code=$(docker inspect --format '{{.State.ExitCode}}' riptide)
+          docker logs riptide
+          test "$code" = 0 || { echo "::error::the container exited $code, not 0"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # What the image is made of — no libc, no shell, no /etc — is worth checking on a host
+      # that has no container runtime, which is where this was written.
+      - name: Build a static binary for the one-file rootfs check
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Run the static binary with nothing but itself in the filesystem
+        run: ./scripts/check-headless.sh
 
   # Compiles the platform module for all seven targets from one host. It is a step in its
   # own right because it needs no toolchain at all — just `rustup target add` — so it is

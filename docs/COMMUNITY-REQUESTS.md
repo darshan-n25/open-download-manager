@@ -160,8 +160,14 @@ Requests cluster around "run it somewhere that is not my desktop, and talk to it
 **Riptide:** the daemon, its JSON API, the CLI, and `project tick` for cron are the closest match
 on this page — you can run the daemon on a NAS and drive it over HTTP, with an optional bearer
 token required on every route (HTTP and the WebSocket handshake alike) so binding it beyond
-loopback is a decision rather than an accident. One honest gap remains: the only UI is a status
-page. That is cheap; it is not done.
+loopback is a decision rather than an accident. As of the packaging work there is something to
+*install* for that too: a `scratch` image holding one fully static binary — no libc, no shell, no
+CA bundle, because the trust roots are compiled in — one `/data` volume for the queue, the config,
+the projects and the downloads, and SIGTERM handled the way a service manager sends it, so
+`docker stop` stops jobs at a chunk boundary, records them `paused` and exits 0 instead of killing
+the process mid-write. Release archives (static musl, aarch64 Linux, both macOS architectures,
+Windows) are built and attached by `.github/workflows/release.yml`. One honest gap remains: the
+only UI is a status page. That is cheap; it is not done.
 
 ## 8. No ads, no nag, no account
 
@@ -213,10 +219,14 @@ Not commitments — candidates, ordered by (evidence × cost):
    different kind of software, and the second is a maintenance treadmill that IDM itself
    visibly struggles with.
 
-Since this list was written, candidates 1 and 2 have shipped: checksum verification, and daemon
+Since this list was written, candidates 1, 2 and 3 have shipped: checksum verification; daemon
 authentication (a constant-time bearer token from a file, the environment, or a config path,
-required on every HTTP route and on the WebSocket handshake). See [`ROADMAP.md`](ROADMAP.md) for
-what is left and the order it is ranked in.
+required on every HTTP route and on the WebSocket handshake); and the headless release story — a
+`scratch` image, release archives for five targets, and SIGTERM handling so the daemon can be run
+as a service rather than watched in a terminal. Two items the ranking above did not contain also
+shipped, because the verification work surfaced them: platform support for Linux, macOS and
+Windows, and the MPEG-TS remux fallback. See [`ROADMAP.md`](ROADMAP.md) for what is left —
+BitTorrent — and the order it is ranked in.
 
 ## Sources
 

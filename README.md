@@ -62,6 +62,7 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Projects | Recurring work stored as one document per project: `file` keeps a URL in step with a local path using conditional requests (`304` costs no body bytes), `site` re-crawls and fetches only what changed, `site --archive` keeps an offline mirror; run by the daemon when due, or from `cron` with `project tick` |
 | Browser | MV3 extension + a loopback daemon speaking IDM's `MSG#` framing over its WebSocket subprotocol, plus a plain JSON API |
 | Daemon auth | Optional bearer token required on **every** route — the JSON API, the control page, `/health`, and the WebSocket handshake — compared in constant time. The token comes from `--token-file`, `RIPTIDE_DAEMON_TOKEN`, or the `daemon_token_file` setting, never from an argument; off-loopback binds say what is at stake |
+| Headless / NAS | One fully static binary and a `scratch`-based image — no libc, no shell, no CA bundle, because the trust roots are compiled in: `docker compose -f deploy/compose.yaml up -d`. SIGTERM, which is what `docker stop` and `systemctl stop` send, stops running jobs at a chunk boundary, records them `paused`, and exits **0** — see [Headless and containers](#headless-and-containers) |
 | CLI | `download`, `grab`, `daemon`, `probe`, `list`, `show`, `remove`, `pause`, `queue`, `project`, `config`, `state-dir` |
 
 ## Build and install
@@ -72,11 +73,12 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 331 tests: unit + protocol + end-to-end
+cargo test         # 336 tests: unit + protocol + end-to-end
 ```
 
 On Windows the binary is the same program; only the directory it keeps its files in changes.
-See [Platform support](#platform-support), including how to build a static Linux binary.
+See [Platform support](#platform-support), including how to build a static Linux binary, and
+[Headless and containers](#headless-and-containers) for the image.
 
 ## Platform support
 
@@ -123,9 +125,130 @@ file fails the `x86_64-pc-windows-msvc` line while the Linux line still passes.
 `.github/workflows/ci.yml` is the rest of it: the whole suite natively on `ubuntu-latest`,
 `macos-latest` and `windows-latest` with clippy and rustfmt; `cargo check --all-targets` for
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`; a fully
-static musl binary proven static with `ldd`; and `x86_64-apple-darwin` cross-built from the arm64
-macOS runner. **That workflow has not run** — this repository has no remote yet — so the
-non-Linux jobs are written and reviewed but unexecuted. The executed evidence is Linux, below.
+static musl binary proven static with `ldd`; `x86_64-apple-darwin` cross-built from the arm64
+macOS runner; and the container image built, run and stopped. **That workflow has not run** —
+this repository has no remote yet — so the non-Linux jobs are written and reviewed but
+unexecuted. The executed evidence is Linux, below.
+
+## Headless and containers
+
+For the machines with no desktop: a NAS, a home server, a Raspberry-Pi-class box. The daemon is
+the whole program, so the image is the whole program — [`deploy/Dockerfile`](deploy/Dockerfile)
+builds a static binary in Alpine and copies it into `scratch`. No shell, no package manager, no
+libc, and no CA bundle: TLS is `rustls` with `webpki-roots`, whose trust roots are compiled into
+the binary.
+
+```sh
+docker compose -f deploy/compose.yaml up -d      # builds and runs it
+curl http://127.0.0.1:1001/health
+docker exec riptide riptide list
+```
+
+State, configuration, projects, mirrors and the default download directory all live under
+`/data`, which is the one volume worth mounting. `HOME=/data` is set in the image on purpose:
+the layout falls back to the working directory when there is no home at all, and a runtime that
+invents `HOME=/root` would put the queue outside the volume — a queue that cannot resume is the
+one thing a download manager must never have.
+
+The port is published on the host's **loopback only** by default, so nothing on the network can
+reach it and no token is needed. Reaching it from elsewhere means doing both halves of the change
+in one edit: publish the port, and set `RIPTIDE_DAEMON_TOKEN`. With a token configured the daemon
+requires it on every route, `/health` and the control page included.
+
+**Stopping is a signal, not a kill.** `docker stop`, `systemctl stop` and `kubectl delete` all
+send SIGTERM. Riptide handles it: running jobs stop at the next chunk boundary, record themselves
+as `paused` with the bytes they do have, and the process exits **0** instead of dying by signal
+(which is what an orchestrator reports as a crash). The stop waits up to five seconds for that
+saving and then reports by name anything still going, so a wedged connection cannot hold
+`docker stop` open until it escalates. `stop_grace_period` / `TimeoutStopSec` should therefore
+exceed five seconds — the compose file sets fifteen.
+
+```ini
+# ~/.config/systemd/user/riptide.service
+[Unit]
+Description=Riptide download daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/riptide daemon --addr 127.0.0.1:1001
+Restart=on-failure
+# SIGTERM is handled; this is how long it may take. The daemon stops at five seconds and
+# names anything that is still running.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
+```
+
+What is deliberately **not** in the image:
+
+- **`ffmpeg`.** A media job still works — the fMP4 is kept, or the raw `.ts`, and nothing fails —
+  but a *remuxed* MPEG-TS only happens if you bake `ffmpeg` into a derived image.
+- **A healthcheck.** A `scratch` image has no shell and no `curl` to run one with, so probing
+  `/health` is the orchestrator's job (`httpGet`), not the image's.
+- **A user database.** Downloads run as root by default, because a bind-mounted host directory is
+  usually not writable by the unprivileged uid a fresh named volume would inherit; pass
+  `--user "$(id -u):$(id -g)"` and make `/data` writable by it if you would rather not.
+
+The browser extension is not in the image either: it runs in the browser, and points at the
+daemon's address. Nothing else about the daemon changes in a container — `cron`-driven
+[projects](#recurring-projects) work the same way from inside the image or from the host.
+
+**What has and has not been executed.** There is no container runtime on the machine this was
+written on — no `docker`, `podman`, `buildah` or `containerd` — so `docker build` has never run
+here, and neither has `docker stop`. Two things stand in: the `image` job in
+`.github/workflows/ci.yml` builds the Dockerfile, runs the container and stops it with SIGTERM
+(then asserts the exit code is 0), and
+[`scripts/check-headless.sh`](scripts/check-headless.sh) checks the same claims on the host at
+hand, by building the same kind of binary — a fully static one — and running it inside a rootfs
+that holds exactly what the image holds, one file, with an unprivileged user namespace standing
+in for the chroot. It is what the claims above rest on:
+
+```
+$ ./scripts/check-headless.sh
+note: checking inside a chroot with unprivileged user namespaces
+
+== 1. a static binary ==
+   11984160 bytes, ldd says: statically linked
+
+== 2. an image that is one file ==
+           40 /image/data
+           60 /image/usr
+           60 /image/usr/local
+           60 /image/usr/local/bin
+     11984160 /image/usr/local/bin/riptide
+
+== 3. where it keeps its files ==
+   no HOME    -> ./.config/riptide/config.json
+   HOME=/data -> /data/.config/riptide/config.json
+
+== 4. a real download ==
+   6 MiB over 4 connections: … 100.0%  6.00 MB / 6.00 MB  —done → /data/Downloads/payload.bin
+
+== 5. the daemon serves the API, with a job in flight ==
+   GET  /health      -> 200 ok
+   GET  /            -> 200
+   POST /api/jobs    -> 201 {"id":"d49215ddfb764a56","status":"queued"}
+   GET  /api/jobs    -> d49215ddfb764a56 is active
+
+== 6. docker stop, mid-download ==
+   exit=0 after 1s
+   | SIGTERM — stopping; running jobs save their place at the next chunk boundary …
+   | stopped
+   the queue afterwards:
+   ID                STATE    SIZE       DONE  NAME
+   0dc2cdf17aa84e0f  done     6.00 MB    100%  payload.bin
+   d49215ddfb764a56  paused   12.00 MB     16%  slow.bin
+   d49215ddfb764a56 is paused at 2070976 of 12582912 bytes — resumable
+
+all checks passed
+```
+
+(The rootfs is built under a temporary directory and the daemon is given a dribbling origin, so
+the stop lands in the middle of a transfer rather than between two of them. The same claim is
+asserted against the released binary, with no container or chroot involved, by
+`cargo test --test shutdown`.)
 
 ## Use
 
@@ -400,7 +523,7 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 | Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
 | BitTorrent and magnet links | The single most-cited reason to keep a second app installed | Deliberately absent — a second engine, not a mode of this one |
 | Checksum verification | Listed as a headline feature by neighbouring projects | `--checksum sha256:…`, verified before the rename |
-| Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick` + an optional bearer token on every route |
+| Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick` + an optional bearer token on every route, and a `scratch` image that runs it all: `docker compose up -d`, `docker stop` and back without losing a queue |
 | No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
 | Offline copies of sites | IDM advertises it; the strings are in the binary | `grab --archive`, `site --archive` |
 
@@ -428,14 +551,20 @@ and ranks what to build next. The ranking, in short:
    CI matrix that runs the suite natively on all three systems, cross-checks three more targets,
    and proves the static musl build is static. See [Platform support](#platform-support) for
    what has and has not been *executed*.
+5. **Headless packaging** (was item 4) — the daemon learned to stop on SIGTERM, which it had
+   never done: `docker stop` and `systemctl stop` used to kill it mid-write. It now stops at a
+   chunk boundary, waits up to five seconds for running jobs to save themselves as `paused`, and
+   exits 0. Around that: a `scratch` image with no libc, shell or CA bundle
+   ([`deploy/Dockerfile`](deploy/Dockerfile)), a compose file that publishes on host loopback
+   unless you also set a token, a release workflow that attaches static musl / glibc / macOS /
+   Windows archives and pushes the image to GHCR, and a CI job that builds the image, runs it and
+   stops it. See [Headless and containers](#headless-and-containers).
 
 **Still to build, in the order the roadmap ranks them:**
 
-1. **Headless packaging** — static binaries and a container image for NAS use. (The static
-   binary itself is now built and checked in CI; what remains is the image and the release.)
-2. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
+1. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
    the queue and state but deliberately **not** a mode of the HTTP engine.
-3. **Finishing the MPEG-TS remux verification** — a host with a working `ffmpeg` and a real
+2. **Finishing the MPEG-TS remux verification** — a host with a working `ffmpeg` and a real
    transport-stream fixture, to prove the *successful* remux as well as the fallback.
 
 The same document records what verification changed on 2026-10-19: ffmpeg turned out to be
@@ -518,6 +647,22 @@ against this implementation (§12 there). The short version:
 - **Failed authentication is logged, not delayed.** A wrong token gets a 401 immediately rather
   than a backoff. With a 256-bit secret that is the right trade, but it does mean a token that is
   a short password is only as strong as that password.
+
+**Headless and containers**
+
+- **The image has never been built here**, and neither has `docker stop`: this machine has no
+  container runtime at all. The `image` job in CI and `scripts/check-headless.sh` are what stand
+  in for it — the latter runs a *glibc* static build rather than the musl one the Dockerfile
+  produces, which is the same claim (no interpreter, no shared libraries) from a different libc.
+- **Nothing is remuxed inside the image.** `ffmpeg` is not installed, so an MPEG-TS capture keeps
+  the raw `.ts` there. Bake `ffmpeg` into a derived image if you need the remux.
+- **No healthcheck, and no shell to write one in.** Probing `/health` is the orchestrator's job.
+- **The shutdown grace is five seconds.** A job wedged mid-chunk cannot be cancelled before that;
+  the daemon then names what is still running and exits anyway, leaving a resumable part file.
+  A `stop_grace_period` (or `TimeoutStopSec`) below five seconds means the service manager's
+  SIGKILL arrives first, which is the case this feature exists to avoid.
+- **Downloads run as root** unless you pass `--user`, because the image carries no user database
+  and a bind-mounted host directory is usually not writable by an arbitrary uid.
 
 **Media**
 
@@ -629,16 +774,19 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 331 tests
+cargo test                              # Rust: 336 tests
 node --test extension/tests/protocol.test.mjs   # JavaScript: 15 tests
+./scripts/check-portability.sh          # the platform module, for all 7 targets
+./scripts/check-headless.sh             # the static binary alone in a one-file rootfs
 ```
 
-331 Rust tests: 266 unit tests across every module, 17 daemon-protocol tests driving a real
+336 Rust tests: 268 unit tests across every module, 17 daemon-protocol tests driving a real
 WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
 which really does byte ranges, 6 that stand up a mock `Negotiate` server, 6 that verify
 checksums end-to-end against a real HTTP server, 17 that stand up a server which really
-honours `If-None-Match` and `Range`, and 10 that archive a small site and then read their own
-output back to check that every rewritten reference resolves.
+honours `If-None-Match` and `Range`, 10 that archive a small site and then read their own
+output back to check that every rewritten reference resolves, and 3 that start the released
+**binary**, send it a real signal, and check what it does about it.
 
 The end-to-end ones assert that
 
@@ -709,6 +857,15 @@ Two more are worth naming because they are about *refusing* rather than computin
 inference, and every malformed spec), and the **media fallback** — an MPEG-TS remux is driven
 with an `ffmpeg` that is absent, one that exits non-zero, and whatever `ffmpeg` the host
 actually has, and in every case publishing must succeed and the raw track must survive.
+
+And the shutdown tests are about the process rather than the download: they start the built
+binary, send it **SIGTERM** (and, as a control, SIGINT) while a trickling origin is mid-transfer,
+and assert that the process exits **0** with a line saying what stopped it — a signal death has
+no exit code, which is what an orchestrator reports as a crash — that the interrupted job is on
+disk as `paused` with some bytes but not all of them, and that an idle daemon stops *immediately*
+rather than sitting out its five-second grace. The unit tests around them pin the two halves of
+that: an idle scheduler reports idle at once, and a scheduler with work registers a waiter that is
+woken by the work ending rather than by the deadline.
 
 A third group is about the *other* platform. The layout resolver is fed a literal environment
 so the Windows answers — `%LOCALAPPDATA%` for state, `%APPDATA%` for config, `%HOMEDRIVE%` joined

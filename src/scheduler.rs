@@ -6,10 +6,10 @@
 //! that IDM's Tips file describes ("leave this file alone in the queue of IDM scheduler
 //! and start the queue. IDM scheduler will retry downloading the file every 30 seconds").
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::config::Config;
 use crate::engine::{Engine, ProgressFn, SharedLimits};
@@ -36,9 +36,29 @@ pub struct Scheduler {
     /// for one download. A fresh `Scheduler` starts the window over.
     pub quota: Arc<Quota>,
     slots: Arc<Semaphore>,
-    /// Raised on Ctrl-C. Every in-flight engine watches this and stops cleanly, leaving a
-    /// resumable partial file rather than a truncated one.
+    /// Raised on Ctrl-C or SIGTERM. Every in-flight engine watches this and stops cleanly,
+    /// leaving a resumable partial file rather than a truncated one.
     shutdown: Option<Arc<AtomicBool>>,
+    /// Units of work currently inside [`Scheduler::execute_with`] or a
+    /// [`Scheduler::run_due_projects`] sweep, plus a `Notify` raised whenever one finishes.
+    ///
+    /// Counted here rather than left to the caller because a shutdown has to *wait* for
+    /// these to finish saving — and the daemon, which replies to the client immediately,
+    /// does not hold their handles.
+    running: Arc<AtomicUsize>,
+    idle: Arc<Notify>,
+}
+
+/// Counts one unit of work for as long as it lives, however it ends.
+struct Running<'a>(&'a Scheduler);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        if self.0.running.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Last one out: wake every waiter, which then sees zero.
+            self.0.idle.notify_waiters();
+        }
+    }
 }
 
 impl Scheduler {
@@ -58,6 +78,8 @@ impl Scheduler {
             quota,
             slots,
             shutdown: None,
+            running: Arc::new(AtomicUsize::new(0)),
+            idle: Arc::new(Notify::new()),
         })
     }
 
@@ -66,12 +88,50 @@ impl Scheduler {
         self.shutdown = Some(flag);
     }
 
+    /// Count one unit of work for as long as it lives.
+    ///
+    /// A guard rather than a pair of calls at the ends: every path out of the work —
+    /// including the `?` on a failed save — has to decrement, or a shutdown would wait for
+    /// a job that already ended.
+    fn enter(&self) -> Running<'_> {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        Running(self)
+    }
+
+    /// Wait until nothing is running, or `grace` elapses. Returns what is still running.
+    ///
+    /// This is what makes a signal-triggered stop *clean* rather than merely fast: a
+    /// cancelled job stops at a chunk boundary, records `Paused` and flushes the quota
+    /// before it returns, so a process that waits for this can then exit 0 instead of
+    /// looking like a crash. The deadline is the backstop — a transfer wedged mid-chunk
+    /// must not hold `docker stop` open until it is killed — and the count returned is what
+    /// the caller reports when the deadline wins.
+    pub async fn wait_for_idle(&self, grace: std::time::Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            // Registered *before* the count is read, so a finish that happens from here on
+            // is never missed (`Notify` only signals waiters that already exist). The loop
+            // re-reads the count after waking, so a notification raised in between is not
+            // waited for twice.
+            let waiting = self.idle.notified();
+            tokio::pin!(waiting);
+            if self.running.load(Ordering::SeqCst) == 0 {
+                return 0;
+            }
+            match tokio::time::timeout_at(deadline, waiting).await {
+                Ok(()) => continue,
+                Err(_) => return self.running.load(Ordering::SeqCst),
+            }
+        }
+    }
+
     /// Run one job to completion (or failure) and persist the outcome.
     pub async fn execute(&self, job: Job) -> Result<Job> {
         self.execute_with(job, None).await
     }
 
     pub async fn execute_with(&self, mut job: Job, progress: Option<ProgressFn>) -> Result<Job> {
+        let _running = self.enter();
         job.state = JobState::Active;
         job.touch();
         self.store.save(&job)?;
@@ -214,6 +274,8 @@ impl Scheduler {
             quota: self.quota.clone(),
             slots: self.slots.clone(),
             shutdown: self.shutdown.clone(),
+            running: self.running.clone(),
+            idle: self.idle.clone(),
         }
     }
 
@@ -229,6 +291,9 @@ impl Scheduler {
         &self,
         runner: &crate::project::ProjectRunner,
     ) -> Vec<(String, crate::project::RunOutcome)> {
+        // A sweep is a project run's only handle too: counting it here is what lets a
+        // shutdown wait for a crawl to finish saving rather than cutting it off.
+        let _running = self.enter();
         let due = match self.projects.due(crate::util::now_ms()) {
             Ok(d) => d,
             Err(e) => {
@@ -255,6 +320,7 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::*;
     use crate::job::JobKind;
+    use std::time::Duration;
 
     fn test_cfg(dir: &std::path::Path) -> Config {
         let mut cfg = Config::default();
@@ -304,5 +370,45 @@ mod tests {
         let sched = Scheduler::new(test_cfg(dir.path())).unwrap();
         let out = sched.run_queue().await.unwrap();
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_idle_scheduler_is_idle_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let sched = Scheduler::new(test_cfg(dir.path())).unwrap();
+        // Not "within the grace period": immediately. A stop that waited five seconds for
+        // nothing is the failure this is here to catch.
+        assert_eq!(sched.wait_for_idle(Duration::from_millis(10)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_for_idle_wakes_when_the_work_ends_and_gives_up_at_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let sched = Arc::new(Scheduler::new(test_cfg(dir.path())).unwrap());
+
+        // The deadline is the backstop: work that never ends must not hold the stop open.
+        let stuck = sched.enter();
+        assert_eq!(
+            sched.wait_for_idle(Duration::from_millis(50)).await,
+            1,
+            "a job that outlasts the grace period should be reported, not waited for"
+        );
+
+        // And once it does end, the waiter is woken by it rather than by the deadline.
+        let waiter = {
+            let sched = sched.clone();
+            tokio::spawn(async move { sched.wait_for_idle(Duration::from_secs(60)).await })
+        };
+        // Let the waiter register before the guard is dropped, so a missed notification
+        // would show up as a timeout instead of a pass.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        drop(stuck);
+        assert_eq!(waiter.await.unwrap(), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "woke on the drop, not on the deadline: {:?}",
+            started.elapsed()
+        );
     }
 }

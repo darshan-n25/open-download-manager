@@ -681,7 +681,7 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
         sched.store.save(job)?;
     }
 
-    let ctrl_c = spawn_ctrl_c(stop.clone());
+    let signals = spawn_stop_signal(stop.clone());
 
     let mut handles = Vec::new();
     for job in jobs {
@@ -710,7 +710,7 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
             }
         }
     }
-    ctrl_c.abort();
+    signals.abort();
 
     if failed > 0 {
         return Err(RiptideError::other(format!(
@@ -720,13 +720,42 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn spawn_ctrl_c(stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+/// Set `stop` when the process is asked to quit — Ctrl-C always, and on Unix a SIGTERM too.
+///
+/// SIGTERM is the one that matters for headless use: `docker stop`, `systemctl stop` and
+/// `kubectl delete` all send it, and the default action kills the process outright,
+/// mid-write. Handling it means the engine stops at a chunk boundary, the job is persisted
+/// as `Paused`, and the process exits 0 instead of looking like a crash.
+fn spawn_stop_signal(stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\ninterrupted — stopping transfers; resume with `riptide queue`");
-            stop.store(true, Ordering::SeqCst);
-        }
+        let why = wait_for_stop().await;
+        eprintln!("\n{why} — stopping transfers; resume with `riptide queue`");
+        stop.store(true, Ordering::SeqCst);
     })
+}
+
+/// Which signal asked us to stop. Returns nothing if it never does.
+async fn wait_for_stop() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "interrupted",
+                _ = term.recv() => "SIGTERM",
+            },
+            // Only if the handler could not be installed at all; Ctrl-C still works.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                "interrupted"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "interrupted"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -951,7 +980,7 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     sched.set_shutdown(stop.clone());
     let sched = Arc::new(sched);
-    let ctrl_c = spawn_ctrl_c(stop);
+    let signals = spawn_stop_signal(stop);
 
     let mut handles = Vec::new();
     for t in &targets {
@@ -998,7 +1027,7 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
             }
         }
     }
-    ctrl_c.abort();
+    signals.abort();
     if failed > 0 {
         return Err(RiptideError::other(format!("{failed} download(s) failed")));
     }
@@ -1008,6 +1037,15 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Daemon
 // ---------------------------------------------------------------------------
+
+/// How long a stopping daemon waits for running work to save before it exits anyway.
+///
+/// A cancelled job stops at a chunk boundary, records `Paused` and flushes the quota, so
+/// waiting is what makes the exit clean. It is bounded on purpose: a transfer wedged
+/// mid-chunk must not hold a stop open until the service manager loses patience and kills
+/// the process, which would lose exactly what this wait was for. Five seconds sits well
+/// inside the ten `docker stop` allows by default.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn cmd_daemon(args: DaemonArgs) -> Result<()> {
     let mut cfg = Config::load();
@@ -1042,8 +1080,30 @@ async fn cmd_daemon(args: DaemonArgs) -> Result<()> {
         return Ok(());
     }
 
-    let (listener, sched) = crate::daemon::bind(&cfg).await?;
-    crate::daemon::serve_on(listener, sched, auth.map(Arc::new)).await
+    let (listener, sched, stop) = crate::daemon::bind(&cfg).await?;
+
+    // Run until a signal says otherwise. A daemon has no other end, so this is the only
+    // exit path — and it is the one a container uses: `docker stop` sends SIGTERM, waits
+    // for the process (ten seconds by default), then kills it.
+    tokio::select! {
+        outcome = crate::daemon::serve_on(listener, sched.clone(), auth.map(Arc::new)) => outcome,
+        why = wait_for_stop() => {
+            eprintln!(
+                "\n{why} — stopping; running jobs save their place at the next chunk boundary \
+                 and resume with `riptide queue`"
+            );
+            stop.store(true, Ordering::SeqCst);
+            match sched.wait_for_idle(SHUTDOWN_GRACE).await {
+                0 => {}
+                left => eprintln!(
+                    "{left} job(s) still active after {}s — their part files are resumable",
+                    SHUTDOWN_GRACE.as_secs()
+                ),
+            }
+            eprintln!("stopped");
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,7 +1316,7 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
         }
     }
 
-    let ctrl_c = spawn_ctrl_c(stop);
+    let signals = spawn_stop_signal(stop);
     let mut handles = Vec::new();
     for job in pending {
         let label = job.display_name();
@@ -1297,7 +1357,7 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
             }
         }
     }
-    ctrl_c.abort();
+    signals.abort();
 
     if sched.quota.limit_bytes().is_some() {
         println!("download quota: {}", sched.quota.describe());

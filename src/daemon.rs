@@ -21,6 +21,7 @@
 //! extension only contains the *dispatcher*), so only the subset Riptide itself defines is
 //! guaranteed. The framing, the handshake shape and the subprotocol string are as observed.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -970,12 +971,19 @@ async fn handle_conn(
 /// Bind the daemon socket and prepare its scheduler, without accepting connections yet.
 ///
 /// Splitting binding from serving lets tests bind port 0 and learn the real address.
-pub async fn bind(cfg: &Config) -> Result<(TcpListener, Arc<Scheduler>)> {
-    let sched = Arc::new(Scheduler::new(cfg.clone())?);
+///
+/// The third element is the flag that stops the work. It is handed out because only the
+/// caller knows when to raise it — the CLI does so on SIGTERM — and without a flag a
+/// `Scheduler` has nothing to watch, so a signal could only kill the process mid-write.
+pub async fn bind(cfg: &Config) -> Result<(TcpListener, Arc<Scheduler>, Arc<AtomicBool>)> {
+    let mut sched = Scheduler::new(cfg.clone())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    sched.set_shutdown(stop.clone());
+    let sched = Arc::new(sched);
     let listener = TcpListener::bind(&cfg.daemon_addr)
         .await
         .map_err(|e| RiptideError::other(format!("cannot bind {}: {e}", cfg.daemon_addr)))?;
-    Ok((listener, sched))
+    Ok((listener, sched, stop))
 }
 
 /// Accept connections on an already-bound listener until the process stops.
@@ -1076,9 +1084,13 @@ async fn project_ticker(sched: Arc<Scheduler>) {
 }
 
 /// Run the daemon until the process is stopped.
+///
+/// The blocking form, for callers that want the whole thing and have no signal of their own
+/// to raise. `cmd_daemon` does not use it — it needs the stop flag so SIGTERM can end the
+/// process cleanly.
 pub async fn serve(cfg: Config) -> Result<()> {
     let auth = crate::auth::token::load(None, cfg.daemon_token_file.as_deref())?.map(Arc::new);
-    let (listener, sched) = bind(&cfg).await?;
+    let (listener, sched, _stop) = bind(&cfg).await?;
     serve_on(listener, sched, auth).await
 }
 
