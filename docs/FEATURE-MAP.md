@@ -225,6 +225,15 @@ download engine:
 Everything else on the list is either implemented, deliberately refused, or UI that a
 terminal-first tool has no place for.
 
+### What the community asks for, as opposed to what IDM ships
+
+§1–§11 compare Riptide against **IDM**. [`COMMUNITY-REQUESTS.md`](COMMUNITY-REQUESTS.md)
+compares it against what people actually ask for, which is not the same list: the most-repeated
+*feature* request in the surrounding ecosystem is **BitTorrent/magnet support** (which IDM does
+not have either), followed by **checksum verification**, and the most-repeated request of any
+kind is simply to **run on something other than Windows**. The first two are recorded there as
+gaps; the third is answered by construction.
+
 ## 13. What "tested" means here
 
 `cargo test` runs 272 Rust tests, and `node --test extension/tests/protocol.test.mjs` runs 13

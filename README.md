@@ -8,8 +8,10 @@ Riptide is a **clean-room reimplementation**. It was designed by statically reve
 engineering the shipped IDM binaries and then rebuilding the *behaviour* in Rust — no IDM
 code is used or present. The analysis lives in
 [`docs/IDM-REVERSE-ENGINEERING.md`](docs/IDM-REVERSE-ENGINEERING.md) (every claim tagged
-`OBSERVED` / `INFERRED` / `UNKNOWN`) and the feature-by-feature comparison, including what is
-**not** implemented, lives in [`docs/FEATURE-MAP.md`](docs/FEATURE-MAP.md).
+`OBSERVED` / `INFERRED` / `UNKNOWN`), the feature-by-feature comparison, including what is
+**not** implemented, lives in [`docs/FEATURE-MAP.md`](docs/FEATURE-MAP.md), and what the IDM
+community actually asks for — and which of those Riptide answers — is surveyed in
+[`docs/COMMUNITY-REQUESTS.md`](docs/COMMUNITY-REQUESTS.md).
 
 > **Read the feature map before trusting a checkbox.** PAC script evaluation, FTPS, MMS and
 > MPEG-TS remuxing without `ffmpeg` are honest gaps, Kerberos itself is absent (Negotiate is
@@ -281,6 +283,23 @@ src/
 extension/       MV3 browser integration (background, popup, options)
 tests/           end-to-end tests against servers that really do byte ranges, conditional requests and SPNEGO, plus daemon protocol tests and an archive suite that reads its own output back
 ```
+
+## What the community asks for
+
+[`docs/COMMUNITY-REQUESTS.md`](docs/COMMUNITY-REQUESTS.md) surveys what IDM users and IDM
+*refugees* ask for, and Riptide's answer to each. The headlines:
+
+| Ask | Where it comes from | Riptide |
+| --- | --- | --- |
+| Run on macOS/Linux/Android at all | IDM's own FAQ confirms Windows-only; the loudest theme in Linux/macOS threads | Answered by construction: native binaries, no Wine |
+| Browser integration that survives browser policy | Chrome disabling IDM's MV2 extension; IDM's own "keep the extension enabled" advice | Loopback daemon is the integration; the extension is a thin MV3 client, and `curl` can do everything it can |
+| Never lose media again, and say so honestly when it cannot | The video panel is the reason people stay; protected streams and YouTube changes are the top failures | HLS/DASH capture and muxing; no DRM circumvention and no per-site signature layer, by design |
+| Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
+| BitTorrent and magnet links | The single most-cited reason to keep a second app installed | Deliberately absent — a second engine, not a mode of this one |
+| Checksum verification | Listed as a headline feature by neighbouring projects | **Gap, and the cheapest one** |
+| Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick`; **no daemon auth yet** |
+| No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
+| Offline copies of sites | IDM advertises it; the strings are in the binary | `grab --archive`, `site --archive` |
 
 ## How Riptide differs from IDM
 
