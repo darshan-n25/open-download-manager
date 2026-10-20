@@ -252,13 +252,28 @@ struct App {
     sort: SortState,
     tab: Tab,
     show_add: bool,
-    add_connections: usize,
+    /// `None` means "whatever the daemon is configured to use". A slider would silently
+    /// clamp a zero into one, and a download with one connection is a fifth of the
+    /// speed — so the number is only sent when the user actually asks for one.
+    add_connections: Option<usize>,
     add_output: String,
     add_quality: String,
     search: String,
+    /// The daemon's configured number of connections, shown in the Add URL dialog.
+    default_connections: usize,
 }
 
 impl App {
+    /// The window starts with the daemon's own settings in view, so the Add URL dialog
+    /// offers the connection count the machine is actually configured for.
+    fn new() -> Self {
+        let cfg = Config::load();
+        App {
+            default_connections: cfg.connections.max(1),
+            ..Default::default()
+        }
+    }
+
     fn refresh(&mut self) {
         if let Some(jobs) = http_get::<Vec<Job>>("/api/jobs") {
             self.jobs = jobs;
@@ -369,8 +384,8 @@ impl App {
             return;
         }
         let mut body = serde_json::json!({ "url": url });
-        if self.add_connections > 0 {
-            body["connections"] = serde_json::json!(self.add_connections.to_string());
+        if let Some(n) = self.add_connections {
+            body["connections"] = serde_json::json!(n.to_string());
         }
         if !self.add_output.trim().is_empty() {
             body["output"] = serde_json::json!(self.add_output.trim());
@@ -1214,7 +1229,18 @@ impl App {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label("Connections");
-                    ui.add(egui::Slider::new(&mut self.add_connections, 1..=32));
+                    let mut n = self.add_connections.unwrap_or(self.default_connections);
+                    if ui
+                        .add(egui::Slider::new(&mut n, 1..=32))
+                        .changed()
+                    {
+                        self.add_connections = Some(n);
+                    } else {
+                        self.add_connections = None;
+                    }
+                    if self.add_connections.is_some() && ui.small_button("default").clicked() {
+                        self.add_connections = None;
+                    }
                 });
                 ui.label("Save as (optional)");
                 ui.add_sized(
@@ -1372,7 +1398,7 @@ fn main() {
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
             cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
-            Ok(Box::new(App::default()))
+            Ok(Box::new(App::new()))
         }),
     );
 }

@@ -194,6 +194,15 @@ impl Scheduler {
         let outcome = async {
             if engine.job().kind != crate::job::JobKind::Ftp {
                 engine.probe().await?;
+                // The probe is where the file learns its real name and its size: the
+                // server's `Content-Disposition` and the length of a ranged reply. Save
+                // them now, because until this moment the stored job still carries the
+                // provisional name — and a client watching the queue would show the
+                // user "3f2a….download" for a download that is really called
+                // "movie.mkv".
+                let mut probed = engine.job().clone();
+                probed.touch();
+                self.store.save(&probed)?;
             }
             engine.run().await
         }
