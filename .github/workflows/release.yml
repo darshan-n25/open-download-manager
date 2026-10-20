@@ -410,10 +410,19 @@ jobs:
             echo
             echo "Verify a download with \`sha256sum -c SHA256SUMS.txt\`."
           } > notes-extra.md
+          # Only the archives, the installer and the checksum file: `dist/*` would also
+          # pick up any staging directory left behind by a build step. The list is built
+          # by hand because a glob that matches nothing is passed through as itself, and
+          # `gh` would then be asked to upload a file that does not exist.
+          files=()
+          for f in dist/*.zip dist/*.tar.gz dist/*.exe dist/SHA256SUMS.txt; do
+            if [ -e "$f" ]; then files+=("$f"); fi
+          done
+          ls -l "${files[@]}"
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
-            dist/*
+            "${files[@]}"
           # `--generate-notes` and `--notes-file` cannot be combined in one call, so the
           # generated notes are fetched back and the install section is appended to them.
           gh release view "$TAG" --json body --jq .body > body.md
