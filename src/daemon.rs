@@ -1385,7 +1385,12 @@ mod tests {
 
         // An absolute path is honoured as given: that is how the browser extension's
         // "output folder" setting arrives.
-        let abs = std::path::PathBuf::from("/tmp/somewhere/movie.mkv");
+        //
+        // `temp_dir()` rather than a hard-coded `/tmp/...`: on Windows a leading slash
+        // is not an absolute path — it is a path rooted on the current drive — so
+        // `Path::is_absolute()` says no, and the code would (correctly, by its own rule)
+        // treat the name as relative to the download directory.
+        let abs = std::env::temp_dir().join("somewhere").join("movie.mkv");
         let v = serde_json::json!({ "url": "https://h/a.bin", "output": abs.to_string_lossy() });
         let m = message_from_json(v["url"].as_str().unwrap(), &v);
         let job = job_from_message(&cfg, &m).unwrap();
@@ -1505,9 +1510,12 @@ mod tests {
     #[test]
     fn add_message_becomes_a_job() {
         let cfg = Config::default();
+        // An absolute path, on every platform: see the note in
+        // `a_relative_output_lands_in_the_download_directory`.
+        let abs = std::env::temp_dir().join("movie.mp4");
         let m = Message::new(1, msg::ADD)
             .with("url", "https://host/movie.mp4")
-            .with("output", "/tmp/movie.mp4")
+            .with("output", abs.to_string_lossy().to_string())
             .with("cookie", "session=abc")
             .with("referer", "https://host/page")
             .with("user_agent", "TestAgent/1")
@@ -1515,7 +1523,7 @@ mod tests {
             .with("auth", "bob:hunter2");
         let job = job_from_message(&cfg, &m).unwrap();
         assert_eq!(job.url, "https://host/movie.mp4");
-        assert_eq!(job.output, std::path::PathBuf::from("/tmp/movie.mp4"));
+        assert_eq!(job.output, abs);
         assert!(!job.output_provisional);
         assert_eq!(job.connections, 4);
         assert_eq!(job.ctx.cookie.as_deref(), Some("session=abc"));
@@ -1585,9 +1593,12 @@ mod tests {
 
     #[test]
     fn http_api_json_maps_to_a_message() {
+        // An absolute path, on every platform: see the note in
+        // `a_relative_output_lands_in_the_download_directory`.
+        let abs = std::env::temp_dir().join("f");
         let v = serde_json::json!({
             "url": "https://h/f",
-            "output": "/tmp/f",
+            "output": abs.to_string_lossy().to_string(),
             "connections": 16,
             "cookie": "a=b",
             "proxy": "socks5://127.0.0.1:9150"
@@ -1599,7 +1610,7 @@ mod tests {
         assert_eq!(job.ctx.cookie.as_deref(), Some("a=b"));
         assert_eq!(job.ctx.proxy.as_deref(), Some("socks5://127.0.0.1:9150"));
         // Numbers arriving as JSON numbers must still work.
-        assert_eq!(job.output, std::path::PathBuf::from("/tmp/f"));
+        assert_eq!(job.output, abs);
     }
 
     #[test]

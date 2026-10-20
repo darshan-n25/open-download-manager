@@ -259,6 +259,12 @@ jobs:
       - name: Run the static binary with nothing but itself in the filesystem
         run: ./scripts/check-headless.sh
 
+      # And again without the chroot. GitHub's runners refuse `unshare -r`, so the
+      # script takes its fallback branch there — and a fallback nobody runs is a
+      # fallback that rots. This job runs both.
+      - name: Run it again without user namespaces
+        run: IMAGE=direct ./scripts/check-headless.sh
+
   # Compiles the platform module for all seven targets from one host. It is a step in its
   # own right because it needs no toolchain at all — just `rustup target add` — so it is
   # the check that works on the machine you are sitting at.

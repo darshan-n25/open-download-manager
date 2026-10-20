@@ -40,10 +40,61 @@ for tool in ldd cmp curl python3; do
   command -v "$tool" >/dev/null || fail "$tool is needed"
 done
 
+# A free port, and a way to ask whether one is free.
+#
+# The script used to insist on fixed ports and fail if something was already listening.
+# That is worse than it sounds: a leftover origin from an earlier run — or from another
+# project on the same machine — is still an HTTP server, and the script would quietly
+# download *its* payload and compare the bytes. Choosing a free port every time means
+# the script only ever talks to the servers it started itself.
+port_is_free() {
+  python3 - "$1" <<'PYEOF'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PYEOF
+}
+
+free_port() {
+  python3 - <<'PYEOF'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PYEOF
+}
+
+pick_port() {
+  if port_is_free "$1"; then
+    echo "$1"
+  else
+    port=$(free_port)
+    echo "note: port $1 was busy; using $port instead" >&2
+    echo "$port"
+  fi
+}
+
+PORT_ORIGIN=$(pick_port "$PORT_ORIGIN")
+PORT_SLOW=$(pick_port "$PORT_SLOW")
+PORT_DAEMON=$(pick_port "$PORT_DAEMON")
+
 # --- can we use a real chroot? ---------------------------------------------
-IMAGE=_direct
-if unshare -r true 2>/dev/null; then
-  IMAGE=chroot
+# `auto` is the normal answer: use a chroot when the kernel lets an unprivileged user
+# namespace map itself to root, and fall back to an empty environment when it does
+# not. The fallback is not a theory — GitHub's own runners are a case where
+# `unshare -r` is refused, so both branches have to work and both are exercised.
+IMAGE=${IMAGE:-auto}
+if [ "$IMAGE" = auto ]; then
+  IMAGE=_direct
+  if unshare -r true 2>/dev/null; then
+    IMAGE=chroot
+  fi
 fi
 if [ "$IMAGE" = chroot ]; then
   echo "note: checking inside a chroot with unprivileged user namespaces"
@@ -59,7 +110,12 @@ in_image() {
   if [ "$IMAGE" = chroot ]; then
     env -i HOME=/data PATH="$PATH" unshare -r chroot "$ROOT" "$@"
   else
-    env -i HOME="$ROOT/data" PATH="$PATH" "$@"
+    # Without a chroot there is no `/usr/local/bin` to look in: the program is the copy
+    # inside the fake root, under the fake root's own prefix, and HOME points inside it
+    # too. Running `/usr/local/bin/odm-cli` here would be running whatever the *host*
+    # has at that path — which is nothing, and is why this branch used to fail with
+    # "No such file or directory" on the machines that need it.
+    env -i HOME="$ROOT/data" PATH="$PATH" "$ROOT$1" "${@:2}"
   fi
 }
 
@@ -70,7 +126,7 @@ in_image_exec() {
   if [ "$IMAGE" = chroot ]; then
     exec env -i HOME=/data PATH="$PATH" unshare -r chroot "$ROOT" "$@"
   else
-    exec env -i HOME="$ROOT/data" PATH="$PATH" "$@"
+    exec env -i HOME="$ROOT/data" PATH="$PATH" "$ROOT$1" "${@:2}"
   fi
 }
 
