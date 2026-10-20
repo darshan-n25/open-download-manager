@@ -228,7 +228,17 @@ pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
     let id = crate::util::gen_id();
     let explicit = m.get("output").map(std::path::PathBuf::from);
     let provisional = explicit.is_none();
-    let output = explicit.unwrap_or_else(|| cfg.download_dir.join(format!("{id}.download")));
+    // A relative output is a *name*, not a path: the daemon's working directory is
+    // whatever the service manager gave it — on Windows, often a UNC path that cannot
+    // be written to at all — so a bare "movie.mkv" lands in the download directory
+    // instead of somewhere the user never asked for. An absolute path is honoured
+    // as given, because that is how the browser extension's "output folder" setting
+    // arrives.
+    let output = match explicit {
+        Some(p) if p.is_absolute() => p,
+        Some(p) => cfg.download_dir.join(p),
+        None => cfg.download_dir.join(format!("{id}.download")),
+    };
 
     let mut job = Job::new(id, url, output, kind);
     job.output_provisional = provisional;
@@ -702,7 +712,31 @@ async fn handle_http(
         }
         ("GET", "/api/jobs") => {
             let jobs = sched.store.list().unwrap_or_default();
-            let json = serde_json::to_vec_pretty(&jobs).unwrap_or_else(|_| b"[]".to_vec());
+            // The live progress is not in the stored job — a byte count and a rate belong
+            // to *now*, and the stored job is only rewritten when the download ends — so
+            // it is merged in here, for the clients that show a "Size", "Transfer rate"
+            // or "Time left" column.
+            let view: Vec<serde_json::Value> = jobs
+                .iter()
+                .map(|j| {
+                    let mut v = serde_json::to_value(j).unwrap_or_default();
+                    let live = sched.live(&j.id);
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert(
+                            "speed_bps".into(),
+                            serde_json::json!(live.map(|l| l.speed_bps).unwrap_or(0.0)),
+                        );
+                        if let Some(l) = live {
+                            obj.insert("downloaded".into(), serde_json::json!(l.downloaded));
+                            if l.total.is_some() {
+                                obj.insert("total".into(), serde_json::json!(l.total));
+                            }
+                        }
+                    }
+                    v
+                })
+                .collect();
+            let json = serde_json::to_vec_pretty(&view).unwrap_or_else(|_| b"[]".to_vec());
             write_response(stream, 200, "OK", "application/json", &json).await
         }
         ("GET", p) if p.starts_with("/api/jobs/") => {
@@ -716,6 +750,118 @@ async fn handle_http(
                     write_response(stream, 404, "Not Found", "text/plain", b"no such job").await
                 }
             }
+        }
+        // Job actions, so a GUI (or the browser extension) can do what the CLI does
+        // without shelling out: pause, resume, remove.
+        ("POST", p) if p.starts_with("/api/jobs/") => {
+            let rest = p.trim_start_matches("/api/jobs/");
+            let Some((id, action)) = rest.rsplit_once('/') else {
+                return write_response(
+                    stream,
+                    400,
+                    "Bad Request",
+                    "text/plain",
+                    b"expected /api/jobs/<id>/<pause|resume|remove>",
+                )
+                .await;
+            };
+            match action {
+                "remove" => match sched.store.delete(id) {
+                    Ok(()) => write_response(stream, 200, "OK", "text/plain", b"removed").await,
+                    Err(e) => {
+                        write_response(
+                            stream,
+                            400,
+                            "Bad Request",
+                            "text/plain",
+                            e.to_string().as_bytes(),
+                        )
+                        .await
+                    }
+                },
+                "pause" | "resume" => {
+                    let Ok(mut job) = sched.store.load(id) else {
+                        return write_response(
+                            stream,
+                            404,
+                            "Not Found",
+                            "text/plain",
+                            b"no such job",
+                        )
+                        .await;
+                    };
+                    if job.state.is_terminal() && action == "pause" {
+                        return write_response(
+                            stream,
+                            400,
+                            "Bad Request",
+                            "text/plain",
+                            b"job is already finished",
+                        )
+                        .await;
+                    }
+                    job.state = if action == "pause" {
+                        crate::job::JobState::Paused
+                    } else {
+                        crate::job::JobState::Queued
+                    };
+                    job.touch();
+                    match sched.store.save(&job) {
+                        Ok(()) => {
+                            write_response(stream, 200, "OK", "text/plain", action.as_bytes()).await
+                        }
+                        Err(e) => {
+                            write_response(
+                                stream,
+                                500,
+                                "Internal Server Error",
+                                "text/plain",
+                                e.to_string().as_bytes(),
+                            )
+                            .await
+                        }
+                    }
+                }
+                _ => {
+                    write_response(stream, 404, "Not Found", "text/plain", b"unknown action").await
+                }
+            }
+        }
+        // Queue control: start the pending queue, or stop the running one.
+        //
+        // "Stop queue" pauses what is in flight rather than cancelling it: the engine's
+        // cancel handle belongs to the running job, and the honest way to stop a download
+        // without losing its partial is to let it reach a chunk boundary and record
+        // `Paused`. That is what the CLI's `riptide pause` does for one job, applied to
+        // all of them.
+        ("POST", "/api/queue/start") => {
+            let this = sched.clone();
+            tokio::spawn(async move {
+                let _ = this.run_queue().await;
+            });
+            write_response(stream, 202, "Accepted", "text/plain", b"queue started").await
+        }
+        ("POST", "/api/queue/stop") => {
+            let mut stopped = 0usize;
+            for job in sched.store.list().unwrap_or_default() {
+                if job.state.is_terminal() {
+                    continue;
+                }
+                let mut job = job;
+                job.state = crate::job::JobState::Paused;
+                job.touch();
+                if sched.store.save(&job).is_ok() {
+                    stopped += 1;
+                }
+            }
+            write_response(
+                stream,
+                200,
+                "OK",
+                "text/plain",
+                format!("paused {stopped} job(s)").as_bytes(),
+            )
+            .await
         }
         ("GET", "/api/projects") => {
             let projects = sched.projects.list().unwrap_or_default();
@@ -812,9 +958,20 @@ async fn handle_http(
                 Ok(job) => {
                     let id = job.id.clone();
                     let this = sched.clone();
-                    let handle = this.spawn(job);
+                    // Record the live rate as it comes, so a client polling the job list
+                    // sees a moving "Transfer rate" rather than a stale zero.
+                    let speed_sched = sched.clone();
+                    let speed_id = id.clone();
+                    let progress: crate::engine::ProgressFn =
+                        Arc::new(move |sample: crate::engine::ProgressSample| {
+                            speed_sched.set_live(&speed_id, sample);
+                        });
+                    let handle = this.spawn_with(job, Some(progress));
+                    let cleanup = sched.clone();
+                    let cleanup_id = id.clone();
                     tokio::spawn(async move {
                         let _ = handle.await;
+                        cleanup.clear_live(&cleanup_id);
                     });
                     let body =
                         serde_json::to_vec(&serde_json::json!({ "id": id, "status": "queued" }))
@@ -1213,6 +1370,32 @@ mod tests {
         let bad = serde_json::json!({ "url": "https://h/a.bin", "checksum": "not-a-digest" });
         let m = message_from_json(bad["url"].as_str().unwrap(), &bad);
         assert!(job_from_message(&cfg, &m).is_err());
+    }
+
+    #[test]
+    fn a_relative_output_lands_in_the_download_directory() {
+        let cfg = crate::config::Config::default();
+        // A bare name is a *name*, not a path: the daemon's working directory is
+        // whatever the service manager gave it, and on Windows that is often a UNC
+        // path, which cannot be written to at all.
+        let v = serde_json::json!({ "url": "https://h/a.bin", "output": "movie.mkv" });
+        let m = message_from_json(v["url"].as_str().unwrap(), &v);
+        let job = job_from_message(&cfg, &m).unwrap();
+        assert_eq!(job.output, cfg.download_dir.join("movie.mkv"));
+
+        // An absolute path is honoured as given: that is how the browser extension's
+        // "output folder" setting arrives.
+        let abs = std::path::PathBuf::from("/tmp/somewhere/movie.mkv");
+        let v = serde_json::json!({ "url": "https://h/a.bin", "output": abs.to_string_lossy() });
+        let m = message_from_json(v["url"].as_str().unwrap(), &v);
+        let job = job_from_message(&cfg, &m).unwrap();
+        assert_eq!(job.output, abs);
+
+        // And with no output at all, the id-named placeholder in the download directory.
+        let v = serde_json::json!({ "url": "https://h/a.bin" });
+        let m = message_from_json(v["url"].as_str().unwrap(), &v);
+        let job = job_from_message(&cfg, &m).unwrap();
+        assert!(job.output.starts_with(&cfg.download_dir));
     }
 
     #[test]

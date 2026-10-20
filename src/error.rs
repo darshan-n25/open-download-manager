@@ -1,11 +1,15 @@
+use std::error::Error as _;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RiptideError {
-    /// Boxed: `reqwest::Error` is over 100 bytes, and it appears in `Result` in the
-    /// innermost loops of the engine, so boxing it keeps every `Result` small.
+    /// An HTTP-level failure.
+    ///
+    /// The message carries the whole cause chain, not `reqwest`'s summary: "builder
+    /// error" on its own says nothing about *which* builder failed and why, and this
+    /// error is what a user sees when a download does not start.
     #[error("http error: {0}")]
-    Http(Box<reqwest::Error>),
+    Http(String),
 
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
@@ -72,8 +76,24 @@ impl RiptideError {
 
 impl From<reqwest::Error> for RiptideError {
     fn from(e: reqwest::Error) -> Self {
-        RiptideError::Http(Box::new(e))
+        RiptideError::Http(http_cause_chain(&e))
     }
+}
+
+/// The causes behind a `reqwest` error, as one readable string.
+///
+/// `reqwest`'s own message is a summary ("builder error", "error sending request"); the
+/// reason is in the source chain, and a download manager that only says "builder error"
+/// has told the user nothing.
+fn http_cause_chain(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(cause) = src {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        src = cause.source();
+    }
+    out
 }
 
 pub type Result<T> = std::result::Result<T, RiptideError>;

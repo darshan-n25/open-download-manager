@@ -261,6 +261,72 @@ async fn the_http_api_creates_and_lists_jobs() {
 }
 
 #[tokio::test]
+async fn a_job_can_be_paused_resumed_and_removed_over_http() {
+    let d = start_daemon().await;
+
+    let out_dir = tempfile::tempdir().unwrap();
+    let output = out_dir.path().join("actions.bin");
+    let payload = serde_json::json!({
+        "url": "http://127.0.0.1:9/actions.bin",
+        "output": output.to_string_lossy(),
+    });
+    let (status, body) = http_post(d.addr, "/api/jobs", &payload.to_string()).await;
+    assert_eq!(status, 201, "body: {body}");
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // Pause: the job is recorded as `paused`, which is what makes it resumable.
+    let (status, _) = http_post(d.addr, &format!("/api/jobs/{id}/pause"), "{}").await;
+    assert_eq!(status, 200);
+    let job: serde_json::Value =
+        serde_json::from_str(&http_get(d.addr, &format!("/api/jobs/{id}")).await).unwrap();
+    assert_eq!(job["state"], "paused");
+
+    // Resume: back to `queued`, so `riptide queue` will pick it up.
+    let (status, _) = http_post(d.addr, &format!("/api/jobs/{id}/resume"), "{}").await;
+    assert_eq!(status, 200);
+    let job: serde_json::Value =
+        serde_json::from_str(&http_get(d.addr, &format!("/api/jobs/{id}")).await).unwrap();
+    assert_eq!(job["state"], "queued");
+
+    // Remove: gone from the queue entirely.
+    let (status, _) = http_post(d.addr, &format!("/api/jobs/{id}/remove"), "{}").await;
+    assert_eq!(status, 200);
+    let (status, _) = http_get_raw(d.addr, &format!("/api/jobs/{id}")).await;
+    assert_eq!(status, 404);
+
+    // An unknown action is a 404, and an unknown job is a 404 too.
+    let (status, _) = http_post(d.addr, &format!("/api/jobs/{id}/explode"), "{}").await;
+    assert_eq!(status, 404);
+    let (status, _) = http_post(d.addr, "/api/jobs/nosuchjob/pause", "{}").await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn the_queue_can_be_started_and_stopped_over_http() {
+    let d = start_daemon().await;
+
+    let (status, body) = http_post(d.addr, "/api/queue/start", "{}").await;
+    assert_eq!(status, 202, "body: {body}");
+
+    let (status, body) = http_post(d.addr, "/api/queue/stop", "{}").await;
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("paused"), "body: {body}");
+}
+
+#[tokio::test]
+async fn the_job_list_carries_a_live_transfer_rate() {
+    let d = start_daemon().await;
+    // Every job reports a speed, even a stopped one: the column has to have a number in
+    // it rather than nothing, or the client has to guess what a missing field means.
+    let body = http_get(d.addr, "/api/jobs").await;
+    let jobs: serde_json::Value = serde_json::from_str(&body).unwrap();
+    for job in jobs.as_array().unwrap() {
+        assert!(job.get("speed_bps").is_some(), "no speed_bps in {job}");
+    }
+}
+
+#[tokio::test]
 async fn the_download_quota_is_reported_over_every_surface() {
     // 300 MB per 10 minutes: a value that cannot be confused with a default.
     let d = start_daemon_with(|cfg| {

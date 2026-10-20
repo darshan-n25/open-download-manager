@@ -47,6 +47,14 @@ pub struct Scheduler {
     /// does not hold their handles.
     running: Arc<AtomicUsize>,
     idle: Arc<Notify>,
+    /// Live progress, keyed by job id.
+    ///
+    /// A rate and a byte count are properties of *now*, not of the file: the stored job
+    /// cannot hold them, because a download that was fast a minute ago may be stalled now,
+    /// and the stored job is only rewritten when the download ends. The engine reports
+    /// progress through its callback and the API reads it from here, so a GUI can show a
+    /// live "Size", "Transfer rate" and "Time left".
+    live: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::engine::ProgressSample>>>,
 }
 
 /// Counts one unit of work for as long as it lives, however it ends.
@@ -80,7 +88,27 @@ impl Scheduler {
             shutdown: None,
             running: Arc::new(AtomicUsize::new(0)),
             idle: Arc::new(Notify::new()),
+            live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    /// Record a job's current progress.
+    pub fn set_live(&self, id: &str, sample: crate::engine::ProgressSample) {
+        if let Ok(mut map) = self.live.lock() {
+            map.insert(id.to_string(), sample);
+        }
+    }
+
+    /// Forget a job's live progress — it has finished, so the numbers would be a lie.
+    pub fn clear_live(&self, id: &str) {
+        if let Ok(mut map) = self.live.lock() {
+            map.remove(id);
+        }
+    }
+
+    /// A job's live progress, if it is running.
+    pub fn live(&self, id: &str) -> Option<crate::engine::ProgressSample> {
+        self.live.lock().ok().and_then(|m| m.get(id).copied())
     }
 
     /// Install a flag that, when raised, cancels every running job.
@@ -276,6 +304,7 @@ impl Scheduler {
             shutdown: self.shutdown.clone(),
             running: self.running.clone(),
             idle: self.idle.clone(),
+            live: self.live.clone(),
         }
     }
 
