@@ -864,81 +864,183 @@ fn message_from_json(url: &str, v: &serde_json::Value) -> Message {
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>Riptide</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Riptide</title>
 <style>
- body{font:14px/1.5 system-ui,sans-serif;margin:2rem auto;max-width:52rem;padding:0 1rem;color:#111}
- h1{font-size:1.4rem} code{background:#f4f4f5;padding:.1rem .3rem;border-radius:3px}
- input,button{font:inherit;padding:.4rem .6rem}
- li{margin:.25rem 0}
- .muted{color:#666}
+:root{--bg:#0f172a;--panel:#1e293b;--panel2:#334155;--text:#e2e8f0;--muted:#94a3b8;--accent:#3b82f6;--accent2:#22c55e;--danger:#ef4444;--warn:#f59e0b;--border:#334155}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:14px/1.5 'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+header{background:var(--panel);padding:.9rem 1.5rem;display:flex;align-items:center;gap:1rem;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10}
+header h1{font-size:1.15rem;margin:0;font-weight:700;letter-spacing:.5px}
+header .sub{color:var(--muted);font-size:.8rem}
+main{max-width:80rem;margin:1.2rem auto;padding:0 1.2rem}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:1.1rem;margin-bottom:1rem}
+h2{font-size:.95rem;margin:0 0 .7rem;color:var(--text);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+input,select{font:inherit;padding:.5rem .7rem;border:1px solid var(--border);border-radius:8px;background:var(--panel2);color:var(--text);flex:1;min-width:12rem}
+button{font:inherit;padding:.5rem .9rem;border:0;border-radius:8px;cursor:pointer;background:var(--accent);color:#fff;font-weight:600;transition:opacity .15s}
+button:hover{opacity:.9} button:disabled{opacity:.4;cursor:default}
+button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+button.danger{background:var(--danger)}
+table{width:100%;border-collapse:collapse;font-size:.88rem}
+th,td{padding:.55rem .6rem;text-align:left;border-bottom:1px solid var(--border);vertical-align:middle}
+th{color:var(--muted);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em}
+tr:hover td{background:rgba(255,255,255,.02)}
+.bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;width:100%;min-width:6rem}
+.bar>div{height:100%;background:linear-gradient(90deg,var(--accent),#60a5fa);transition:width .4s}
+.state{display:inline-block;padding:.15rem .5rem;border-radius:999px;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.state.done{background:rgba(34,197,94,.15);color:#4ade80}
+.state.paused{background:rgba(245,158,11,.15);color:#fbbf24}
+.state.active{background:rgba(59,130,246,.15);color:#60a5fa}
+.state.failed{background:rgba(239,68,68,.15);color:#f87171}
+.state.queued{background:rgba(148,163,184,.15);color:#cbd5e1}
+.muted{color:var(--muted);font-size:.82rem}
+.mono{font-family:ui-monospace,monospace;font-size:.78rem}
+.kv{display:flex;justify-content:space-between;padding:.3rem 0;border-bottom:1px solid var(--border)}
+.kv:last-child{border:0}
+.kv b{color:var(--muted);font-weight:500}
+.grid{display:grid;grid-template-columns:2fr 1fr;gap:1rem}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+ul{list-style:none} li{padding:.4rem 0;border-bottom:1px solid var(--border)}
+li:last-child{border:0}
+.toast{position:fixed;bottom:1rem;right:1rem;background:var(--panel);border:1px solid var(--border);padding:.6rem 1rem;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.3);font-size:.85rem;opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:1}
+.empty{text-align:center;padding:2rem;color:var(--muted)}
 </style></head>
 <body>
-<h1>Riptide</h1>
-<p class="muted">Local download daemon. The browser extension speaks the
-<code>MSG#</code> protocol over the <code>plugin.v3.internetdownloadmanager.com</code>
-WebSocket subprotocol on this port. This page is the plain-HTTP control surface.</p>
+<header><h1>⚡ Riptide</h1><span class="sub">download daemon · 127.0.0.1:1001</span>
+ <div style="margin-left:auto" class="row">
+  <span id="status" class="muted">● connecting…</span>
+ </div></header>
+<main>
+<div class="card">
+ <h2>Add a download</h2>
+ <div class="row">
+  <input id="url" placeholder="https://host/file.iso">
+  <button onclick="add()">Queue download</button>
+ </div>
+ <p id="addout" class="muted mono" style="margin-top:.5rem;min-height:1.2rem"></p>
+</div>
 
-<h2>Add a download</h2>
-<p><input id="url" size="60" placeholder="https://host/file.iso">
-<button onclick="add()">Queue</button></p>
-<pre id="out"></pre>
+<div class="card">
+ <h2>Jobs</h2>
+ <p id="quota" class="muted"></p>
+ <table><thead><tr><th>File / URL</th><th>State</th><th>Progress</th><th>Downloaded</th><th>Speed</th><th></th></tr></thead>
+ <tbody id="jobs"></tbody></table>
+ <p id="jobsempty" class="empty" style="display:none">No jobs yet. Queue one above.</p>
+</div>
 
-<h2>Jobs</h2>
-<p id="quota" class="muted"></p>
-<ul id="jobs"></ul>
-
-<h2>Projects</h2>
-<p class="muted">Recurring work: a file kept in sync with a URL, a site re-crawled on a
-schedule, or an offline mirror of a site and everything it needs to render. Created with
-<code>riptide project add</code>; the daemon runs them when due.</p>
-<ul id="projects"></ul>
+<div class="grid">
+ <div class="card">
+  <h2>Projects</h2>
+  <ul id="projects"></ul>
+  <p class="muted" style="margin-top:.6rem;font-size:.78rem">Created with <code style="background:var(--panel2);padding:.1rem .3rem;border-radius:3px">riptide project add</code>. The daemon runs them when due.</p>
+ </div>
+ <div class="card">
+  <h2>System</h2>
+  <div id="sys"></div>
+  <div class="row" style="margin-top:.8rem">
+   <button class="ghost" onclick="refresh()">Refresh now</button>
+  </div>
+ </div>
+</div>
+</main>
+<div id="toast" class="toast"></div>
 
 <script>
+let jobsCache=[];
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),2500);}
 async function add(){
   const url=document.getElementById('url').value.trim();
   if(!url) return;
-  const r=await fetch('/api/jobs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});
-  document.getElementById('out').textContent=await r.text();
+  try{
+    const r=await fetch('/api/jobs',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url})});
+    const txt=await r.text();
+    document.getElementById('addout').textContent=txt;
+    if(r.ok){toast('Queued');document.getElementById('url').value='';}
+    else toast('Failed: '+txt);
+  }catch(e){toast('Error: '+e);}
+  refresh();
+}
+async function act(id,what){
+  if(what==='remove' && !confirm('Remove this job?')) return;
+  try{
+    const r=await fetch(`/api/jobs/${id}/${what}`,{method:'POST'});
+    if(!r.ok) toast(await r.text());
+    else toast(what==='remove'?'Removed':what==='pause'?'Paused':'Resumed');
+  }catch(e){toast('Error: '+e);}
+  refresh();
+}
+async function runProject(name){
+  try{
+    const r=await fetch(`/api/projects/${encodeURIComponent(name)}/run`,{method:'POST'});
+    const t=await r.text();
+    document.getElementById('addout').textContent=t;
+    toast(r.ok?'Project started':'Failed');
+  }catch(e){toast('Error: '+e);}
   refresh();
 }
 async function refresh(){
-  const jobs=await (await fetch('/api/jobs')).json();
-  document.getElementById('jobs').innerHTML=jobs.map(j=>{
-    const p=j.total?Math.round(j.downloaded/j.total*100):0;
-    // Either separator: the daemon may be running on Windows, where a `PathBuf` serialises
-    // with backslashes, and this is a browser's idea of a path, not Rust's.
-    const base=j.output.split(/[\\/]/).pop();
-    return `<li><b>${base}</b> — ${j.state}
-      ${j.total?`(${p}% of ${j.total})`:''}<br><span class="muted">${j.url}</span></li>`;
-  }).join('');
-  const q=await (await fetch('/api/quota')).json();
-  document.getElementById('quota').textContent = q.limit
-    ? `Download quota: ${fmtBytes(q.used)} of ${fmtBytes(q.limit)} used this window`+
-      (q.resets_in_secs!=null?`, refills in ${q.resets_in_secs}s`:'')+'.'
-    : 'No download quota set.';
+  try{
+    const jobs=await (await fetch('/api/jobs')).json();
+    jobsCache=jobs;
+    const tb=document.getElementById('jobs');
+    if(!jobs.length){tb.innerHTML='';document.getElementById('jobsempty').style.display='block';}
+    else{
+      document.getElementById('jobsempty').style.display='none';
+      tb.innerHTML=jobs.map(j=>{
+        const p=j.total?Math.round(j.downloaded/j.total*100):0;
+        const base=j.output.split(/[\\/]/).pop();
+        const speed=j.speed_bps?fmtBytes(j.speed_bps)+'/s':'—';
+        const size=j.total?fmtBytes(j.total):'—';
+        const done=j.downloaded?fmtBytes(j.downloaded):'0 B';
+        let actions='';
+        if(j.state==='paused') actions=`<button onclick="act('${j.id}','resume')">Resume</button>`;
+        else if(j.state==='active') actions=`<button class="ghost" onclick="act('${j.id}','pause')">Pause</button>`;
+        if(j.state!=='done') actions+=` <button class="danger" onclick="act('${j.id}','remove')">✕</button>`;
+        return `<tr>
+          <td><div style="font-weight:600">${escape(base)}</div><div class="muted mono" style="font-size:.72rem;margin-top:.15rem;word-break:break-all">${escape(j.url)}</div></td>
+          <td><span class="state ${j.state}">${j.state}</span></td>
+          <td><div class="bar"><div style="width:${p}%"></div></div><div class="muted" style="font-size:.72rem;margin-top:.2rem">${p}%</div></td>
+          <td class="mono">${done} / ${size}</td>
+          <td class="mono">${speed}</td>
+          <td>${actions}</td></tr>`;
+      }).join('');
+    }
+    const q=await (await fetch('/api/quota')).json();
+    document.getElementById('quota').textContent = q.limit
+      ? `Quota: ${fmtBytes(q.used)} / ${fmtBytes(q.limit)} this window`+(q.resets_in_secs!=null?`, refills in ${q.resets_in_secs}s`:'')+'.'
+      : 'No download quota set.';
 
-  const projects=await (await fetch('/api/projects')).json();
-  document.getElementById('projects').innerHTML = projects.length ? projects.map(pr=>
-    `<li><b>${pr.name}</b> — ${pr.kind}${pr.archive?' (archive)':''}, next ${pr.next_run_in}
-      ${pr.enabled?'':'<span class="muted">(disabled)</span>'}
-      <button onclick="runProject('${pr.name}')">Run now</button><br>
-      <span class="muted">${pr.output} · last ${pr.last_run}${pr.last_found!=null?` · ${pr.last_found} file(s)`:''}</span></li>`
-  ).join('') : '<li class="muted">No projects.</li>';
-}
-async function runProject(name){
-  const r=await fetch(`/api/projects/${encodeURIComponent(name)}/run`,{method:'POST'});
-  document.getElementById('out').textContent=await r.text();
-  refresh();
+    const projects=await (await fetch('/api/projects')).json();
+    document.getElementById('projects').innerHTML = projects.length ? projects.map(pr=>
+      `<li><div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem">
+        <div><b>${escape(pr.name)}</b> <span class="muted">— ${pr.kind}${pr.archive?' (archive)':''}</span><br>
+        <span class="muted" style="font-size:.78rem">${escape(pr.output)} · next in ${pr.next_run_in} · last ${pr.last_run}${pr.last_found!=null?` · ${pr.last_found} files`:''}</span></div>
+        <button class="ghost" onclick="runProject('${pr.name}')">Run now</button></div></li>`
+    ).join('') : '<li class="muted">No projects. Add one with <code style="background:var(--panel2);padding:.1rem .3rem;border-radius:3px">riptide project add</code>.</li>';
+
+    document.getElementById('sys').innerHTML = `
+      <div class="kv"><b>Status</b><span style="color:#4ade80">● online</span></div>
+      <div class="kv"><b>Jobs</b><span>${jobs.length}</span></div>
+      <div class="kv"><b>Projects</b><span>${projects.length}</span></div>
+      <div class="kv"><b>Updated</b><span>${new Date().toLocaleTimeString()}</span></div>`;
+    document.getElementById('status').textContent='● online';
+    document.getElementById('status').style.color='#4ade80';
+  }catch(e){
+    document.getElementById('status').textContent='● offline';
+    document.getElementById('status').style.color='#f87171';
+    document.getElementById('sys').innerHTML=`<div class="muted">Error: ${escape(e.message||e)}</div>`;
+  }
 }
 function fmtBytes(n){
   const u=['B','KB','MB','GB','TB'];let i=0;
   while(n>=1024&&i<u.length-1){n/=1024;i++;}
   return (i?n.toFixed(2):n)+' '+u[i];
 }
-refresh();setInterval(refresh,1000);
+function escape(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+refresh();setInterval(refresh,2000);
 </script>
-</body></html>
-"#;
+</body></html>"#;
 
 async fn handle_conn(
     mut stream: TcpStream,
