@@ -11,12 +11,13 @@
 use eframe::egui;
 use egui_lucide::Lucide;
 use riptide::config::Config;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// The base URL of the in-process daemon, filled in once it has bound.
 static DAEMON_ADDR: OnceLock<String> = OnceLock::new();
-
 
 // ---------------------------------------------------------------------------
 // Data from the daemon
@@ -77,7 +78,7 @@ struct Project {
 fn daemon_base() -> String {
     DAEMON_ADDR
         .get()
-        .map(|s| s.clone())
+        .cloned()
         .unwrap_or_else(|| "http://127.0.0.1:1001".to_string())
 }
 
@@ -167,7 +168,7 @@ impl Category {
 }
 
 fn ext_of(j: &Job) -> String {
-    let name = j.output.rsplit(|c| c == '/' || c == '\\').next().unwrap_or("");
+    let name = j.output.rsplit(['/', '\\']).next().unwrap_or("");
     match name.rfind('.') {
         Some(i) => name[i + 1..].to_ascii_lowercase(),
         None => String::new(),
@@ -176,24 +177,34 @@ fn ext_of(j: &Job) -> String {
 
 fn is_doc(j: &Job) -> bool {
     let e = ext_of(j);
-    ["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "rtf", "odt", "epub"]
-        .contains(&e.as_str())
+    [
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md", "rtf", "odt", "epub",
+    ]
+    .contains(&e.as_str())
 }
 
 fn is_archive(j: &Job) -> bool {
     let e = ext_of(j);
-    ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "cab"].contains(&e.as_str())
+    [
+        "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "cab",
+    ]
+    .contains(&e.as_str())
 }
 
 fn is_audio(j: &Job) -> bool {
     let e = ext_of(j);
-    ["mp3", "flac", "wav", "aac", "ogg", "m4a", "wma", "opus", "aiff"].contains(&e.as_str())
+    [
+        "mp3", "flac", "wav", "aac", "ogg", "m4a", "wma", "opus", "aiff",
+    ]
+    .contains(&e.as_str())
 }
 
 fn is_video(j: &Job) -> bool {
     let e = ext_of(j);
-    ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "m3u8"]
-        .contains(&e.as_str())
+    [
+        "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts", "m3u8",
+    ]
+    .contains(&e.as_str())
 }
 
 fn is_program(j: &Job) -> bool {
@@ -223,7 +234,10 @@ struct SortState {
 
 impl Default for SortState {
     fn default() -> Self {
-        SortState { by: SortBy::Name, asc: true }
+        SortState {
+            by: SortBy::Name,
+            asc: true,
+        }
     }
 }
 
@@ -232,6 +246,22 @@ enum Tab {
     #[default]
     Downloads,
     Projects,
+    Torrents,
+}
+
+/// One torrent download, shared between the UI and the worker thread that runs it.
+#[derive(Clone)]
+struct TorrentJob {
+    name: String,
+    info_hash: String,
+    output: PathBuf,
+    total: u64,
+    downloaded: u64,
+    speed_bps: f64,
+    /// "connecting", "downloading", "done", "failed" or "cancelled".
+    state: String,
+    error: Option<String>,
+    cancel: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -258,9 +288,13 @@ struct App {
     add_connections: Option<usize>,
     add_output: String,
     add_quality: String,
+    /// The path of a torrent to add, for the times a file cannot be dragged.
+    add_torrent_path: String,
     search: String,
     /// The daemon's configured number of connections, shown in the Add URL dialog.
     default_connections: usize,
+    /// The torrent downloads, shared with the worker threads that run them.
+    torrents: Arc<std::sync::Mutex<Vec<TorrentJob>>>,
 }
 
 impl App {
@@ -307,7 +341,10 @@ impl App {
             .collect();
         v.sort_by(|a, b| {
             let ord = match self.sort.by {
-                SortBy::Name => a.output.to_ascii_lowercase().cmp(&b.output.to_ascii_lowercase()),
+                SortBy::Name => a
+                    .output
+                    .to_ascii_lowercase()
+                    .cmp(&b.output.to_ascii_lowercase()),
                 SortBy::Size => a.total.unwrap_or(0).cmp(&b.total.unwrap_or(0)),
                 SortBy::Status => a.state.cmp(&b.state),
                 SortBy::Eta => eta_secs(a).cmp(&eta_secs(b)),
@@ -487,11 +524,10 @@ impl eframe::App for App {
 
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            match self.tab {
-                Tab::Downloads => self.downloads(ui),
-                Tab::Projects => self.projects_tab(ui),
-            }
+        egui::CentralPanel::default().show(ui, |ui| match self.tab {
+            Tab::Downloads => self.downloads(ui),
+            Tab::Projects => self.projects_tab(ui),
+            Tab::Torrents => self.torrents_tab(ui),
         });
 
         if self.show_add {
@@ -546,18 +582,25 @@ impl App {
             });
             ui.menu_button("View", |ui| {
                 let mut t = self.tab;
-                if ui.selectable_value(&mut t, Tab::Downloads, "Downloads").clicked() {
+                if ui
+                    .selectable_value(&mut t, Tab::Downloads, "Downloads")
+                    .clicked()
+                {
                     self.tab = t;
                     ui.close();
                 }
-                if ui.selectable_value(&mut t, Tab::Projects, "Projects").clicked() {
+                if ui
+                    .selectable_value(&mut t, Tab::Projects, "Projects")
+                    .clicked()
+                {
                     self.tab = t;
                     ui.close();
                 }
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("About Open Download Manager").clicked() {
-                    self.status = "Open Download Manager 0.1.0 — an open-source download manager".into();
+                    self.status =
+                        "Open Download Manager 0.1.0 — an open-source download manager".into();
                     ui.close();
                 }
             });
@@ -595,41 +638,96 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 14.0;
 
-                    self.tool_button(ui, Lucide::Plus, "Add URL", egui::Color32::from_rgb(96, 165, 250), |s| {
-                        s.show_add = true;
-                    });
-                    self.tool_button(ui, Lucide::Play, "Resume", egui::Color32::from_rgb(74, 222, 128), |s| {
-                        s.act_all("resume");
-                    });
-                    self.tool_button(ui, Lucide::Square, "Stop", egui::Color32::from_rgb(248, 113, 113), |s| {
-                        s.act_all("pause");
-                    });
-                    self.tool_button(ui, Lucide::Trash, "Delete", egui::Color32::from_rgb(148, 163, 184), |s| {
-                        if let Some(id) = s.selected.clone() {
-                            s.act(&id, "remove");
-                        }
-                    });
-                    self.tool_button(ui, Lucide::Trash2, "Delete Completed", egui::Color32::from_rgb(148, 163, 184), |s| {
-                        s.delete_finished();
-                    });
+                    self.tool_button(
+                        ui,
+                        Lucide::Plus,
+                        "Add URL",
+                        egui::Color32::from_rgb(96, 165, 250),
+                        |s| {
+                            s.show_add = true;
+                        },
+                    );
+                    self.tool_button(
+                        ui,
+                        Lucide::Play,
+                        "Resume",
+                        egui::Color32::from_rgb(74, 222, 128),
+                        |s| {
+                            s.act_all("resume");
+                        },
+                    );
+                    self.tool_button(
+                        ui,
+                        Lucide::Square,
+                        "Stop",
+                        egui::Color32::from_rgb(248, 113, 113),
+                        |s| {
+                            s.act_all("pause");
+                        },
+                    );
+                    self.tool_button(
+                        ui,
+                        Lucide::Trash,
+                        "Delete",
+                        egui::Color32::from_rgb(148, 163, 184),
+                        |s| {
+                            if let Some(id) = s.selected.clone() {
+                                s.act(&id, "remove");
+                            }
+                        },
+                    );
+                    self.tool_button(
+                        ui,
+                        Lucide::Trash2,
+                        "Delete Completed",
+                        egui::Color32::from_rgb(148, 163, 184),
+                        |s| {
+                            s.delete_finished();
+                        },
+                    );
 
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(8.0);
 
-                    self.tool_button(ui, Lucide::Settings, "Options", egui::Color32::from_rgb(167, 139, 250), |s| {
-                        s.status =
-                            "Set limits with `riptide config set` (speed_limit, quota_bytes)".into();
-                    });
-                    self.tool_button(ui, Lucide::Clock, "Scheduler", egui::Color32::from_rgb(251, 191, 36), |s| {
-                        s.tab = Tab::Projects;
-                    });
-                    self.tool_button(ui, Lucide::CirclePlay, "Start Queue", egui::Color32::from_rgb(96, 165, 250), |s| {
-                        s.queue_start();
-                    });
-                    self.tool_button(ui, Lucide::CircleStop, "Stop Queue", egui::Color32::from_rgb(248, 113, 113), |s| {
-                        s.queue_stop();
-                    });
+                    self.tool_button(
+                        ui,
+                        Lucide::Settings,
+                        "Options",
+                        egui::Color32::from_rgb(167, 139, 250),
+                        |s| {
+                            s.status =
+                                "Set limits with `riptide config set` (speed_limit, quota_bytes)"
+                                    .into();
+                        },
+                    );
+                    self.tool_button(
+                        ui,
+                        Lucide::Clock,
+                        "Scheduler",
+                        egui::Color32::from_rgb(251, 191, 36),
+                        |s| {
+                            s.tab = Tab::Projects;
+                        },
+                    );
+                    self.tool_button(
+                        ui,
+                        Lucide::CirclePlay,
+                        "Start Queue",
+                        egui::Color32::from_rgb(96, 165, 250),
+                        |s| {
+                            s.queue_start();
+                        },
+                    );
+                    self.tool_button(
+                        ui,
+                        Lucide::CircleStop,
+                        "Stop Queue",
+                        egui::Color32::from_rgb(248, 113, 113),
+                        |s| {
+                            s.queue_stop();
+                        },
+                    );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(
@@ -704,33 +802,30 @@ impl App {
                     ui.painter()
                         .rect_filled(rect, 5.0, egui::Color32::from_rgb(45, 50, 60));
                 }
-                ui.scope_builder(
-                    egui::UiBuilder::new().max_rect(rect),
-                    |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                cat.icon()
-                                    .size(15.0)
-                                    .color(if selected {
-                                        egui::Color32::WHITE
-                                    } else {
-                                        egui::Color32::from_rgb(148, 163, 184)
-                                    })
-                                    .image()
-                                    .sense(egui::Sense::empty()),
-                            );
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(cat.label())
-                                    .size(13.0)
-                                    .color(if selected {
-                                        egui::Color32::WHITE
-                                    } else {
-                                        ui.visuals().text_color()
-                                    }),
-                            ));
-                        });
-                    },
-                );
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            cat.icon()
+                                .size(15.0)
+                                .color(if selected {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_rgb(148, 163, 184)
+                                })
+                                .image()
+                                .sense(egui::Sense::empty()),
+                        );
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(cat.label())
+                                .size(13.0)
+                                .color(if selected {
+                                    egui::Color32::WHITE
+                                } else {
+                                    ui.visuals().text_color()
+                                }),
+                        ));
+                    });
+                });
                 if response.clicked() {
                     self.category = cat;
                 }
@@ -738,15 +833,15 @@ impl App {
 
             category_row(ui, Category::All);
             ui.add_space(4.0);
-            for cat in [
-                Category::Unfinished,
-                Category::Finished,
-                Category::Failed,
-            ] {
+            for cat in [Category::Unfinished, Category::Finished, Category::Failed] {
                 category_row(ui, cat);
             }
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("CATEGORIES").size(10.0).color(egui::Color32::GRAY));
+            ui.label(
+                egui::RichText::new("CATEGORIES")
+                    .size(10.0)
+                    .color(egui::Color32::GRAY),
+            );
             ui.add_space(2.0);
             for cat in [
                 Category::Documents,
@@ -758,7 +853,11 @@ impl App {
                 category_row(ui, cat);
             }
             ui.add_space(8.0);
-            ui.label(egui::RichText::new("OTHER").size(10.0).color(egui::Color32::GRAY));
+            ui.label(
+                egui::RichText::new("OTHER")
+                    .size(10.0)
+                    .color(egui::Color32::GRAY),
+            );
             ui.add_space(2.0);
             category_row(ui, Category::Projects);
         });
@@ -767,13 +866,9 @@ impl App {
     // ----- downloads table -------------------------------------------------
     fn downloads(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let t = self.tab;
-            if ui.selectable_label(t == Tab::Downloads, "Downloads").clicked() {
-                self.tab = t;
-            }
-            if ui.selectable_label(t == Tab::Projects, "Projects").clicked() {
-                self.tab = t;
-            }
+            ui.selectable_value(&mut self.tab, Tab::Downloads, "Downloads");
+            ui.selectable_value(&mut self.tab, Tab::Projects, "Projects");
+            ui.selectable_value(&mut self.tab, Tab::Torrents, "Torrents");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let visible = self.visible_jobs();
                 let total: u64 = visible.iter().filter_map(|j| j.total).sum();
@@ -826,31 +921,32 @@ impl App {
                 .inner_margin(egui::Margin::symmetric(8, 5))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let mut header = |ui: &mut egui::Ui, label: &str, by: SortBy, width: f32| {
-                            let mut r = egui::RichText::new(label)
-                                .size(11.5)
-                                .strong()
-                                .color(egui::Color32::from_rgb(156, 163, 175));
-                            if self.sort.by == by {
-                                r = r.color(egui::Color32::from_rgb(96, 165, 250));
-                            }
-                            let row = ui.horizontal(|ui| {
-                                ui.add_sized([width, 20.0], egui::Label::new(r));
+                        let mut header =
+                            |ui: &mut egui::Ui, label: &str, by: SortBy, width: f32| {
+                                let mut r = egui::RichText::new(label)
+                                    .size(11.5)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(156, 163, 175));
                                 if self.sort.by == by {
-                                    ui.label(if self.sort.asc { "▲" } else { "▼" });
+                                    r = r.color(egui::Color32::from_rgb(96, 165, 250));
                                 }
-                            });
-                            // A label is not interactive, so the header claims the
-                            // click for itself.
-                            let resp = ui.interact(
-                                row.response.rect,
-                                ui.id().with(("sort", label)),
-                                egui::Sense::click(),
-                            );
-                            if resp.clicked() {
-                                sort_clicked = Some(by);
-                            }
-                        };
+                                let row = ui.horizontal(|ui| {
+                                    ui.add_sized([width, 20.0], egui::Label::new(r));
+                                    if self.sort.by == by {
+                                        ui.label(if self.sort.asc { "▲" } else { "▼" });
+                                    }
+                                });
+                                // A label is not interactive, so the header claims the
+                                // click for itself.
+                                let resp = ui.interact(
+                                    row.response.rect,
+                                    ui.id().with(("sort", label)),
+                                    egui::Sense::click(),
+                                );
+                                if resp.clicked() {
+                                    sort_clicked = Some(by);
+                                }
+                            };
                         header(ui, "File Name", SortBy::Name, 232.0);
                         header(ui, "Size", SortBy::Size, 82.0);
                         header(ui, "Status", SortBy::Status, 74.0);
@@ -891,7 +987,7 @@ impl App {
                                         egui::Label::new(
                                             egui::RichText::new(
                                                 job.output
-                                                    .rsplit(|c| c == '/' || c == '\\')
+                                                    .rsplit(['/', '\\'])
                                                     .next()
                                                     .unwrap_or(&job.output),
                                             )
@@ -1053,7 +1149,8 @@ impl App {
                         }
                         if let Some(e) = &job.error {
                             ui.label(
-                                egui::RichText::new(e).color(egui::Color32::from_rgb(248, 113, 113)),
+                                egui::RichText::new(e)
+                                    .color(egui::Color32::from_rgb(248, 113, 113)),
                             );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1069,13 +1166,9 @@ impl App {
     // ----- projects -------------------------------------------------------
     fn projects_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let t = self.tab;
-            if ui.selectable_label(t == Tab::Downloads, "Downloads").clicked() {
-                self.tab = t;
-            }
-            if ui.selectable_label(t == Tab::Projects, "Projects").clicked() {
-                self.tab = t;
-            }
+            ui.selectable_value(&mut self.tab, Tab::Downloads, "Downloads");
+            ui.selectable_value(&mut self.tab, Tab::Projects, "Projects");
+            ui.selectable_value(&mut self.tab, Tab::Torrents, "Torrents");
         });
         ui.separator();
         if self.projects.is_empty() {
@@ -1141,16 +1234,241 @@ impl App {
                                     );
                                 }
                             });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Run now").clicked() {
-                                    let _ = http_post(&format!("/api/projects/{}/run", p.name), "{}");
-                                    self.refresh();
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Run now").clicked() {
+                                        let _ = http_post(
+                                            &format!("/api/projects/{}/run", p.name),
+                                            "{}",
+                                        );
+                                        self.refresh();
+                                    }
+                                },
+                            );
                         });
                     });
                 ui.add_space(6.0);
             }
+        });
+    }
+
+    // ----- torrents -------------------------------------------------------
+    fn torrents_tab(&mut self, ui: &mut egui::Ui) {
+        // A dropped file is the natural way to hand a torrent over.
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        for path in dropped {
+            if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+            {
+                self.add_torrent(&path);
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Torrent file:");
+            ui.add_sized(
+                [320.0, 24.0],
+                egui::TextEdit::singleline(&mut self.add_torrent_path)
+                    .hint_text("C:\\Downloads\\something.torrent"),
+            );
+            if ui.button("Add").clicked() {
+                let path = self.add_torrent_path.trim().to_string();
+                if !path.is_empty() {
+                    self.add_torrent(std::path::Path::new(&path));
+                    self.add_torrent_path.clear();
+                }
+            }
+            ui.label(
+                egui::RichText::new("or drop a .torrent file onto this window")
+                    .size(12.0)
+                    .color(egui::Color32::GRAY),
+            );
+        });
+        ui.add_space(4.0);
+
+        let jobs = self.torrents.lock().unwrap().clone();
+        if jobs.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.add_space(40.0);
+                ui.label(
+                    egui::RichText::new("No torrents yet")
+                        .size(16.0)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "A .torrent file is read here and fetched from its tracker. \
+                         Magnet links and seeding come later.",
+                    )
+                    .size(13.0)
+                    .color(egui::Color32::GRAY),
+                );
+            });
+            return;
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for job in jobs {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(24, 26, 32))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(&job.name).size(13.0).strong());
+                                let pct = if job.total > 0 {
+                                    job.downloaded as f32 / job.total as f32
+                                } else {
+                                    0.0
+                                };
+                                ui.add(
+                                    egui::ProgressBar::new(pct)
+                                        .desired_width(320.0)
+                                        .show_percentage(),
+                                );
+                                let detail = match &job.error {
+                                    Some(e) => format!("{} · {}", job.state, e),
+                                    None => format!(
+                                        "{} · {} / {} · {}",
+                                        job.state,
+                                        fmt_bytes(job.downloaded),
+                                        if job.total > 0 {
+                                            fmt_bytes(job.total)
+                                        } else {
+                                            "?".into()
+                                        },
+                                        if job.speed_bps > 0.0 {
+                                            format!("{}/s", fmt_bytes(job.speed_bps as u64))
+                                        } else {
+                                            "—".into()
+                                        }
+                                    ),
+                                };
+                                ui.label(
+                                    egui::RichText::new(detail)
+                                        .size(11.5)
+                                        .color(egui::Color32::GRAY),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if (job.state == "downloading" || job.state == "connecting")
+                                        && ui.button("Cancel").clicked()
+                                    {
+                                        job.cancel.store(true, Ordering::SeqCst);
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(
+                                            &job.info_hash[..job.info_hash.len().min(12)],
+                                        )
+                                        .size(10.5)
+                                        .color(egui::Color32::GRAY),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+        });
+    }
+
+    /// Start a torrent download on a worker thread.
+    fn add_torrent(&mut self, path: &std::path::Path) {
+        let torrent = match riptide::bt::engine::read_torrent(path) {
+            Ok(t) => t,
+            Err(e) => {
+                self.status = format!("{}: {e}", path.display());
+                return;
+            }
+        };
+        let name = torrent.name.clone();
+        let info_hash = hex::encode(torrent.info_hash);
+        let total = torrent.length;
+        let out_dir = Config::load().download_dir;
+        let out_path = out_dir.join(&name);
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut jobs = self.torrents.lock().unwrap();
+            jobs.push(TorrentJob {
+                name,
+                info_hash,
+                output: out_path.clone(),
+                total,
+                downloaded: 0,
+                speed_bps: 0.0,
+                state: "connecting".into(),
+                error: None,
+                cancel: cancel.clone(),
+            });
+        }
+
+        let jobs = self.torrents.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    set_torrent_error(&jobs, &out_path, &format!("{e}"));
+                    return;
+                }
+            };
+            rt.block_on(async {
+                let peer_id = *b"-RT0001-0123456789ab";
+                let peers =
+                    match riptide::bt::tracker::announce(&torrent, &peer_id, 6881, torrent.length)
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            set_torrent_error(&jobs, &out_path, &format!("tracker: {e}"));
+                            return;
+                        }
+                    };
+                if peers.is_empty() {
+                    set_torrent_error(&jobs, &out_path, "the tracker returned no peers");
+                    return;
+                }
+                set_torrent_state(&jobs, &out_path, "downloading");
+                let progress_jobs = jobs.clone();
+                let progress_path = out_path.clone();
+                let progress: riptide::bt::engine::ProgressFn = Arc::new(move |p| {
+                    if let Ok(mut list) = progress_jobs.lock() {
+                        if let Some(job) = list.iter_mut().find(|j| j.output == progress_path) {
+                            job.downloaded = p.downloaded;
+                            job.total = p.total;
+                            job.speed_bps = p.speed_bps;
+                        }
+                    }
+                });
+                match riptide::bt::engine::download_with(
+                    &torrent,
+                    &peers,
+                    &out_path,
+                    Some(progress),
+                    Some(cancel),
+                )
+                .await
+                {
+                    Ok(()) => set_torrent_state(&jobs, &out_path, "done"),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("cancelled") {
+                            set_torrent_state(&jobs, &out_path, "cancelled");
+                        } else {
+                            set_torrent_error(&jobs, &out_path, &msg);
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -1188,7 +1506,11 @@ impl App {
                                 .size(12.0)
                                 .color(egui::Color32::GRAY),
                             );
-                            ui.add(egui::ProgressBar::new(pct).desired_width(140.0).show_percentage());
+                            ui.add(
+                                egui::ProgressBar::new(pct)
+                                    .desired_width(140.0)
+                                    .show_percentage(),
+                            );
                             if let Some(r) = self.quota.resets_in_secs {
                                 ui.label(
                                     egui::RichText::new(format!("refills in {r}s"))
@@ -1206,7 +1528,6 @@ impl App {
                             .color(egui::Color32::from_rgb(148, 163, 184)),
                     );
                 }
-
             });
     }
 
@@ -1230,10 +1551,7 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Connections");
                     let mut n = self.add_connections.unwrap_or(self.default_connections);
-                    if ui
-                        .add(egui::Slider::new(&mut n, 1..=32))
-                        .changed()
-                    {
+                    if ui.add(egui::Slider::new(&mut n, 1..=32)).changed() {
                         self.add_connections = Some(n);
                     } else {
                         self.add_connections = None;
@@ -1342,7 +1660,10 @@ fn main() {
             let bound = match riptide::daemon::bind(&cfg).await {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("cannot bind {} ({e}); trying an ephemeral port", cfg.daemon_addr);
+                    eprintln!(
+                        "cannot bind {} ({e}); trying an ephemeral port",
+                        cfg.daemon_addr
+                    );
                     cfg.daemon_addr = "127.0.0.1:0".to_string();
                     match riptide::daemon::bind(&cfg).await {
                         Ok(b) => b,
@@ -1354,7 +1675,10 @@ fn main() {
                 }
             };
             let (listener, sched, _stop) = bound;
-            let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+            let addr = listener
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
             let _ = DAEMON_ADDR.set(format!("http://{addr}"));
             let auth = riptide::auth::token::load(None, cfg.daemon_token_file.as_deref())
                 .ok()
@@ -1365,8 +1689,10 @@ fn main() {
     });
     std::thread::sleep(Duration::from_millis(600));
 
-    let mut style = egui::Style::default();
-    style.visuals = egui::Visuals::dark();
+    let mut style = egui::Style {
+        visuals: egui::Visuals::dark(),
+        ..Default::default()
+    };
     style.visuals.panel_fill = egui::Color32::from_rgb(18, 20, 25);
     style.visuals.window_fill = egui::Color32::from_rgb(24, 26, 32);
     style.visuals.extreme_bg_color = egui::Color32::from_rgb(12, 13, 17);
@@ -1386,10 +1712,10 @@ fn main() {
             .with_min_inner_size([900.0, 560.0])
             .with_title("Open Download Manager")
             // The window's own icon, so the task bar does not show egui's default.
-            .with_icon(eframe::icon_data::from_png_bytes(
-                &include_bytes!("../assets/odm.png")[..],
-            )
-            .expect("the icon is a PNG this program wrote itself")),
+            .with_icon(
+                eframe::icon_data::from_png_bytes(&include_bytes!("../assets/odm.png")[..])
+                    .expect("the icon is a PNG this program wrote itself"),
+            ),
         ..Default::default()
     };
     let _ = eframe::run_native(
@@ -1401,4 +1727,27 @@ fn main() {
             Ok(Box::new(App::new()))
         }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Torrent helpers
+// ---------------------------------------------------------------------------
+
+/// Mark a torrent download as failed, with the reason.
+fn set_torrent_error(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, path: &PathBuf, msg: &str) {
+    if let Ok(mut list) = jobs.lock() {
+        if let Some(job) = list.iter_mut().find(|j| &j.output == path) {
+            job.state = "failed".into();
+            job.error = Some(msg.to_string());
+        }
+    }
+}
+
+/// Move a torrent download to a new state.
+fn set_torrent_state(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, path: &PathBuf, state: &str) {
+    if let Ok(mut list) = jobs.lock() {
+        if let Some(job) = list.iter_mut().find(|j| &j.output == path) {
+            job.state = state.to_string();
+        }
+    }
 }

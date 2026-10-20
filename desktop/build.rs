@@ -6,6 +6,10 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/odm.ico");
+        // The manifest carries the per-monitor DPI awareness. Without it Windows
+        // treats the program as DPI-unaware and the pointer arrives in a different
+        // coordinate space from the interface.
+        res.set_manifest_file("assets/app.manifest");
         res.set("FileDescription", "Open Download Manager");
         res.set("ProductName", "Open Download Manager");
         res.set("CompanyName", "Open Download Manager");

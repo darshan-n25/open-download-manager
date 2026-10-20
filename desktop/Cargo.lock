@@ -2964,6 +2964,7 @@ dependencies = [
  "egui",
  "egui-lucide",
  "egui_extras",
+ "hex",
  "reqwest",
  "riptide",
  "serde",
