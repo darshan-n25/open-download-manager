@@ -25,3 +25,7 @@ rustc-ice-*.txt
 
 # The desktop app has its own build directory too.
 desktop/target/
+
+# The release archives, built by `scripts/package-release.sh` and by the release
+# workflow. They are outputs, not sources: a release publishes them from CI.
+dist/

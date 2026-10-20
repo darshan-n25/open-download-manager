@@ -44,6 +44,9 @@ Check what you downloaded:
 sha256sum -c SHA256SUMS.txt
 ```
 
+A release is cut by pushing a tag — the workflow builds every platform, packages it and
+publishes the page. The whole procedure is in [`docs/RELEASING.md`](docs/RELEASING.md).
+
 **Windows.** Unpack the zip and run `odm.exe` — no installer is required. An installer
 (`open-download-manager-<version>-windows-x64-setup.exe`) is built from
 [`desktop/assets/odm.iss`](desktop/assets/odm.iss) and is the tidier route: it adds a

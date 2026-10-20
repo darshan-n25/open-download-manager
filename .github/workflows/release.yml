@@ -67,22 +67,26 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             binary: odm
+            exe: ""
             # eframe's X11 backend links against these; they are build-time only.
             packages: libx11-dev libxkbcommon-dev libgl1-mesa-dev
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             binary: odm
+            exe: ""
             packages: ""
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
             binary: odm
+            exe: ""
             packages: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
             binary: odm.exe
+            exe: ".exe"
             packages: ""
     steps:
       - uses: actions/checkout@v4
@@ -100,6 +104,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked --manifest-path desktop/Cargo.toml --target ${{ matrix.target }}
 
+      # The command-line tools ride along in the same archive: they are the same program
+      # without the window, they cost nothing to build once the library is compiled, and a
+      # user who wants the daemon (a NAS, a `cron` job) should not have to download a
+      # second archive to get it.
+      - name: Build the command-line tools
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin odm-cli --bin odm-bt
+
       - name: What was built
         shell: bash
         run: |
@@ -115,6 +126,8 @@ jobs:
           name="open-download-manager-$VERSION-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "desktop/target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/odm-cli${{ matrix.exe }}" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/odm-bt${{ matrix.exe }}" "dist/$name/"
           cp README.md LICENSE "dist/$name/"
           case "${{ matrix.archive }}" in
             tar.gz) tar -C dist -czf "dist/$name.tar.gz" "$name" ;;
@@ -122,6 +135,35 @@ jobs:
             # on the Windows runner and GNU tar on Linux both understand it.
             zip)    tar -C dist -a -cf "dist/$name.zip" "$name" ;;
           esac
+          ls -l dist
+
+      # The Windows installer: a Start-menu entry, a desktop shortcut, an uninstaller and
+      # the option to put `odm-cli` on the PATH. The zip above needs no installer at all —
+      # both are published, because a zip is what people who distrust installers want and
+      # an installer is what people who want a shortcut want.
+      - name: The Windows installer
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          choco install innosetup --yes --no-progress
+          mkdir -p dist/windows
+          cp "desktop/target/${{ matrix.target }}/release/odm.exe" dist/windows/
+          cp "target/${{ matrix.target }}/release/odm-cli.exe" dist/windows/
+          cp "target/${{ matrix.target }}/release/odm-bt.exe" dist/windows/
+          # Chocolatey, a per-machine install and a per-user install each put Inno Setup
+          # somewhere else; try them in that order rather than hard-coding one.
+          iscc=""
+          for candidate in \
+            "$(cygpath "$PROGRAMFILES")/Inno Setup 6/ISCC.exe" \
+            "$(cygpath "${PROGRAMFILES(X86)}")/Inno Setup 6/ISCC.exe" \
+            "$(cygpath "$LOCALAPPDATA")/Programs/Inno Setup 6/ISCC.exe"; do
+            if [ -f "$candidate" ]; then iscc="$candidate"; break; fi
+          done
+          if [ -z "$iscc" ]; then echo "::error::Inno Setup was not found"; exit 1; fi
+          "$iscc" /DAppVersion="$VERSION" desktop/assets/odm.iss
           ls -l dist
 
       - uses: actions/upload-artifact@v4
@@ -358,7 +400,8 @@ jobs:
             echo
             echo "| Platform | File |"
             echo "| --- | --- |"
-            echo "| Windows (x64) | \`open-download-manager-$VERSION-x86_64-pc-windows-msvc.zip\` → \`odm.exe\` |"
+            echo "| Windows (x64) | \`open-download-manager-$VERSION-x86_64-pc-windows-msvc.zip\` → \`odm.exe\` (no installer needed) |"
+            echo "| Windows (x64), with an installer | \`open-download-manager-$VERSION-windows-x64-setup.exe\` → Start menu, shortcut, uninstaller |"
             echo "| macOS (Apple silicon) | \`open-download-manager-$VERSION-aarch64-apple-darwin.tar.gz\` → \`odm\` |"
             echo "| macOS (Intel) | \`open-download-manager-$VERSION-x86_64-apple-darwin.tar.gz\` → \`odm\` |"
             echo "| Linux (x64) | \`open-download-manager-$VERSION-x86_64-unknown-linux-gnu.tar.gz\` → \`odm\` |"

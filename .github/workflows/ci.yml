@@ -64,8 +64,23 @@ jobs:
 
       # The window's own tests. They drive the interface with simulated clicks, so they
       # need no display and no mouse — the same tests run on every runner.
+      #
+      # On Linux the window's crate links against X11, and a build needs the headers,
+      # which the runner does not have by default. The runtime libraries are there; the
+      # headers are what `libx11-dev` and its friends are for.
+      - name: GUI build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxkbcommon-dev libgl1-mesa-dev
+
       - name: Desktop interface tests
         run: cargo test --locked --manifest-path desktop/Cargo.toml
+
+      # The window is a separate crate with its own dependency tree, so it gets its own
+      # clippy pass: the root one does not look at it.
+      - name: Clippy (the window)
+        run: cargo clippy --manifest-path desktop/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Browser-extension protocol tests
         run: node --test extension/tests/protocol.test.mjs
