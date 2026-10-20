@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Cut a release.
+# Stage one of a release: get the work onto `dev` and open a pull request.
 #
-# A release in this project is a Git tag: pushing `v0.1.0` makes the workflow in
-# `.github/workflows/release.yml` build every platform, package it, and publish a
-# release page with the archives attached. This script does the part that is easy to
-# get wrong — the version, the tag and the push — and prints what to watch while the
-# workflow runs.
+# The flow is the one a repository with a `dev` branch should use:
+#
+#   dev  ──▶  pull request  ──▶  main  ──▶  tag v0.1.0  ──▶  the release page
+#
+# This script does the first half. It checks the version, runs the tests, and pushes
+# the branch to `dev`. The pull request is then opened in the browser (the script prints
+# the link), reviewed, and merged into `main` by whoever owns the repository.
 #
 #   scripts/release.sh 0.1.0
 #
-# It refuses to run if the working tree is dirty, if the tag already exists, or if the
-# version in `Cargo.toml` is not the one asked for: a release that says one version and
-# contains another is the kind of thing nobody notices until a user reports it.
+# The tag — and with it the release itself — is cut afterwards, from `main`, by
+# `scripts/tag-release.sh`. That order matters: a release must point at a commit that
+# has been reviewed and merged, not at one that only exists on a branch.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -23,7 +25,7 @@ if [ -z "$version" ]; then
 fi
 
 version=${version#v}
-tag="v$version"
+branch=$(git rev-parse --abbrev-ref HEAD)
 
 in_cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 if [ "$in_cargo" != "$version" ]; then
@@ -38,51 +40,33 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-if git rev-parse "$tag" >/dev/null 2>&1; then
-  echo "The tag $tag already exists."
-  exit 1
-fi
+slug=$(git config --get remote.origin.url | sed 's#.*github.com[:/]##; s#\.git$##')
 
-remote=$(git remote get-url origin 2>/dev/null || echo "")
-echo "version:  $version"
-echo "tag:      $tag"
-echo "remote:   $remote"
+echo "version: $version"
+echo "branch:  $branch"
+echo "repo:    $slug"
 echo
 
-echo "1. the tests, before anything is tagged"
+echo "1. the tests, before anything is pushed"
 cargo test --locked
 cargo test --locked --manifest-path desktop/Cargo.toml
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --manifest-path desktop/Cargo.toml --all-targets --locked -- -D warnings
 echo
 
-echo "2. tagging"
-git tag -a "$tag" -m "Open Download Manager $version"
-echo "   $tag -> $(git rev-parse --short HEAD)"
-echo
-
-echo "3. pushing the tag (this is what triggers the release)"
-echo "   git push origin $tag"
-git push origin "$tag" || {
+echo "2. pushing $branch to origin"
+git push origin "$branch" || {
   echo
-  echo "The push failed. The tag is created locally; push it when you have credentials:"
-  echo "   git push origin $tag"
+  echo "The push failed. Nothing is published: the commits are safe locally."
+  echo "Push it when you have credentials:  git push origin $branch"
   exit 1
 }
+echo
 
+echo "3. open the pull request"
+echo "   https://github.com/$slug/compare/main...$branch?expand=1"
 echo
-echo "The release workflow is now running. Watch it here:"
-echo "   https://github.com/$(git config --get remote.origin.url | sed 's#.*github.com[:/]##; s#\.git$##')/actions"
-echo
-echo "When it finishes, the release page is at:"
-echo "   https://github.com/$(git config --get remote.origin.url | sed 's#.*github.com[:/]##; s#\.git$##')/releases/tag/$tag"
-echo
-echo "The archives it publishes:"
-echo "   open-download-manager-$version-x86_64-pc-windows-msvc.zip   the app for Windows"
-echo "   open-download-manager-$version-windows-x64-setup.exe        the Windows installer"
-echo "   open-download-manager-$version-aarch64-apple-darwin.tar.gz   the app for Apple silicon"
-echo "   open-download-manager-$version-x86_64-apple-darwin.tar.gz    the app for Intel Macs"
-echo "   open-download-manager-$version-x86_64-unknown-linux-gnu.tar.gz  the app for Linux"
-echo "   open-download-manager-cli-$version-*.tar.gz                  the headless builds"
-echo "   open-download-manager-extension-$version.zip                the browser extension"
-echo "   SHA256SUMS.txt                                              the checksums"
+echo "Merge it into main when the checks are green, then cut the tag:"
+echo "   scripts/tag-release.sh $version"
+echo "   (or: git tag -a v$version -m \"Open Download Manager $version\" origin/main && git push origin v$version)"

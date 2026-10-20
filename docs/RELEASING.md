@@ -4,12 +4,33 @@ A release is a tag. Pushing `v0.1.0` makes `.github/workflows/release.yml` build
 platform, package it, publish the container image, and create the release page with the
 archives attached. Nothing is uploaded by hand.
 
+The flow is the one a repository with a `dev` branch should use:
+
+```
+dev  ──▶  pull request  ──▶  main  ──▶  tag v0.1.0  ──▶  the release page
+```
+
+**Stage one — get the work onto `dev`:**
+
 ```sh
 scripts/release.sh 0.1.0
 ```
 
-That script checks the version, runs the tests, creates the tag and pushes it. The
-workflow then does the rest.
+That checks the version, runs the whole test suite, pushes the branch to `dev` and prints
+the link to open the pull request. Review it, wait for the checks to go green, and merge
+it into `main`.
+
+**Stage two — tag the merge and publish:**
+
+```sh
+scripts/tag-release.sh 0.1.0
+```
+
+That fetches `main`, refuses to tag a commit that `main` does not contain, creates the
+annotated tag on the merged commit and pushes it. The push is what starts the workflow.
+
+The order is the point: a release points at reviewed, merged code, never at a commit
+that only exists on a branch.
 
 ## What the workflow builds
 
@@ -62,9 +83,9 @@ those systems — or by the workflow, which is what a release uses.
 ## The version
 
 The version lives in `Cargo.toml` and `desktop/Cargo.toml`, and the tag carries it:
-`v0.1.0` is release `0.1.0`. `scripts/release.sh` refuses to tag a version the
-manifest does not have, because a release whose name and contents disagree is the kind
-of thing nobody notices until a user reports it.
+`v0.1.0` is release `0.1.0`. Both scripts refuse to tag a version the manifest does not
+have, because a release whose name and contents disagree is the kind of thing nobody
+notices until a user reports it.
 
 ## After the release
 
