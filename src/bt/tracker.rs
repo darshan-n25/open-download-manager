@@ -16,10 +16,24 @@ pub async fn announce(
     port: u16,
     left: u64,
 ) -> Result<Vec<Peer>> {
+    announce_at(&torrent.announce, &torrent.info_hash, peer_id, port, left).await
+}
+
+/// Announce to one tracker URL.
+///
+/// A magnet link has no torrent file yet, so the hash is all we have to go on —
+/// which is exactly what a tracker wants.
+pub async fn announce_at(
+    url: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    left: u64,
+) -> Result<Vec<Peer>> {
     let url = format!(
         "{}?info_hash={}&peer_id={}&port={}&uploaded=0&downloaded=0&left={}&compact=1&event=started",
-        torrent.announce,
-        urlencode_bytes(&torrent.info_hash),
+        url,
+        urlencode_bytes(info_hash),
         urlencode_bytes(peer_id),
         port,
         left,

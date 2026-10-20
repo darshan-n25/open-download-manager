@@ -7,12 +7,15 @@
 //! queue, the quota budget and the scheduler's slot accounting — so a machine
 //! running both binaries keeps one queue and one budget.
 //!
-//! Scope of this first cut: single-file torrents downloaded from a `.torrent`
-//! file against an HTTP tracker, with the pieces verified by SHA-1 and written
-//! to the download directory. Magnet links, multi-file torrents, DHT and
-//! seeding come later.
+//! Scope: single-file torrents, from a `.torrent` file or from a magnet link,
+//! fetched over HTTP trackers, with every piece verified by SHA-1 before it
+//! is written. A magnet link carries no metadata of its own, so the torrent
+//! file is fetched from the swarm itself (see [`metadata`]). Multi-file
+//! torrents, the DHT and seeding come later.
 
 pub mod bencode;
 pub mod engine;
+pub mod magnet;
+pub mod metadata;
 pub mod torrent;
 pub mod tracker;

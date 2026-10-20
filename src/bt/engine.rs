@@ -130,6 +130,51 @@ pub fn read_torrent(path: &std::path::Path) -> Result<Torrent> {
     Torrent::from_bytes(&data)
 }
 
+/// Download whatever a magnet link points at.
+///
+/// A magnet carries a hash and some trackers but no file information, so the
+/// torrent file itself is fetched from the swarm first; only then are the
+/// pieces known well enough to be checked and written.
+pub async fn download_magnet(
+    magnet: &crate::bt::magnet::Magnet,
+    out_dir: &std::path::Path,
+    progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<std::path::PathBuf> {
+    if magnet.trackers.is_empty() {
+        return Err(RiptideError::other(
+            "the magnet link lists no tracker to ask for peers",
+        ));
+    }
+    let peer_id = PEER_ID;
+
+    // Ask each tracker in turn for peers, until one answers.
+    let mut peers = Vec::new();
+    let mut last_error = None;
+    for tracker in &magnet.trackers {
+        match crate::bt::tracker::announce_at(tracker, &magnet.info_hash, &peer_id, 6881, 0).await {
+            Ok(p) if !p.is_empty() => {
+                peers = p;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => last_error = Some(e),
+        }
+    }
+    if peers.is_empty() {
+        return Err(last_error.unwrap_or_else(|| {
+            RiptideError::other("no tracker returned any peers for this magnet")
+        }));
+    }
+
+    // The metadata comes from the peers themselves.
+    let torrent = crate::bt::metadata::fetch(&magnet.info_hash, &peers).await?;
+
+    let out_path = out_dir.join(&torrent.name);
+    download_with(&torrent, &peers, &out_path, progress, cancel).await?;
+    Ok(out_path)
+}
+
 async fn download_piece(
     torrent: &Torrent,
     pi: usize,

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use riptide::bt::engine;
+use riptide::bt::magnet::Magnet;
 use riptide::bt::torrent::Torrent;
 use riptide::bt::tracker;
 use riptide::config::Config;
@@ -23,8 +24,10 @@ enum Cmd {
     /// Print metadata from a .torrent file.
     Info { torrent: PathBuf },
     /// Download a torrent to the download directory.
+    ///
+    /// The source is either a .torrent file or a magnet link.
     Download {
-        torrent: PathBuf,
+        source: String,
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -53,10 +56,29 @@ async fn run(cli: Cli) -> Result<()> {
             println!("announce:    {}", t.announce);
             Ok(())
         }
-        Cmd::Download { torrent, out } => {
+        Cmd::Download { source, out } => {
             let cfg = Config::load();
+            let dir = out.unwrap_or_else(|| cfg.download_dir.clone());
+            std::fs::create_dir_all(&dir).ok();
+
+            // A magnet link and a .torrent file are both "a source"; the difference
+            // is only where the metadata comes from.
+            if source
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("magnet:")
+            {
+                let magnet = Magnet::parse(&source)?;
+                println!("magnet {}:", magnet.hex());
+                println!("  trackers: {}", magnet.trackers.len());
+                let out_path = engine::download_magnet(&magnet, &dir, None, None).await?;
+                println!("done -> {}", out_path.display());
+                return Ok(());
+            }
+
+            let path = PathBuf::from(&source);
             let data =
-                std::fs::read(&torrent).map_err(|e| riptide::RiptideError::other(e.to_string()))?;
+                std::fs::read(&path).map_err(|e| riptide::RiptideError::other(e.to_string()))?;
             let t = Torrent::from_bytes(&data)?;
             println!("{}: {} bytes, {} pieces", t.name, t.length, t.num_pieces());
 
@@ -68,8 +90,6 @@ async fn run(cli: Cli) -> Result<()> {
                 return Err(riptide::RiptideError::other("no peers from tracker"));
             }
 
-            let dir = out.unwrap_or_else(|| cfg.download_dir.clone());
-            std::fs::create_dir_all(&dir).ok();
             let out_path = dir.join(&t.name);
             engine::download(&t, &peers, &out_path).await?;
             println!("done -> {}", out_path.display());

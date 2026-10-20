@@ -1277,12 +1277,16 @@ impl App {
             ui.add_sized(
                 [320.0, 24.0],
                 egui::TextEdit::singleline(&mut self.add_torrent_path)
-                    .hint_text("C:\\Downloads\\something.torrent"),
+                    .hint_text("C:\\Downloads\\something.torrent, or a magnet link"),
             );
             if ui.button("Add").clicked() {
                 let path = self.add_torrent_path.trim().to_string();
                 if !path.is_empty() {
-                    self.add_torrent(std::path::Path::new(&path));
+                    if path.to_ascii_lowercase().starts_with("magnet:") {
+                        self.add_magnet(&path);
+                    } else {
+                        self.add_torrent(std::path::Path::new(&path));
+                    }
                     self.add_torrent_path.clear();
                 }
             }
@@ -1379,6 +1383,97 @@ impl App {
                     });
                 ui.add_space(6.0);
             }
+        });
+    }
+
+    /// Start a magnet download on a worker thread.
+    ///
+    /// A magnet link has no file information of its own, so the torrent file is
+    /// fetched from the swarm first and the download follows from there.
+    fn add_magnet(&mut self, link: &str) {
+        let magnet = match riptide::bt::magnet::Magnet::parse(link) {
+            Ok(m) => m,
+            Err(e) => {
+                self.status = format!("magnet link: {e}");
+                return;
+            }
+        };
+        let info_hash = magnet.hex();
+        let name = magnet.name.clone().unwrap_or_else(|| info_hash.clone());
+        let total = 0u64;
+        let out_dir = Config::load().download_dir;
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut jobs = self.torrents.lock().unwrap();
+            jobs.push(TorrentJob {
+                name,
+                info_hash,
+                output: out_dir.join("magnet"),
+                total,
+                downloaded: 0,
+                speed_bps: 0.0,
+                state: "connecting".into(),
+                error: None,
+                cancel: cancel.clone(),
+            });
+        }
+
+        let jobs = self.torrents.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    set_torrent_error(&jobs, &out_dir.join("magnet"), &format!("{e}"));
+                    return;
+                }
+            };
+            rt.block_on(async {
+                let progress_jobs = jobs.clone();
+                let progress: riptide::bt::engine::ProgressFn = Arc::new(move |p| {
+                    if let Ok(mut list) = progress_jobs.lock() {
+                        if let Some(job) = list.iter_mut().find(|j| j.state == "downloading") {
+                            job.downloaded = p.downloaded;
+                            job.total = p.total;
+                            job.speed_bps = p.speed_bps;
+                        }
+                    }
+                });
+                match riptide::bt::engine::download_magnet(
+                    &magnet,
+                    &out_dir,
+                    Some(progress),
+                    Some(cancel),
+                )
+                .await
+                {
+                    Ok(path) => {
+                        if let Ok(mut list) = jobs.lock() {
+                            if let Some(job) = list.iter_mut().last() {
+                                job.output = path.clone();
+                                job.name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| job.name.clone());
+                                job.state = "done".into();
+                                job.total = job.total.max(job.downloaded);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let state = if msg.contains("cancelled") {
+                            "cancelled".to_string()
+                        } else {
+                            format!("failed: {msg}")
+                        };
+                        if let Ok(mut list) = jobs.lock() {
+                            if let Some(job) = list.iter_mut().last() {
+                                job.state = state;
+                            }
+                        }
+                    }
+                }
+            });
         });
     }
 

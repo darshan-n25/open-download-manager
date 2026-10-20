@@ -26,6 +26,36 @@ impl Torrent {
         h.update(&info_bytes);
         let info_hash: [u8; 20] = h.finalize().into();
 
+        let mut torrent = Torrent::from_info(info, info_hash)?;
+
+        torrent.announce = root.dict_get_str(b"announce").unwrap_or("").to_string();
+        let mut announce_list = Vec::new();
+        if let Some(al) = root.dict_get(b"announce-list") {
+            if let Some(outer) = al.as_list() {
+                for tier in outer {
+                    if let Some(inner) = tier.as_list() {
+                        for u in inner {
+                            if let Some(s) = u.as_bytes() {
+                                if let Ok(s) = std::str::from_utf8(s) {
+                                    announce_list.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if announce_list.is_empty() && !torrent.announce.is_empty() {
+            announce_list.push(torrent.announce.clone());
+        }
+        torrent.announce_list = announce_list;
+
+        Ok(torrent)
+    }
+
+    /// Build a torrent from an info dictionary — the part of a `.torrent` file
+    /// that describes the content.
+    fn from_info(info: &crate::bt::bencode::Value, info_hash: [u8; 20]) -> Result<Self> {
         let name = info
             .dict_get_str(b"name")
             .ok_or_else(|| RiptideError::other("missing name"))?
@@ -51,36 +81,36 @@ impl Torrent {
             .ok_or_else(|| RiptideError::other("multi-file torrents not supported yet"))?
             as u64;
 
-        let announce = root.dict_get_str(b"announce").unwrap_or("").to_string();
-        let mut announce_list = Vec::new();
-        if let Some(al) = root.dict_get(b"announce-list") {
-            if let Some(outer) = al.as_list() {
-                for tier in outer {
-                    if let Some(inner) = tier.as_list() {
-                        for u in inner {
-                            if let Some(s) = u.as_bytes() {
-                                if let Ok(s) = std::str::from_utf8(s) {
-                                    announce_list.push(s.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if announce_list.is_empty() && !announce.is_empty() {
-            announce_list.push(announce.clone());
-        }
-
         Ok(Torrent {
-            announce,
-            announce_list,
+            announce: String::new(),
+            announce_list: Vec::new(),
             name,
             piece_length,
             pieces,
             length,
             info_hash,
         })
+    }
+
+    /// Read the metadata a peer sent us, and check it against the hash the
+    /// magnet link promised.
+    ///
+    /// The metadata is the torrent's *info dictionary*, not the whole `.torrent`
+    /// file: that is what the extension protocol exchanges. A peer can send any
+    /// metadata it likes, so the hash is the only thing that says whether it is
+    /// the torrent the magnet asked for.
+    pub fn from_metadata(data: &[u8], expected: [u8; 20]) -> Result<Self> {
+        let info = bencode::decode_one_doc(data)?;
+        let info_bytes = reencode(&info)?;
+        let mut h = Sha1::new();
+        h.update(&info_bytes);
+        let info_hash: [u8; 20] = h.finalize().into();
+        if info_hash != expected {
+            return Err(RiptideError::other(
+                "the metadata a peer sent is for a different torrent",
+            ));
+        }
+        Torrent::from_info(&info, info_hash)
     }
 
     pub fn num_pieces(&self) -> usize {
