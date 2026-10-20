@@ -5,7 +5,7 @@
 //! what stops four parallel downloads from one CDN from opening thirty-two sockets to it and
 //! getting the client throttled or banned.
 //!
-//! Riptide enforces it at the point where a request is actually in flight: a caller holds a
+//! Open Download Manager enforces it at the point where a request is actually in flight: a caller holds a
 //! permit for the duration of one response, then releases it. Permits are shared through an
 //! `Arc`, so the ceiling is global across the whole process rather than per job.
 //!

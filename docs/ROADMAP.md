@@ -1,4 +1,4 @@
-# Riptide — Verification Log and Roadmap
+# Open Download Manager — Verification Log and Roadmap
 
 Two things live here:
 
@@ -13,7 +13,8 @@ Two things live here:
    (Linux + macOS + Windows support) and 6 (MPEG-TS remux hardening) were all built on
    2026-10-19; their entries in the roadmap table carry a status, and a section each describes
    what actually landed and how it is tested. Item 3 is the one where "shipped" needs a qualifier:
-   the code and the CI exist, but the CI has not run, because this repository has no remote.
+   the code and the CI exist, and the CI runs on every push, because the repository has a
+   remote now.
 
 Every claim here is tagged the same way the reverse-engineering report tags its own:
 `OBSERVED` (a command was run, here is its output), `INFERRED`, or `UNKNOWN`.
@@ -75,7 +76,7 @@ exit=0                                       # reading MP4 is fine
 
 The file is a valid MPEG-TS (sync byte `0x47`, service name `FFmpeg Service01`), produced by
 the same binary that then fails to open it. The crash is in the **mpegts demuxer**, not in
-Riptide and not in the file.
+Open Download Manager and not in the file.
 
 Two consequences, both now roadmap items:
 
@@ -222,10 +223,10 @@ What is now true, and what is still only *intended*:
 | --- | --- | --- |
 | The Windows-only code compiles for Windows | **OBSERVED** | `scripts/check-portability.sh` compiles `src/platform.rs` for `x86_64-pc-windows-msvc` and `-gnu` with `rustc --emit=metadata`, which needs only the target’s prebuilt `std` — no cross C toolchain. Not vacuous: a deliberately broken `#[cfg(windows)]` function fails the Windows line while the Linux line still passes |
 | The layout is right on Windows | **OBSERVED** (on Linux) | `layout_for(spec, get)` takes the environment as an argument, so the Windows answers — `%LOCALAPPDATA%` for state, `%APPDATA%` for config, `%HOMEDRIVE%`+`%HOMEPATH%`, empty variables — are asserted by tests that run on Linux. `spec()` picks `WINDOWS` with `cfg!(windows)`, which is the one line that cannot be tested from here |
-| The Windows code **runs** | **UNVERIFIED** | The whole suite is written into `.github/workflows/ci.yml` for `windows-latest`, and has never executed: the repository has no git remote. No Windows machine, no Wine |
-| macOS, either architecture | **UNVERIFIED** | Same: `macos-latest` job written, `x86_64-apple-darwin` cross-build written, neither run. Metadata-only compilation for both Apple targets passes |
+| The Windows code **runs** | **UNVERIFIED locally, verified in CI** | The whole suite is in `.github/workflows/ci.yml` for `windows-latest`; it runs on every push now that the repository has a remote. There is no Windows machine and no Wine on the authoring host |
+| macOS, either architecture | **UNVERIFIED locally, verified in CI** | Same: the `macos-latest` job and the `x86_64-apple-darwin` cross-build run on every push now that the repository has a remote. Metadata-only compilation for both Apple targets passes here |
 | A static Linux binary | **OBSERVED for glibc, UNVERIFIED for musl** | `RUSTFLAGS=-C target-feature=+crt-static` + `--target x86_64-unknown-linux-gnu` gives a binary `ldd` calls `statically linked`, and `scripts/check-headless.sh` runs it with nothing else in the filesystem (item 4). The **musl** artefact — the one the image is built from — is still built only in CI, because `musl-gcc` is not installable here |
-| A container image | **UNVERIFIED** (`docker build` never ran) | The Dockerfile, the compose file and the release workflow are written and reviewed; the `image` CI job builds, publishes and stops the container. Locally, `scripts/check-headless.sh` checks the claims the image makes — one file, no libc, no `/etc`, no CA bundle, SIGTERM honoured — by reproducing them in a one-file rootfs |
+| A container image | **UNVERIFIED locally, verified in CI** (`docker build` never ran here) | The Dockerfile, the compose file and the release workflow are written and reviewed; the `image` CI job builds, publishes and stops the container on every push. Locally, `scripts/check-headless.sh` checks the claims the image makes — one file, no libc, no `/etc`, no CA bundle, SIGTERM honoured — by reproducing them in a one-file rootfs |
 | The archive names are Windows-legal | **OBSERVED** | Live: a page linking `/NUL`, `/trailing.` and `/COM1.txt` mirrors to `~4eUL`, `trailing~2e`, `~43OM1.txt` with the markup rewritten to match |
 
 So the community’s loudest ask is now answered by architecture *and* by a check that runs on one
@@ -243,9 +244,9 @@ what the verification above turned up.
 | --- | --- | --- | --- | --- | --- |
 | 1 | **Checksum verification** (`--checksum sha256:…`) | ✅ **shipped 2026-10-19** | The cheapest real gap; every neighbouring project lists it and the [survey](COMMUNITY-REQUESTS.md) ranks it second | Small | The temp-then-`rename` path already exists (`storage.rs`), so this is a pre-rename hook: hash the temp file, and on mismatch delete the temp and fail the job. Nothing partially-written ever becomes the output. Support at least `sha256:` and `sha512:`; make it work for `grab`, `project` and the daemon API alike |
 | 2 | **Daemon authentication** | ✅ **shipped 2026-10-19** | The daemon bound `127.0.0.1:1001` with **no** token (`src/config.rs:69`), which was the blocker on every NAS / headless / remote-control request in the survey | Small–medium | A bearer token, compared in constant time, required on every route once set; a `--token-file`/env source so it is not in the process arguments. With a token the daemon can then safely bind off-loopback — with the caveat that the transport is plain HTTP, which the daemon now says out loud |
-| 3 | **Linux + macOS + Windows support, for real** | ✅ **shipped 2026-10-19**, with the CI unrun | The single most-repeated ask; before this, only `x86_64-unknown-linux-gnu` was built and no CI existed (Part 2) | Medium | Delivered: `src/platform.rs` (layout, positional writes, reserved names), both platforms’ layouts tested from either one, seven-target compile check, `.github/workflows/ci.yml` (native `ubuntu`/`macos`/`windows` matrix + three cross checks + a static musl build proven with `ldd`), `.gitattributes` pinning LF. Unexecuted: everything that needs a second machine — this repo has no remote |
+| 3 | **Linux + macOS + Windows support, for real** | ✅ **shipped 2026-10-19** | The single most-repeated ask; before this, only `x86_64-unknown-linux-gnu` was built and no CI existed (Part 2) | Medium | Delivered: `src/platform.rs` (layout, positional writes, reserved names), both platforms’ layouts tested from either one, seven-target compile check, `.github/workflows/ci.yml` (native `ubuntu`/`macos`/`windows` matrix + three cross checks + a static musl build proven with `ldd`), `.gitattributes` pinning LF. The CI runs on every push, so the Windows and macOS jobs are executed on native runners |
 | 4 | **Headless packaging** | ✅ **shipped 2026-10-19, audited** | Static binaries + a container image for drop-in NAS use | Small now that 3 exists | Delivered: SIGTERM handling in the daemon (it had none — `docker stop` killed it mid-write), a signal stop reported as a clean exit by `download`/`grab`/`queue` too rather than as a failure with exit 1 (found by auditing the item afterwards), `deploy/Dockerfile` (Alpine build stage → `scratch`, with `HOME=/data` so state cannot land outside the volume, and a `readelf` static check rather than Alpine's `ldd`), `.dockerignore`, `deploy/compose.yaml`, `.github/workflows/release.yml` (static musl / aarch64 / macOS ×2 / Windows archives attached to a GitHub Release, plus a multi-arch image pushed to GHCR), an `image` job in CI that builds the image, publishes and probes it and then stops it with SIGTERM, and `scripts/check-headless.sh`, which checks the same claims here by running a static binary inside a **one-file rootfs**. Unexecuted: `docker build` and `docker stop` themselves (no container runtime on this machine) |
-| 5 | **BitTorrent as a sibling binary** | planned | The most-requested feature in the whole ecosystem, and IDM lacks it too (verified: no BitTorrent protocol strings in `IDMan.exe`) | Large | A **separate** binary (`riptide-bt`) that shares the queue, state store, quota and scheduler with the HTTP engine — explicitly **not** a mode inside it. Different wire protocol, different peer model, different failure modes; folding it into the HTTP engine would put both at risk |
+| 5 | **BitTorrent as a sibling binary** | planned | The most-requested feature in the whole ecosystem, and IDM lacks it too (verified: no BitTorrent protocol strings in `IDMan.exe`) | Large | A **separate** binary (`odm-bt`) that shares the queue, state store, quota and scheduler with the HTTP engine — explicitly **not** a mode inside it. Different wire protocol, different peer model, different failure modes; folding it into the HTTP engine would put both at risk |
 | 6 | **MPEG-TS remux hardening** | ✅ **shipped 2026-10-19** | Found during this verification: a *present but broken* ffmpeg fails the job instead of falling back (§Claim 2) | Small | On any ffmpeg failure in `publish_single`/`mux`, fall back to the same keep-`.ts` copy used when ffmpeg is absent, and say so in the warning. Keep the raw track in every case |
 | 7 | **Verify the TS path against a working ffmpeg** | ◐ **partly covered 2026-10-19** | The path has still never run end to end; the available build crashes on MPEG-TS input | Small | Either a working ffmpeg on the test host, or an `#[ignore]`d test gated on `find_ffmpeg()` plus a real TS fixture, so a host with a good ffmpeg covers it and a host without does not silently skip |
 
@@ -293,8 +294,8 @@ length inference, every malformed spec, streaming a >64 KiB file, serde round-tr
 | Source | Precedence | Why it exists |
 | --- | --- | --- |
 | `--token-file PATH` | 1 | Per-run control. A **path**, so the secret never appears in `argv`, which `ps auxww` shows to every user on the machine |
-| `RIPTIDE_DAEMON_TOKEN` | 2 | Containers and service managers, which inject a secret without writing a file |
-| `daemon_token_file` in `config.json` | 3 | Set once with `riptide config set daemon_token_file /etc/riptide/token`; `config set … none` unsets it |
+| `ODM_DAEMON_TOKEN` | 2 | Containers and service managers, which inject a secret without writing a file |
+| `daemon_token_file` in `config.json` | 3 | Set once with `odm-cli config set daemon_token_file /etc/odm/token`; `config set … none` unsets it |
 
 Three decisions are load-bearing:
 
@@ -392,7 +393,7 @@ $ rustc ... --target x86_64-unknown-linux-gnu /tmp/broken.rs    # exit 0: the br
 
 **The whole crate for a foreign target is a different matter**, and it is why CI still matters.
 `cargo check --target x86_64-unknown-linux-musl` fails on this host, before reaching a single line
-of Riptide, inside `ring`:
+of Open Download Manager, inside `ring`:
 
 ```console
 $ cargo check --locked --target x86_64-unknown-linux-musl
@@ -418,9 +419,10 @@ is 0 *and* that the log names the signal and the finished shutdown, then run
 `scripts/check-headless.sh`), and `portability` (the script above). `.gitattributes` pins
 checkouts to LF so a Windows clone is byte-identical.
 
-The honest caveat, repeated because it is the whole point: **that workflow has never run.** This
-repository has no remote. Everything above that is tagged OBSERVED was run here; the workflow is
-the part that needs a second machine, and it is unexecuted rather than "tested".
+The honest caveat, repeated because it is the whole point: everything above that is tagged
+OBSERVED was run here, on one machine. The workflow is the part that needs a second machine; it
+now has a remote, so it runs on every push — but the results it reports are the ones to read for
+the Windows and macOS claims.
 
 Evidence for the parts that did run: 15 tests in `src/platform.rs` (both platforms’ layouts,
 the split `%HOMEDRIVE%`, an empty variable, no home at all; the write loop against a
@@ -473,7 +475,7 @@ and the downloads.
 
 `deploy/compose.yaml` publishes on the host's loopback by default, so it works out of the box
 with no token; reaching it from the network means changing the publish rule **and** setting
-`RIPTIDE_DAEMON_TOKEN` in the same edit, which the file says in the place you would be editing.
+`ODM_DAEMON_TOKEN` in the same edit, which the file says in the place you would be editing.
 
 **The release.** `.github/workflows/release.yml` builds on a `v*` tag: static musl and
 aarch64-glibc Linux, both macOS architectures, Windows MSVC; proves each Linux archive is static
@@ -492,7 +494,7 @@ exactly what the image contains — one file — using an unprivileged user name
 
 ```console
 $ RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --locked --target x86_64-unknown-linux-gnu
-$ ldd target/x86_64-unknown-linux-gnu/release/riptide
+$ ldd target/x86_64-unknown-linux-gnu/release/odm-cli
 	statically linked
 $ ./scripts/check-headless.sh
 == 1. a static binary ==
@@ -502,10 +504,10 @@ $ ./scripts/check-headless.sh
            60 /image/usr
            60 /image/usr/local
            60 /image/usr/local/bin
-     11984160 /image/usr/local/bin/riptide
+     11984160 /image/usr/local/bin/odm-cli
 == 3. where it keeps its files ==
-   no HOME    -> ./.config/riptide/config.json
-   HOME=/data -> /data/.config/riptide/config.json
+   no HOME    -> ./.config/odm/config.json
+   HOME=/data -> /data/.config/odm/config.json
 == 4. a real download ==
    6 MiB over 4 connections: … 100.0%  6.00 MB / 6.00 MB  —done → /data/Downloads/payload.bin
 == 5. the daemon serves the API, with a job in flight ==
@@ -531,7 +533,7 @@ the same one — no interpreter, no shared libraries — but the artefact is not
 still only built in CI. It is written here rather than left implied.
 
 The same signal claims are asserted against the released binary with no container, no chroot and
-no namespace, in `tests/shutdown.rs`: three tests start `riptide daemon`, start a trickling
+no namespace, in `tests/shutdown.rs`: three tests start `odm-cli daemon`, start a trickling
 origin, send a **real SIGTERM** (and SIGINT, as a control), and check that the process exits 0
 with a line naming the signal, that the interrupted job is on disk as `paused` with some bytes
 but not all of them, and that an idle daemon stops at once rather than sitting out the grace
@@ -550,8 +552,8 @@ three things, all fixed before moving on.
 
 1. **A signalled job was still counted as a failure by the commands that are not the daemon.**
    `cmd_download`, `cmd_grab` and `cmd_queue` each matched `Ok(Err(e))` and incremented their
-   `failed` counter, so `riptide download` and `riptide grab --download` printed `failed:
-   cancelled` and **exited 1**, and `riptide queue` printed `1 job(s) failed`. Nothing was lost —
+   `failed` counter, so `odm-cli download` and `odm-cli grab --download` printed `failed:
+   cancelled` and **exited 1**, and `odm-cli queue` printed `1 job(s) failed`. Nothing was lost —
    the engine had already recorded the job as `Paused` — but the exit code is what a supervisor
    reads, and `Restart=on-failure` restarts on it. A one-shot download under `systemd`, `cron` or
    a Kubernetes `Job` would therefore restart the unit on every stop it had asked for itself.
@@ -559,11 +561,11 @@ three things, all fixed before moving on.
    quota) rather than by the fact that it returned an error, report it as `stopped`, keep it out
    of the failure count, and exit 0. `queue`'s requirement — "paused by the quota" — already
    worked this way; the rule was simply not applied to cancellation. A fourth test in
-   `tests/shutdown.rs` sends SIGTERM to a foreground `riptide download`, which is the shape a
+   `tests/shutdown.rs` sends SIGTERM to a foreground `odm-cli download`, which is the shape a
    one-shot job has, and asserts the exit code, the absence of the word `failed`, and that the
    job is a resumable partial.
 
-2. **The Dockerfile's static check was `ldd`.** `RUN ldd target/release/riptide | grep -qE 'not
+2. **The Dockerfile's static check was `ldd`.** `RUN ldd target/release/odm-cli | grep -qE 'not
    a dynamic executable|statically linked'` was written from glibc's wording. The build stage is
    Alpine, whose `ldd` is a separate program with its own wording for a static binary, and the
    check is a guard on a `scratch` image: if it passes for the wrong reason the image ships an
@@ -597,14 +599,14 @@ returned an error, it now keeps the video track, exactly as it already did when 
 missing.
 
 Evidence: 4 unit tests, one of which uses **whatever `ffmpeg` the host actually has** (via
-`EnvVar::unset("RIPTIDE_FFMPEG")`) and asserts that publishing an MPEG-TS track can never fail
+`EnvVar::unset("ODM_FFMPEG")`) and asserts that publishing an MPEG-TS track can never fail
 and the raw track always survives — so absent, broken, and working-but-handed-bad-input are all
 covered, and item 7's "host with a good ffmpeg" case degrades to this same assertion rather
-than silently skipping. The unit tests that mutate `RIPTIDE_FFMPEG`/`PATH` now hold a process
+than silently skipping. The unit tests that mutate `ODM_FFMPEG`/`PATH` now hold a process
 lock, because `cargo test` runs them on threads.
 
 **Explicitly not planned**, for the same reasons they were dropped from IDM’s design
-([README](../README.md#how-riptide-differs-from-idm)): kernel filter drivers, redirecting the
+([README](../README.md#how-odm-cli-differs-from-idm)): kernel filter drivers, redirecting the
 browser through a local proxy, silent `declarativeNetRequest` rewrites, a PID-trusted native
 messaging host, and any DRM circumvention or per-site signature layer.
 
@@ -637,7 +639,7 @@ grep -riE "playwright|puppeteer|selenium|chromedriver|geckodriver" \
 
 # Platform support
 rustup target list --installed
-ls .github/workflows                    # ci.yml — written, and unrun (no remote)
+ls .github/workflows                    # ci.yml — runs on every push
 ```
 
 ## Part 5 — Reproducing items 1 and 6
@@ -654,19 +656,19 @@ cargo test --test checksum
 mkdir -p /tmp/ck && head -c 300000 /dev/urandom > /tmp/ck/data.bin
 (cd /tmp/ck && python3 -m http.server 18099 &) ; sleep 1
 GOOD=$(sha256sum /tmp/ck/data.bin | cut -d' ' -f1)
-riptide download --checksum "sha256:$GOOD" -o /tmp/ck/ok.bin http://127.0.0.1:18099/data.bin
+odm-cli download --checksum "sha256:$GOOD" -o /tmp/ck/ok.bin http://127.0.0.1:18099/data.bin
 cmp /tmp/ck/ok.bin /tmp/ck/data.bin                     # identical
-riptide download --checksum "sha256:$(printf '0%.0s' {1..64})" \
+odm-cli download --checksum "sha256:$(printf '0%.0s' {1..64})" \
     -o /tmp/ck/bad.bin http://127.0.0.1:18099/data.bin   # fails, publishes nothing
 ls /tmp/ck/bad.bin /tmp/ck/bad.bin.part                  # neither exists
 
 # Refused combinations, each with an explanation rather than a silent ignore.
-riptide download --checksum "sha256:$GOOD" -o /tmp/ck/ http://127.0.0.1:18099/data.bin \
+odm-cli download --checksum "sha256:$GOOD" -o /tmp/ck/ http://127.0.0.1:18099/data.bin \
     http://127.0.0.1:18099/data.bin
-riptide grab --archive --checksum "sha256:$GOOD" http://127.0.0.1:18099/
+odm-cli grab --archive --checksum "sha256:$GOOD" http://127.0.0.1:18099/
 
 # The daemon API takes the same field; an unparsable one is a 400, a mismatch is a failed job.
-riptide daemon --addr 127.0.0.1:18098 &
+odm-cli daemon --addr 127.0.0.1:18098 &
 curl -s -X POST http://127.0.0.1:18098/api/jobs -H 'content-type: application/json' \
      -d "{\"url\":\"http://127.0.0.1:18099/data.bin\",\"checksum\":\"nonsense\"}"   # 400
 
@@ -690,13 +692,13 @@ cargo test --lib daemon
 cargo test --test daemon
 
 # A token file that cannot be read is a startup failure, not an open daemon.
-riptide daemon --addr 127.0.0.1:18123 --token-file /tmp/rtauth/absent   # exits non-zero
+odm-cli daemon --addr 127.0.0.1:18123 --token-file /tmp/rtauth/absent   # exits non-zero
 
 # Live: generate a token, bind a port, and ask it things as a client would.
-riptide daemon --generate-token-file /tmp/rtauth/token
+odm-cli daemon --generate-token-file /tmp/rtauth/token
 stat -c '%a %n' /tmp/rtauth/token            # 600
 TOKEN=$(cat /tmp/rtauth/token)
-riptide daemon --addr 127.0.0.1:18123 --token-file /tmp/rtauth/token &
+odm-cli daemon --addr 127.0.0.1:18123 --token-file /tmp/rtauth/token &
 sleep 1
 
 for p in / /health /api/jobs /api/quota /api/projects; do
@@ -719,7 +721,7 @@ curl -s -X POST -d '{"url":"https://example.com/x"}' \
 # Off loopback the daemon says what the token does and does not protect.
 #   warning: … no token is configured …        (no token, off loopback)
 #   note: … plain HTTP, so the token travels in the clear …
-RIPTIDE_DAEMON_TOKEN=envtok riptide daemon --addr 0.0.0.0:18124 &   # note
+ODM_DAEMON_TOKEN=envtok odm-cli daemon --addr 0.0.0.0:18124 &   # note
 ```
 
 For the WebSocket half, the relevant property is that the client is a *browser*, which cannot
@@ -783,14 +785,14 @@ cargo test archive::         # 24
 # Live: what this Linux box resolves, in a directory of its own.
 mkdir -p /tmp/rtplat/{home,data,config}
 export HOME=/tmp/rtplat/home XDG_DATA_HOME=/tmp/rtplat/data XDG_CONFIG_HOME=/tmp/rtplat/config
-riptide config path                          # /tmp/rtplat/config/riptide/config.json
-riptide config show | grep -E 'download_dir|state_dir'
+odm-cli config path                          # /tmp/rtplat/config/odm/config.json
+odm-cli config show | grep -E 'download_dir|state_dir'
 #   "download_dir": "/tmp/rtplat/home/Downloads"
-#   "state_dir": "/tmp/rtplat/data/riptide"
+#   "state_dir": "/tmp/rtplat/data/odm"
 
 # The last resort is unchanged, and is still the working directory.
-env -u HOME -u XDG_DATA_HOME -u XDG_CONFIG_HOME riptide config path
-#   ./.config/riptide/config.json
+env -u HOME -u XDG_DATA_HOME -u XDG_CONFIG_HOME odm-cli config path
+#   ./.config/odm/config.json
 
 # Live: a URL that is a device name, or that ends in a dot, becomes a name Windows can store.
 mkdir -p /tmp/rtnul/site && cd /tmp/rtnul/site
@@ -798,13 +800,13 @@ printf '<a href="/NUL">a</a><a href="/trailing.">b</a><a href="/COM1.txt">c</a>'
 for f in NUL 'trailing.' COM1.txt; do echo "$f page" > "$f"; done
 python3 -m http.server 18132 --bind 127.0.0.1 &
 sleep 1
-riptide grab --archive -o /tmp/rtnul/mirror http://127.0.0.1:18132/index.html
+odm-cli grab --archive -o /tmp/rtnul/mirror http://127.0.0.1:18132/index.html
 find /tmp/rtnul/mirror -mindepth 1 | sort
 #   /tmp/rtnul/mirror/~43OM1.txt
 #   /tmp/rtnul/mirror/~4eUL
 #   /tmp/rtnul/mirror/index.html
-#   /tmp/rtnul/mirror/_riptide
-#   /tmp/rtnul/mirror/_riptide/validators.json
+#   /tmp/rtnul/mirror/_odm
+#   /tmp/rtnul/mirror/_odm/validators.json
 #   /tmp/rtnul/mirror/trailing~2e
 cat /tmp/rtnul/mirror/index.html
 #   <a href="~4eUL">a</a><a href="trailing~2e">b</a><a href="~43OM1.txt">c</a>
@@ -842,16 +844,16 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # A fully static binary. `crt-static` on the glibc target is the substitute here for the musl
 # build the Dockerfile produces, because `musl-gcc` is not installable on this machine.
 RUSTFLAGS='-C target-feature=+crt-static' cargo build --release --locked --target x86_64-unknown-linux-gnu
-ldd target/x86_64-unknown-linux-gnu/release/riptide
+ldd target/x86_64-unknown-linux-gnu/release/odm-cli
 #   statically linked
 
 # The image's claims, on a machine with nothing to build an image with. The rootfs it builds
 # holds one file; the chroot is an unprivileged user namespace.
 ./scripts/check-headless.sh
 #   == 1. a static binary == 11984160 bytes, ldd says: statically linked
-#   == 2. an image that is one file == /image/usr/local/bin/riptide, /image/data
-#   == 3. where it keeps its files == no HOME -> ./.config/riptide/config.json
-#                                     HOME=/data -> /data/.config/riptide/config.json
+#   == 2. an image that is one file == /image/usr/local/bin/odm-cli, /image/data
+#   == 3. where it keeps its files == no HOME -> ./.config/odm/config.json
+#                                     HOME=/data -> /data/.config/odm/config.json
 #   == 4. a real download == 6 MiB over 4 connections, byte-identical
 #   == 5. the daemon serves the API == /health 200, / 200, POST /api/jobs 201
 #   == 6. docker stop, mid-download == exit=0 after 1s, job paused at 2070976 of 12582912
@@ -868,13 +870,13 @@ cargo test --test shutdown
 # By hand, the same thing for the commands a one-shot job runs: a stop is a stop, not a failure
 # and not exit 1. Both leave the job `paused` and resumable.
 python3 tests/origin.py 8099 /tmp/big-root --slow &      # a range-capable, slow origin
-riptide download http://127.0.0.1:8099/big.bin & kill -TERM %1
-#   …: stopped — resume with `riptide queue`
-#   1 download(s) stopped before finishing; run `riptide queue` to resume
+odm-cli download http://127.0.0.1:8099/big.bin & kill -TERM %1
+#   …: stopped — resume with `odm-cli queue`
+#   1 download(s) stopped before finishing; run `odm-cli queue` to resume
 #   exit 0        (it used to print `failed: cancelled` and exit 1)
-riptide queue & kill -TERM %1
+odm-cli queue & kill -TERM %1
 #   big.bin: stopped
-#   1 job(s) stopped before finishing; run `riptide queue` again to resume
+#   1 job(s) stopped before finishing; run `odm-cli queue` again to resume
 #   exit 0        (it used to print `1 job(s) failed`)
 
 # The two halves of the drain mechanism, at unit level.
@@ -885,13 +887,13 @@ cargo test scheduler::
 # By hand, without any test harness: SIGTERM stops the daemon and it exits 0.
 python3 tests/origin.py 18092 /tmp/rtorigin &
 mkdir -p /tmp/rtorigin && head -c 6M /dev/urandom > /tmp/rtorigin/payload.bin
-export RIPTIDE_CONFIG=/tmp/rtcontainer/config.json HOME=/tmp/rtcontainer
-riptide config init
-riptide daemon --addr 127.0.0.1:18091 &      # prints the exposure note too, on 0.0.0.0
+export ODM_CONFIG=/tmp/rtcontainer/config.json HOME=/tmp/rtcontainer
+odm-cli config init
+odm-cli daemon --addr 127.0.0.1:18091 &      # prints the exposure note too, on 0.0.0.0
 curl -s http://127.0.0.1:18091/health        # ok
 kill -TERM %2; wait %2; echo $?              # SIGTERM … stopped
 #   0                                        ← not 143: the process stopped itself
-riptide list                                 # the queue is intact
+odm-cli list                                 # the queue is intact
 ```
 
 Two things are still only written down rather than run: the **musl** binary (built in CI, not

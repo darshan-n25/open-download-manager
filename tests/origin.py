@@ -7,7 +7,7 @@
 stand in for a real origin: a segmented downloader against it either refuses to split the file
 or gets `200` for a `Range` request. This answers `HEAD` with the size, advertises
 `Accept-Ranges`, and replies `206` with the right `Content-Range` for a ranged `GET` — the
-three things Riptide's probe and its segment workers need in order to be tested for real.
+three things Open Download Manager's probe and its segment workers need in order to be tested for real.
 
 `--slow` dribbles the body out a chunk at a time, so a transfer is still running when something
 else asks the daemon to stop. That is what makes it possible to check a shutdown mid-download

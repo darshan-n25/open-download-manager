@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::job::Job;
 
 #[derive(Clone, Debug)]
@@ -40,9 +40,9 @@ impl JobStore {
         let path = self.path_for(id);
         let data = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                RiptideError::NoSuchJob(id.to_string())
+                OdmError::NoSuchJob(id.to_string())
             } else {
-                RiptideError::Io(e)
+                OdmError::Io(e)
             }
         })?;
         Ok(serde_json::from_slice(&data)?)
@@ -147,7 +147,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = JobStore::open(dir.path()).unwrap();
         match store.load("nope") {
-            Err(RiptideError::NoSuchJob(id)) => assert_eq!(id, "nope"),
+            Err(OdmError::NoSuchJob(id)) => assert_eq!(id, "nope"),
             other => panic!("expected NoSuchJob, got {other:?}"),
         }
     }

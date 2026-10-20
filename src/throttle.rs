@@ -1,7 +1,7 @@
 //! Independent bandwidth ceilings.
 //!
 //! IDM exposes "Maximum download speed" (global) and "Maximum download speed for one
-//! file" (per job) as separate controls. Riptide models each as its own leaky/token
+//! file" (per job) as separate controls. Open Download Manager models each as its own leaky/token
 //! bucket so a queue of jobs shares the global ceiling while each job may additionally
 //! be capped on its own.
 

@@ -14,10 +14,10 @@
 //!   7 = fixed servers, value = "http://p;socks5://q"  (+ ";bypass,...")
 //! ```
 //!
-//! Riptide accepts that exact syntax *and* a plain proxy URL, so `--proxy` works the way
+//! Open Download Manager accepts that exact syntax *and* a plain proxy URL, so `--proxy` works the way
 //! people expect while remaining compatible with what an IDM-style extension sends.
 
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxySpec {
@@ -84,7 +84,7 @@ fn valid_scheme(s: &str) -> bool {
 ///
 /// IDM's compact string is genuinely ambiguous: in `1:http://p:3128;localhost` the `;`
 /// introduces bypass entries, while in `7:http://a:1;socks5://b:2` it separates two proxy
-/// servers. Riptide resolves it by shape rather than by position — an entry is a proxy only
+/// servers. Open Download Manager resolves it by shape rather than by position — an entry is a proxy only
 /// if it carries a recognised scheme *and* a port; anything else is a bypass pattern.
 fn split_proxies_and_bypass<'a>(
     items: impl Iterator<Item = &'a str>,
@@ -122,9 +122,7 @@ pub fn parse_proxy(input: &str) -> Result<ProxySpec> {
     {
         let url = normalise_url(s);
         if !valid_scheme(&url) {
-            return Err(RiptideError::other(format!(
-                "unsupported proxy scheme: {s}"
-            )));
+            return Err(OdmError::other(format!("unsupported proxy scheme: {s}")));
         }
         return Ok(ProxySpec::Server {
             proxies: vec![url],
@@ -173,7 +171,7 @@ pub fn parse_proxy(input: &str) -> Result<ProxySpec> {
                     Ok(ProxySpec::Pac(value.to_string()))
                 }
             }
-            other => Err(RiptideError::other(format!("unknown proxy mode {other}"))),
+            other => Err(OdmError::other(format!("unknown proxy mode {other}"))),
         };
     }
 

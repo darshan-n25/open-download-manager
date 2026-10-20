@@ -2,7 +2,7 @@
 //!
 //! Deliberately its own stack rather than a browser's: IDM imports only seven Win32 DLLs
 //! and resolves `ws2_32`/`schannel` dynamically precisely so it fully controls range,
-//! resume and timeout behaviour. Riptide gets the same control by configuring one
+//! resume and timeout behaviour. Open Download Manager gets the same control by configuring one
 //! `reqwest` client per job from the captured [`RequestContext`].
 
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use reqwest::cookie::Jar;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE, REFERER};
 
 use super::proxy::{parse_proxy, ProxySpec};
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::job::RequestContext;
 
 pub struct NetClient {
@@ -23,9 +23,9 @@ pub struct NetClient {
 
 fn header_pair(k: &str, v: &str) -> Result<(HeaderName, HeaderValue)> {
     let name = HeaderName::from_bytes(k.as_bytes())
-        .map_err(|e| RiptideError::other(format!("bad header name {k:?}: {e}")))?;
+        .map_err(|e| OdmError::other(format!("bad header name {k:?}: {e}")))?;
     let value = HeaderValue::from_str(v)
-        .map_err(|e| RiptideError::other(format!("bad header value for {k:?}: {e}")))?;
+        .map_err(|e| OdmError::other(format!("bad header value for {k:?}: {e}")))?;
     Ok((name, value))
 }
 

@@ -165,7 +165,7 @@ pub struct MediaSpec {
     pub init_url: Option<String>,
     pub segments: Vec<MediaSegmentRef>,
     pub key: Option<MediaKey>,
-    /// Separate audio track, when the manifest splits video and audio. Riptide muxes the
+    /// Separate audio track, when the manifest splits video and audio. Open Download Manager muxes the
     /// two automatically instead of leaving the user with two stray files.
     #[serde(default)]
     pub audio: Option<Box<MediaSpec>>,

@@ -1,18 +1,18 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use riptide::bt::engine;
-use riptide::bt::magnet::Magnet;
-use riptide::bt::torrent::Torrent;
-use riptide::bt::tracker;
-use riptide::config::Config;
-use riptide::error::Result;
+use odm::bt::engine;
+use odm::bt::magnet::Magnet;
+use odm::bt::torrent::Torrent;
+use odm::bt::tracker;
+use odm::config::Config;
+use odm::error::Result;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "riptide-bt",
+    name = "odm-bt",
     version,
-    about = "BitTorrent companion to riptide"
+    about = "BitTorrent companion to Open Download Manager"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,8 +45,7 @@ async fn main() {
 async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Info { torrent } => {
-            let data =
-                std::fs::read(&torrent).map_err(|e| riptide::RiptideError::other(e.to_string()))?;
+            let data = std::fs::read(&torrent).map_err(|e| odm::OdmError::other(e.to_string()))?;
             let t = Torrent::from_bytes(&data)?;
             println!("name:        {}", t.name);
             println!("size:        {} bytes", t.length);
@@ -77,8 +76,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
 
             let path = PathBuf::from(&source);
-            let data =
-                std::fs::read(&path).map_err(|e| riptide::RiptideError::other(e.to_string()))?;
+            let data = std::fs::read(&path).map_err(|e| odm::OdmError::other(e.to_string()))?;
             let t = Torrent::from_bytes(&data)?;
             println!("{}: {} bytes, {} pieces", t.name, t.length, t.num_pieces());
 
@@ -87,7 +85,7 @@ async fn run(cli: Cli) -> Result<()> {
             let peers = tracker::announce(&t, &peer_id, port, t.length).await?;
             println!("tracker returned {} peers", peers.len());
             if peers.is_empty() {
-                return Err(riptide::RiptideError::other("no peers from tracker"));
+                return Err(odm::OdmError::other("no peers from tracker"));
             }
 
             let out_path = dir.join(&t.name);

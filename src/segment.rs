@@ -3,7 +3,7 @@
 //! IDM's engine keeps a *mutable* chunk list — the strings
 //! `Insert next chunk in list`, `Erase chunk_list`, `Change chunk size to %ld` and
 //! `Chunk order violation error` all come from its `ChLst` class. So instead of one
-//! fixed split up front, Riptide plans an initial split and then lets idle workers
+//! fixed split up front, Open Download Manager plans an initial split and then lets idle workers
 //! carve the largest outstanding remainder in half (see [`split_off`]).
 
 use crate::job::Segment;

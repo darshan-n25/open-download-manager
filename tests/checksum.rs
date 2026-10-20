@@ -14,11 +14,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use riptide::checksum::{Algorithm, Checksum};
-use riptide::config::Config;
-use riptide::engine::Engine;
-use riptide::error::RiptideError;
-use riptide::job::{Job, JobKind};
+use odm::checksum::{Algorithm, Checksum};
+use odm::config::Config;
+use odm::engine::Engine;
+use odm::error::OdmError;
+use odm::job::{Job, JobKind};
 
 /// A deterministic body large enough to be split into many segments.
 fn body(len: usize) -> Vec<u8> {
@@ -182,7 +182,7 @@ async fn a_mismatching_checksum_fails_and_publishes_nothing() {
     let err = engine.run().await.unwrap_err();
 
     match &err {
-        RiptideError::ChecksumMismatch { expected, .. } => {
+        OdmError::ChecksumMismatch { expected, .. } => {
             assert_eq!(
                 expected, &wrong.digest,
                 "the error names the expected digest"
@@ -196,7 +196,7 @@ async fn a_mismatching_checksum_fails_and_publishes_nothing() {
         "the working file must be removed on mismatch"
     );
     // And the job is recorded as failed, not done.
-    assert_eq!(engine.job().state, riptide::job::JobState::Failed);
+    assert_eq!(engine.job().state, odm::job::JobState::Failed);
 }
 
 #[tokio::test]

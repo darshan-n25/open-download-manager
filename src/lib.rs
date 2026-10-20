@@ -1,4 +1,4 @@
-//! Riptide — an open-source, cross-platform download manager.
+//! Open Download Manager — an open-source, cross-platform download manager.
 //!
 //! Design derived from the static reverse-engineering of Internet Download Manager
 //! documented in `docs/IDM-REVERSE-ENGINEERING.md`:
@@ -43,5 +43,5 @@ pub mod storage;
 pub mod throttle;
 pub mod util;
 
-pub use error::{Result, RiptideError};
+pub use error::{OdmError, Result};
 pub use job::{Job, JobKind, JobState, Segment, SegmentState};

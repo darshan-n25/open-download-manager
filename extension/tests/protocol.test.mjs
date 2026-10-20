@@ -82,7 +82,7 @@ test('several frames in one message are all returned', () => {
 });
 
 test('a partial frame is held back and completed later', () => {
-  const whole = encodeFrame({ id: 9, type: MSG.HELLO_ACK, kv: { server: 'riptide/0.1.0' } });
+  const whole = encodeFrame({ id: 9, type: MSG.HELLO_ACK, kv: { server: 'odm/0.1.0' } });
   const cut = 12;
 
   const first = drainFrames(whole.slice(0, cut));
@@ -91,7 +91,7 @@ test('a partial frame is held back and completed later', () => {
 
   const second = drainFrames(first.rest + whole.slice(cut));
   assert.equal(second.frames.length, 1);
-  assert.equal(second.frames[0].kv.server, 'riptide/0.1.0');
+  assert.equal(second.frames[0].kv.server, 'odm/0.1.0');
   assert.equal(second.rest, '');
 });
 
@@ -112,7 +112,7 @@ test('the real HELLO_ACK the daemon sends parses completely', () => {
   // Captured from a live daemon during the smoke test.
   const raw =
     'MSG#1#2#0#0,version=16845059,protocol=plugin.v3.internetdownloadmanager.com,' +
-    'conn=8,perconn=2,maxconn=32,hls=1,dash=1,ftp=1,server=riptide/0.1.0;';
+    'conn=8,perconn=2,maxconn=32,hls=1,dash=1,ftp=1,server=odm/0.1.0;';
   const { frames, rest } = drainFrames(raw);
   assert.equal(rest, '');
   assert.equal(frames.length, 1);
@@ -121,7 +121,7 @@ test('the real HELLO_ACK the daemon sends parses completely', () => {
   assert.equal(f.type, MSG.HELLO_ACK);
   assert.equal(f.kv.protocol, 'plugin.v3.internetdownloadmanager.com');
   assert.equal(f.kv.perconn, '2');
-  assert.equal(f.kv.server, 'riptide/0.1.0');
+  assert.equal(f.kv.server, 'odm/0.1.0');
   // The daemon answers with the same packed constant the extension announced.
   assert.equal(f.kv.version, String(PROTOCOL_VERSION));
 });
@@ -142,10 +142,10 @@ test('encoding is exactly encodeURIComponent', () => {
 });
 
 test('the daemon URL carries a token only when there is one', () => {
-  const base = { host: '127.0.0.1', port: 1001, cid: 'riptide-ext', nonce: 1234 };
+  const base = { host: '127.0.0.1', port: 1001, cid: 'odm-ext', nonce: 1234 };
 
   const bare = P.daemonWsUrl({ ...base, token: '' });
-  assert.equal(bare, 'ws://127.0.0.1:1001/?cid=riptide-ext&rnd=1234');
+  assert.equal(bare, 'ws://127.0.0.1:1001/?cid=odm-ext&rnd=1234');
   assert.ok(!bare.includes('token'), bare);
 
   // Undefined and null behave like empty, so a settings file that predates the field works.
@@ -153,7 +153,7 @@ test('the daemon URL carries a token only when there is one', () => {
   assert.equal(P.daemonWsUrl({ ...base, token: null }), bare);
 
   const withToken = P.daemonWsUrl({ ...base, token: 'abc123' });
-  assert.equal(withToken, 'ws://127.0.0.1:1001/?cid=riptide-ext&rnd=1234&token=abc123');
+  assert.equal(withToken, 'ws://127.0.0.1:1001/?cid=odm-ext&rnd=1234&token=abc123');
 });
 
 test('a token that needs encoding is encoded', () => {
@@ -162,11 +162,11 @@ test('a token that needs encoding is encoded', () => {
   const url = P.daemonWsUrl({
     host: '10.0.0.5',
     port: 1001,
-    cid: 'riptide-ext',
+    cid: 'odm-ext',
     token: 'a&b=c #d',
     nonce: 7,
   });
-  assert.equal(url, 'ws://10.0.0.5:1001/?cid=riptide-ext&rnd=7&token=a%26b%3Dc%20%23d');
+  assert.equal(url, 'ws://10.0.0.5:1001/?cid=odm-ext&rnd=7&token=a%26b%3Dc%20%23d');
 
   // And the daemon's own parser reads back exactly what was sent: percent-decode, then take
   // the `token=` pair. (The Rust side is asserted in `src/daemon.rs::a_token_query_parameter

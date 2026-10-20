@@ -1,7 +1,7 @@
 //! The daemon's own bearer token — the *server* side of authentication.
 //!
 //! The rest of [`crate::auth`] is about authenticating **to** other servers (Basic, Digest,
-//! NTLM, Negotiate). This module is the reverse: the credential Riptide's daemon demands
+//! NTLM, Negotiate). This module is the reverse: the credential Open Download Manager's daemon demands
 //! from its own clients, so that listening somewhere other than loopback is a decision
 //! rather than an accident.
 //!
@@ -21,11 +21,11 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 /// Environment variable holding the token literally — for containers and service managers,
 /// which can inject a secret without writing a file.
-pub const ENV_TOKEN: &str = "RIPTIDE_DAEMON_TOKEN";
+pub const ENV_TOKEN: &str = "ODM_DAEMON_TOKEN";
 
 /// A required daemon token, kept as its SHA-256 so a comparison is over a fixed width.
 #[derive(Clone)]
@@ -47,13 +47,13 @@ impl Auth {
     /// a mistake, and the consequence of guessing wrong is an open daemon.
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            RiptideError::other(format!(
+            OdmError::other(format!(
                 "cannot read the daemon token file {}: {e}",
                 path.display()
             ))
         })?;
         if raw.trim().is_empty() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "the daemon token file {} is empty; refusing to run with a token that \
                  authenticates nothing",
                 path.display()
@@ -105,7 +105,7 @@ fn load_from(
     }
     if let Some(raw) = env_token {
         if raw.trim().is_empty() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "{ENV_TOKEN} is set but empty; unset it or give it a value"
             )));
         }
@@ -124,7 +124,7 @@ fn load_from(
 /// command should do by surprise.
 pub fn write_token_file(path: &Path) -> Result<String> {
     if path.exists() {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "{} already exists; delete it first if you really want to replace the token",
             path.display()
         )));

@@ -2,7 +2,7 @@
 //!
 //! IDM's engine strings (`Cannot open ftp data socket`, `Cannot find IP address for data
 //! socket in reply on PASV command.`) show it speaks FTP directly over its own socket
-//! loop. Riptide does the same over tokio, and implements resume through `REST`, which is
+//! loop. Open Download Manager does the same over tokio, and implements resume through `REST`, which is
 //! the FTP equivalent of an HTTP byte range.
 //!
 //! Explicit/implicit TLS (`ftps://`) is **not** implemented — see `docs/FEATURE-MAP.md`.
@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::engine::Engine;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::storage::Sink;
 
 /// A parsed `ftp://` URL.
@@ -31,19 +31,19 @@ pub const DEFAULT_FTP_PORT: u16 = 21;
 
 /// Parse an `ftp://` URL, applying conventional defaults for missing parts.
 pub fn parse_ftp_url(raw: &str) -> Result<FtpUrl> {
-    let u = url::Url::parse(raw).map_err(RiptideError::Url)?;
+    let u = url::Url::parse(raw).map_err(OdmError::Url)?;
     match u.scheme() {
         "ftp" => {}
         "ftps" => {
-            return Err(RiptideError::Unsupported(
+            return Err(OdmError::Unsupported(
                 "FTPS (FTP over TLS) is not implemented; use plain ftp:// for now".into(),
             ))
         }
-        other => return Err(RiptideError::other(format!("{other}:// is not an FTP URL"))),
+        other => return Err(OdmError::other(format!("{other}:// is not an FTP URL"))),
     }
     let host = u
         .host_str()
-        .ok_or_else(|| RiptideError::other("FTP URL has no host"))?
+        .ok_or_else(|| OdmError::other("FTP URL has no host"))?
         .to_string();
     let port = u.port().unwrap_or(DEFAULT_FTP_PORT);
 
@@ -102,17 +102,17 @@ pub fn filename_of(path: &str) -> Option<String> {
 pub fn parse_pasv(reply: &str) -> Result<String> {
     let open = reply
         .find('(')
-        .ok_or_else(|| RiptideError::Protocol("PASV reply has no address".into()))?;
+        .ok_or_else(|| OdmError::Protocol("PASV reply has no address".into()))?;
     let close = reply
         .find(')')
-        .ok_or_else(|| RiptideError::Protocol("PASV reply has no closing paren".into()))?;
+        .ok_or_else(|| OdmError::Protocol("PASV reply has no closing paren".into()))?;
     let inner = &reply[open + 1..close];
     let parts: Vec<u16> = inner
         .split(',')
         .filter_map(|p| p.trim().parse::<u16>().ok())
         .collect();
     if parts.len() != 6 {
-        return Err(RiptideError::Protocol(format!(
+        return Err(OdmError::Protocol(format!(
             "PASV reply did not contain six numbers: {inner:?}"
         )));
     }
@@ -153,7 +153,7 @@ impl Control {
     async fn connect(host: &str, port: u16, timeout: Duration) -> Result<Self> {
         let stream = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
             .await
-            .map_err(|_| RiptideError::other(format!("timed out connecting to {host}:{port}")))??;
+            .map_err(|_| OdmError::other(format!("timed out connecting to {host}:{port}")))??;
         stream.set_nodelay(true).ok();
         let (r, w) = stream.into_split();
         Ok(Control {
@@ -169,7 +169,7 @@ impl Control {
             let mut line = String::new();
             let n = self.reader.read_line(&mut line).await?;
             if n == 0 {
-                return Err(RiptideError::Protocol(
+                return Err(OdmError::Protocol(
                     "FTP control connection closed unexpectedly".into(),
                 ));
             }
@@ -226,7 +226,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
     let mut ctrl = Control::connect(&target.host, target.port, connect_timeout).await?;
     let (code, banner) = ctrl.read_reply().await?;
     if code != 220 {
-        return Err(RiptideError::Protocol(format!(
+        return Err(OdmError::Protocol(format!(
             "FTP server refused the connection: {banner}"
         )));
     }
@@ -237,14 +237,14 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
         331 => {
             let (code, msg) = ctrl.cmd(&format!("PASS {}", target.pass)).await?;
             if code != 230 {
-                return Err(RiptideError::AuthFailed(format!(
+                return Err(OdmError::AuthFailed(format!(
                     "FTP login failed ({}): {msg}",
                     code
                 )));
             }
         }
         _ => {
-            return Err(RiptideError::AuthFailed(format!(
+            return Err(OdmError::AuthFailed(format!(
                 "FTP USER rejected ({}): {msg}",
                 code
             )))
@@ -254,7 +254,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
     // Binary mode is mandatory: ASCII mode would rewrite line endings and corrupt the file.
     let (code, msg) = ctrl.cmd("TYPE I").await?;
     if code != 200 {
-        return Err(RiptideError::Protocol(format!(
+        return Err(OdmError::Protocol(format!(
             "FTP TYPE I failed ({}): {msg}",
             code
         )));
@@ -298,7 +298,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
     let data = open_data_connection(&mut ctrl, connect_timeout).await?;
     let (code, msg) = ctrl.cmd(&format!("RETR {}", target.path)).await?;
     if code != 150 && code != 125 {
-        return Err(RiptideError::Protocol(format!(
+        return Err(OdmError::Protocol(format!(
             "FTP RETR refused ({}): {msg}",
             code
         )));
@@ -312,12 +312,12 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
     loop {
         if engine.is_cancelled() {
             ctrl.quit().await;
-            return Err(RiptideError::Cancelled);
+            return Err(OdmError::Cancelled);
         }
         let n = match tokio::time::timeout(read_timeout, reader.read(&mut buf)).await {
             Err(_) => {
                 ctrl.quit().await;
-                return Err(RiptideError::other("FTP data connection timed out"));
+                return Err(OdmError::other("FTP data connection timed out"));
             }
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => n,
@@ -340,7 +340,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
         Ok(Ok((code, msg))) => {
             if code != 226 && code != 250 {
                 ctrl.quit().await;
-                return Err(RiptideError::Protocol(format!(
+                return Err(OdmError::Protocol(format!(
                     "FTP transfer did not complete cleanly ({}): {msg}",
                     code
                 )));
@@ -352,7 +352,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
 
     if let Some(t) = total {
         if pos != t {
-            return Err(RiptideError::Protocol(format!(
+            return Err(OdmError::Protocol(format!(
                 "FTP transfer ended early: got {pos} of {t} bytes"
             )));
         }
@@ -370,7 +370,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
 async fn open_data_connection(ctrl: &mut Control, timeout: Duration) -> Result<TcpStream> {
     let (code, msg) = ctrl.cmd("PASV").await?;
     if code != 227 {
-        return Err(RiptideError::Protocol(format!(
+        return Err(OdmError::Protocol(format!(
             "FTP PASV failed ({}): {msg}",
             code
         )));
@@ -378,9 +378,7 @@ async fn open_data_connection(ctrl: &mut Control, timeout: Duration) -> Result<T
     let addr = parse_pasv(&msg)?;
     let stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
         .await
-        .map_err(|_| {
-            RiptideError::other(format!("timed out connecting to FTP data port {addr}"))
-        })??;
+        .map_err(|_| OdmError::other(format!("timed out connecting to FTP data port {addr}")))??;
     Ok(stream)
 }
 
@@ -413,7 +411,7 @@ mod tests {
     #[test]
     fn ftps_is_explicitly_unsupported() {
         match parse_ftp_url("ftps://host/x") {
-            Err(RiptideError::Unsupported(_)) => {}
+            Err(OdmError::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }

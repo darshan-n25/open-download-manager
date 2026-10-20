@@ -1,15 +1,21 @@
 name: Release
 
-# What "headless" ends with: something to download that is not a source tree.
+# What a release is: a page on GitHub with a download button per platform, and the
+# archives behind it. That is what a user expects to find on a download manager's
+# releases page, so this workflow builds them the way the community expects:
 #
-# On a `v*` tag this builds the binary for every platform Riptide claims to support, attaches
-# the archives to a GitHub Release, and pushes the container image to GHCR. The Linux
-# archives are static musl builds, which is what makes them usable on a NAS, an Alpine
-# container or a router without a package manager in sight.
+#   open-download-manager-<version>-windows-x64.zip   the app (GUI), with the CLI
+#   open-download-manager-<version>-macos-<arch>.tar.gz
+#   open-download-manager-<version>-linux-x86_64.tar.gz
+#   open-download-manager-cli-<version>-<target>.tar.gz   the headless build
+#   open-download-manager-extension-<version>.zip          the browser extension
+#   SHA256SUMS.txt                                   checksums for all of the above
 #
-# Not executed: this repository has no git remote yet, so no tag has ever been pushed. The
-# same steps run in `ci.yml` on every commit — except the two that publish, which by
-# definition only a real release does.
+# Everything is built on a native runner for its platform, so the binaries are the
+# ones a user would get from `cargo build` on their own machine. The release page is
+# created with `gh release create`, and the notes are the tag's commits plus the
+# install section of the README, so the page says how to use the thing as well as
+# what changed.
 
 on:
   push:
@@ -28,10 +34,108 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # The binaries
+  # The version, read once so every job agrees on it
   # ---------------------------------------------------------------------------
-  artifacts:
-    name: ${{ matrix.target }}
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag=${GITHUB_REF_NAME:-v$version}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "building $version ($tag)"
+
+  # ---------------------------------------------------------------------------
+  # The desktop app: the thing most people install
+  # ---------------------------------------------------------------------------
+  desktop:
+    name: desktop (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary: odm
+            # eframe's X11 backend links against these; they are build-time only.
+            packages: libx11-dev libxkbcommon-dev libgl1-mesa-dev
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary: odm
+            packages: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary: odm
+            packages: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary: odm.exe
+            packages: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: GUI build dependencies
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Build
+        run: cargo build --release --locked --manifest-path desktop/Cargo.toml --target ${{ matrix.target }}
+
+      - name: What was built
+        shell: bash
+        run: |
+          bin="desktop/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          "$bin" --version
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          name="open-download-manager-$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "desktop/target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          case "${{ matrix.archive }}" in
+            tar.gz) tar -C dist -czf "dist/$name.tar.gz" "$name" ;;
+            # `tar -a` picks the format from the extension, so this needs no 7-Zip. bsdtar
+            # on the Windows runner and GNU tar on Linux both understand it.
+            zip)    tar -C dist -a -cf "dist/$name.zip" "$name" ;;
+          esac
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/open-download-manager-*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The command-line tools, for the machines with no desktop
+  # ---------------------------------------------------------------------------
+  cli:
+    name: cli (${{ matrix.target }})
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -43,27 +147,27 @@ jobs:
             packages: musl-tools
             cc: musl-gcc
             archive: tar.gz
-            binary: riptide
+            binary: odm-cli
           # Every modern ARM Linux box that is not musl.
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             packages: gcc-aarch64-linux-gnu
             cc: aarch64-linux-gnu-gcc
             archive: tar.gz
-            binary: riptide
+            binary: odm-cli
           # Both halves of the macOS world, from the arm64 runner.
           - os: macos-latest
             target: aarch64-apple-darwin
             packages: ""
             cc: ""
             archive: tar.gz
-            binary: riptide
+            binary: odm-cli
           - os: macos-latest
             target: x86_64-apple-darwin
             packages: ""
             cc: ""
             archive: tar.gz
-            binary: riptide
+            binary: odm-cli
           # `packages: ""` rather than no key at all: an absent matrix value is not the empty
           # string, so `if: matrix.packages != ''` would be true and the step would run `apt`
           # with nothing to install.
@@ -72,7 +176,7 @@ jobs:
             packages: ""
             cc: ""
             archive: zip
-            binary: riptide.exe
+            binary: odm-cli.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -96,14 +200,14 @@ jobs:
           CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.cc }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cc }}
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin riptide
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin odm-cli
 
       # The claim the Linux archive makes is "static"; `ldd` is the one-line proof, and a
       # release is a bad place to discover it is not true.
       - name: Prove the Linux builds are static
         if: contains(matrix.target, 'linux')
         run: |
-          bin=target/${{ matrix.target }}/release/riptide
+          bin=target/${{ matrix.target }}/release/odm-cli
           if ldd "$bin" 2>&1 | grep -q '=>'; then
             echo "::error::$bin links against shared libraries"
             exit 1
@@ -116,25 +220,50 @@ jobs:
       - name: Package
         shell: bash
         env:
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -eu
-          name="riptide-${TAG}-${{ matrix.target }}"
+          name="open-download-manager-cli-$VERSION-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
           cp README.md LICENSE "dist/$name/"
           case "${{ matrix.archive }}" in
             tar.gz) tar -C dist -czf "dist/$name.tar.gz" "$name" ;;
-            # `tar -a` picks the format from the extension, so this needs no 7-Zip. bsdtar
-            # on the Windows runner and GNU tar on Linux both understand it.
             zip)    tar -C dist -a -cf "dist/$name.zip" "$name" ;;
           esac
           ls -l dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: riptide-${{ matrix.target }}
-          path: dist/*.${{ matrix.archive }}
+          name: cli-${{ matrix.target }}
+          path: dist/open-download-manager-cli-*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The browser extension: a zip the user unpacks into their browser
+  # ---------------------------------------------------------------------------
+  extension:
+    name: browser extension
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          name="open-download-manager-extension-$VERSION"
+          mkdir -p "dist/$name"
+          cp extension/manifest.json extension/background.js extension/protocol.js \
+             extension/popup.html extension/popup.css extension/popup.js \
+             extension/README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.zip" "$name"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension
+          path: dist/open-download-manager-extension-*
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -142,6 +271,7 @@ jobs:
   # ---------------------------------------------------------------------------
   image:
     name: image (ghcr.io)
+    needs: version
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -182,11 +312,11 @@ jobs:
           platforms: linux/amd64,linux/arm64
 
   # ---------------------------------------------------------------------------
-  # The release note
+  # The release page
   # ---------------------------------------------------------------------------
   release:
     name: GitHub Release
-    needs: [artifacts, image]
+    needs: [version, desktop, cli, extension]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -199,16 +329,50 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # A checksum file, so a user can tell that what they downloaded is what was
+      # published — the same thing every serious release does.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       # `gh` rather than a third-party action: one less thing to trust with a write token.
       # The notes are generated from the commits and labels since the previous tag, so the
-      # release body does not have to be maintained by hand in two places.
+      # release body does not have to be maintained by hand in two places — and the install
+      # section is appended from the README, so the page tells the user what to do with
+      # the files they just downloaded.
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
+          set -eu
           ls -l dist
+          {
+            echo
+            echo "## Install"
+            echo
+            echo "Grab the archive for your platform from the assets below, unpack it and run \`odm\`."
+            echo
+            echo "| Platform | File |"
+            echo "| --- | --- |"
+            echo "| Windows (x64) | \`open-download-manager-$VERSION-x86_64-pc-windows-msvc.zip\` → \`odm.exe\` |"
+            echo "| macOS (Apple silicon) | \`open-download-manager-$VERSION-aarch64-apple-darwin.tar.gz\` → \`odm\` |"
+            echo "| macOS (Intel) | \`open-download-manager-$VERSION-x86_64-apple-darwin.tar.gz\` → \`odm\` |"
+            echo "| Linux (x64) | \`open-download-manager-$VERSION-x86_64-unknown-linux-gnu.tar.gz\` → \`odm\` |"
+            echo "| Headless / NAS | \`open-download-manager-cli-$VERSION-x86_64-unknown-linux-musl.tar.gz\` → \`odm-cli\` |"
+            echo "| Browser extension | \`open-download-manager-extension-$VERSION.zip\` → unpack into the browser |"
+            echo
+            echo "Verify a download with \`sha256sum -c SHA256SUMS.txt\`."
+          } > notes-extra.md
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
             dist/*
+          # `--generate-notes` and `--notes-file` cannot be combined in one call, so the
+          # generated notes are fetched back and the install section is appended to them.
+          gh release view "$TAG" --json body --jq .body > body.md
+          cat notes-extra.md >> body.md
+          gh release edit "$TAG" --notes-file body.md

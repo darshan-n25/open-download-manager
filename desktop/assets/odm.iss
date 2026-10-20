@@ -1,4 +1,4 @@
-; Inno Setup script for Riptide on Windows.
+; Inno Setup script for Open Download Manager on Windows.
 ;
 ; Produces a real installer: a Start-menu entry, a desktop shortcut, an
 ; uninstaller, and the three programs — the desktop app, the command-line
@@ -41,22 +41,22 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
-Name: "addtopath"; Description: "Add riptide to PATH (for the command line)"; GroupDescription: "Extra:"
-Name: "autostart"; Description: "Start Riptide when you sign in"; GroupDescription: "Extra:"; Flags: unchecked
+Name: "addtopath"; Description: "Add odm-cli to PATH (for the command line)"; GroupDescription: "Extra:"
+Name: "autostart"; Description: "Start Open Download Manager when you sign in"; GroupDescription: "Extra:"; Flags: unchecked
 
 [Files]
 ; The window, the command-line tool and the BitTorrent companion.
 Source: "..\..\dist\windows\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\windows\riptide.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\windows\riptide-bt.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\windows\odm-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\windows\odm-bt.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "odm.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; DestName: "README.md"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{group}\{#AppName} (command line)"; Filename: "{app}\riptide.exe"
-Name: "{group}\{#AppName} (BitTorrent)"; Filename: "{app}\riptide-bt.exe"
+Name: "{group}\{#AppName} (command line)"; Filename: "{app}\odm-cli.exe"
+Name: "{group}\{#AppName} (BitTorrent)"; Filename: "{app}\odm-bt.exe"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 ; Autostart is a shortcut in the user's Startup folder rather than a registry key: it

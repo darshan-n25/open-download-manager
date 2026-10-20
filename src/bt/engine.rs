@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::bt::torrent::Torrent;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 const BLOCK_SIZE: usize = 16 * 1024;
 const PEER_ID: [u8; 20] = *b"-RT0001-0123456789ab";
@@ -56,9 +56,9 @@ pub async fn download_with(
         .write(true)
         .truncate(false)
         .open(out_path)
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     file.set_len(torrent.length)
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     file.flush().ok();
 
     let total = torrent.length;
@@ -68,7 +68,7 @@ pub async fn download_with(
     for pi in 0..torrent.num_pieces() {
         if let Some(c) = &cancel {
             if c.load(Ordering::SeqCst) {
-                return Err(RiptideError::other("torrent download cancelled"));
+                return Err(OdmError::other("torrent download cancelled"));
             }
         }
         let psize = torrent.piece_size(pi) as usize;
@@ -93,11 +93,11 @@ pub async fn download_with(
                     let mut f = std::fs::OpenOptions::new()
                         .write(true)
                         .open(out_path)
-                        .map_err(|e| RiptideError::other(e.to_string()))?;
+                        .map_err(|e| OdmError::other(e.to_string()))?;
                     f.seek(SeekFrom::Start(offset))
-                        .map_err(|e| RiptideError::other(e.to_string()))?;
+                        .map_err(|e| OdmError::other(e.to_string()))?;
                     f.write_all(&buf)
-                        .map_err(|e| RiptideError::other(e.to_string()))?;
+                        .map_err(|e| OdmError::other(e.to_string()))?;
                     f.flush().ok();
                     downloaded += psize as u64;
                     ok = true;
@@ -106,7 +106,7 @@ pub async fn download_with(
             }
         }
         if !ok {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "could not download piece {pi} of {}",
                 torrent.num_pieces()
             )));
@@ -126,7 +126,7 @@ pub async fn download_with(
 
 /// Read a `.torrent` file.
 pub fn read_torrent(path: &std::path::Path) -> Result<Torrent> {
-    let data = std::fs::read(path).map_err(|e| RiptideError::other(e.to_string()))?;
+    let data = std::fs::read(path).map_err(|e| OdmError::other(e.to_string()))?;
     Torrent::from_bytes(&data)
 }
 
@@ -142,7 +142,7 @@ pub async fn download_magnet(
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<std::path::PathBuf> {
     if magnet.trackers.is_empty() {
-        return Err(RiptideError::other(
+        return Err(OdmError::other(
             "the magnet link lists no tracker to ask for peers",
         ));
     }
@@ -162,9 +162,8 @@ pub async fn download_magnet(
         }
     }
     if peers.is_empty() {
-        return Err(last_error.unwrap_or_else(|| {
-            RiptideError::other("no tracker returned any peers for this magnet")
-        }));
+        return Err(last_error
+            .unwrap_or_else(|| OdmError::other("no tracker returned any peers for this magnet")));
     }
 
     // The metadata comes from the peers themselves.
@@ -183,7 +182,7 @@ async fn download_piece(
 ) -> Result<()> {
     let mut stream = TcpStream::connect(addr)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     // The handshake: a protocol name, eight reserved bytes, the info hash and our
     // peer id. A peer that answers with a different info hash is talking about
     // a different torrent.
@@ -196,20 +195,20 @@ async fn download_piece(
     stream
         .write_all(&hs)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
 
     // Read the peer's handshake (68 bytes).
     let mut peer_hs = [0u8; 68];
     stream
         .read_exact(&mut peer_hs)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     if peer_hs[0] != 19 || &peer_hs[1..20] != b"BitTorrent protocol" {
-        return Err(RiptideError::other("bad handshake"));
+        return Err(OdmError::other("bad handshake"));
     }
     // Verify the info hash.
     if peer_hs[28..48] != torrent.info_hash {
-        return Err(RiptideError::other("info hash mismatch"));
+        return Err(OdmError::other("info hash mismatch"));
     }
 
     // Ask for the piece.
@@ -231,7 +230,7 @@ async fn download_piece(
     let mut downloaded = 0usize;
     while downloaded < psize {
         if std::time::Instant::now() > deadline {
-            return Err(RiptideError::other("piece timeout"));
+            return Err(OdmError::other("piece timeout"));
         }
         // Read a message.
         let mut len_buf = [0u8; 4];
@@ -242,7 +241,7 @@ async fn download_piece(
         .await
         {
             Ok(Ok(_)) => {}
-            _ => return Err(RiptideError::other("read timeout")),
+            _ => return Err(OdmError::other("read timeout")),
         }
         let msg_len = u32::from_be_bytes(len_buf) as usize;
         if msg_len == 0 {
@@ -252,7 +251,7 @@ async fn download_piece(
         stream
             .read_exact(&mut msg)
             .await
-            .map_err(|e| RiptideError::other(e.to_string()))?;
+            .map_err(|e| OdmError::other(e.to_string()))?;
         let msg_type = msg[0];
         match msg_type {
             0 => {} // choke
@@ -298,7 +297,7 @@ async fn send_msg(stream: &mut TcpStream, t: u8, payload: &[u8]) -> Result<()> {
     stream
         .write_all(&buf)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))
+        .map_err(|e| OdmError::other(e.to_string()))
 }
 
 async fn request_block(stream: &mut TcpStream, piece: u32, begin: u32, length: u32) -> Result<()> {

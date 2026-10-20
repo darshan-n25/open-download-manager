@@ -3,7 +3,7 @@
 //! IDM's grabber is a separate process (`IDMGrHlp.exe`) driven by
 //! `HKCU\Software\DownloadManager\GrabberSts\{IncludeFilters,ExcludeFilters,Projects}`
 //! and persisted through `sprojects.dat` / `surlexclist.dat`, and it ships a large default
-//! exclude list (`defexclist.txt`) so it does not chase tracking pixels. Riptide keeps the
+//! exclude list (`defexclist.txt`) so it does not chase tracking pixels. Open Download Manager keeps the
 //! same model: include/exclude wildcard filters plus a built-in noise filter.
 
 use std::collections::{HashSet, VecDeque};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::Fetcher;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::util::wildcard_to_regex;
 
 /// The default ceiling on pages crawled, so a mis-typed depth cannot run away.
@@ -274,7 +274,7 @@ fn classify(u: &str) -> Option<TargetKind> {
 
 /// Breadth-first crawl from `start`, returning everything worth downloading.
 pub async fn crawl(fetcher: &Fetcher, start: &str, cfg: &GrabberConfig) -> Result<Vec<GrabTarget>> {
-    let start_url = Url::parse(start).map_err(RiptideError::Url)?;
+    let start_url = Url::parse(start).map_err(OdmError::Url)?;
     let start_host = start_url.host_str().map(|s| s.to_string());
 
     let mut visited: HashSet<String> = HashSet::new();

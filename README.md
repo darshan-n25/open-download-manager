@@ -1,25 +1,62 @@
-# Riptide
+# Open Download Manager
 
 A cross-platform download manager in the spirit of Internet Download Manager: parallel
 ranged connections, crash-safe resume, a scheduler, HLS/DASH capture, FTP, browser
 integration, a link grabber, and offline site archiving.
 
-Riptide is a **clean-room reimplementation**. It was designed by statically reverse
+Open Download Manager is a **clean-room reimplementation**. It was designed by statically reverse
 engineering the shipped IDM binaries and then rebuilding the *behaviour* in Rust — no IDM
 code is used or present. The analysis lives in
 [`docs/IDM-REVERSE-ENGINEERING.md`](docs/IDM-REVERSE-ENGINEERING.md) (every claim tagged
 `OBSERVED` / `INFERRED` / `UNKNOWN`), the feature-by-feature comparison, including what is
 **not** implemented, lives in [`docs/FEATURE-MAP.md`](docs/FEATURE-MAP.md), and what the IDM
-community actually asks for — and which of those Riptide answers — is surveyed in
+community actually asks for — and which of those Open Download Manager answers — is surveyed in
 [`docs/COMMUNITY-REQUESTS.md`](docs/COMMUNITY-REQUESTS.md).
 
 > **Read the feature map before trusting a checkbox.** PAC script evaluation, FTPS, MMS and
 > MPEG-TS remuxing without `ffmpeg` are honest gaps, Kerberos itself is absent (Negotiate is
 > implemented with NTLM inside it), and NTLM has not been tested against a real server. §12 of
-> that document checks IDM's own advertised feature list line by line and names what Riptide
+> that document checks IDM's own advertised feature list line by line and names what Open Download Manager
 > has no answer for — PAC, FTPS and MMS — having closed the four gaps it found in its own
 > behaviour: periodic file synchronization, scheduled grabber projects, offline site
 > archiving, and download quotas.
+
+---
+
+## Download
+
+Releases live on GitHub: **[darshan-n25/open-download-manager → Releases](https://github.com/darshan-n25/open-download-manager/releases)**.
+Every release has one archive per platform, the browser extension, and a `SHA256SUMS.txt`
+so you can check what you downloaded.
+
+| Platform | File in the release | What you get |
+| --- | --- | --- |
+| Windows (x64) | `open-download-manager-<version>-x86_64-pc-windows-msvc.zip` | `odm.exe` — the app — with `odm-cli.exe` and `odm-bt.exe` beside it |
+| macOS (Apple silicon) | `open-download-manager-<version>-aarch64-apple-darwin.tar.gz` | `odm` |
+| macOS (Intel) | `open-download-manager-<version>-x86_64-apple-darwin.tar.gz` | `odm` |
+| Linux (x64) | `open-download-manager-<version>-x86_64-unknown-linux-gnu.tar.gz` | `odm` |
+| Headless: NAS, router, container | `open-download-manager-cli-<version>-x86_64-unknown-linux-musl.tar.gz` | `odm-cli` — one static binary, no libc, no shell |
+| Any platform | `open-download-manager-extension-<version>.zip` | the browser extension, unpacked into the browser |
+
+Check what you downloaded:
+
+```sh
+sha256sum -c SHA256SUMS.txt
+```
+
+**Windows.** Unpack the zip and run `odm.exe` — no installer is required. An installer
+(`open-download-manager-<version>-windows-x64-setup.exe`) is built from
+[`desktop/assets/odm.iss`](desktop/assets/odm.iss) and is the tidier route: it adds a
+Start-menu entry, a desktop shortcut, an uninstaller, and an option to put `odm-cli` on
+your `PATH`.
+
+**macOS.** Unpack the tarball and move `odm` to `/Applications` (or run it where it is —
+it is self-contained). The binaries are not notarized, so Gatekeeper may ask once:
+right-click → **Open**.
+
+**Linux.** Unpack the tarball and run `./odm`; it needs X11 or Wayland and nothing else.
+The headless build (`odm-cli`) is the one for a server, and the container image
+(`ghcr.io/darshan-n25/open-download-manager`) is the one for a NAS.
 
 ---
 
@@ -27,20 +64,20 @@ community actually asks for — and which of those Riptide answers — is survey
 
 IDM's speedup is not a trick. It opens several connections to the same URL and asks each for
 a different byte range (`Range: bytes=…`), writing each response directly at its final
-offset. Riptide does the same, with the parts that matter recovered from the binary:
+offset. Open Download Manager does the same, with the parts that matter recovered from the binary:
 
 - **Ranged, resumable transfers.** `HEAD` (falling back to a 1-byte `GET`) discovers the size
   and whether the server honours ranges. `Accept-Ranges`, `ETag` and `Last-Modified` are
   recorded, and a resume sends `If-Range` so a changed file is refetched rather than corrupted.
 - **Dynamic chunk re-splitting.** IDM exposes `Change chunk size to %ld` and mutates its chunk
-  list (`ChLst`) while running. Riptide's segment table is live: when a worker finishes early,
+  list (`ChLst`) while running. Open Download Manager's segment table is live: when a worker finishes early,
   it halves the largest outstanding segment and hands the tail to an idle worker. A download
   therefore speeds up as connections free up instead of being frozen at its initial split.
 - **Independent limits.** A global ceiling (bytes/second), a per-file ceiling, a per-server
   cap on simultaneous connections, and a process-wide budget over a time window ("no more
   than 500 MB per hour", IDM's *Download limits*) — exactly as IDM's settings expose them.
   The window survives a restart.
-- **No end-of-download merge.** IDM assembles parts at the end. Riptide writes every chunk at
+- **No end-of-download merge.** IDM assembles parts at the end. Open Download Manager writes every chunk at
   its final offset into a preallocated sparse file and finishes with a `rename`, so the cost of
   finishing is O(1) and the file is never in a half-merged state.
 
@@ -61,7 +98,7 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 | Archiving | `grab --archive` (or a `site` project with `--archive`) keeps a page and everything it needs to render — stylesheets, scripts, images, fonts — rewriting the markup to local relative paths; every URL gets a path decided by the URL alone, and anything it could not hold keeps pointing at the live site |
 | Projects | Recurring work stored as one document per project: `file` keeps a URL in step with a local path using conditional requests (`304` costs no body bytes), `site` re-crawls and fetches only what changed, `site --archive` keeps an offline mirror; run by the daemon when due, or from `cron` with `project tick` |
 | Browser | MV3 extension + a loopback daemon speaking IDM's `MSG#` framing over its WebSocket subprotocol, plus a plain JSON API |
-| Daemon auth | Optional bearer token required on **every** route — the JSON API, the control page, `/health`, and the WebSocket handshake — compared in constant time. The token comes from `--token-file`, `RIPTIDE_DAEMON_TOKEN`, or the `daemon_token_file` setting, never from an argument; off-loopback binds say what is at stake |
+| Daemon auth | Optional bearer token required on **every** route — the JSON API, the control page, `/health`, and the WebSocket handshake — compared in constant time. The token comes from `--token-file`, `ODM_DAEMON_TOKEN`, or the `daemon_token_file` setting, never from an argument; off-loopback binds say what is at stake |
 | Headless / NAS | One fully static binary and a `scratch`-based image — no libc, no shell, no CA bundle, because the trust roots are compiled in: `docker compose -f deploy/compose.yaml up -d`. SIGTERM, which is what `docker stop` and `systemctl stop` send, stops running jobs at a chunk boundary, records them `paused`, and exits **0** — see [Headless and containers](#headless-and-containers) |
 | CLI | `download`, `grab`, `daemon`, `probe`, `list`, `show`, `remove`, `pause`, `queue`, `project`, `config`, `state-dir` |
 
@@ -70,12 +107,27 @@ offset. Riptide does the same, with the parts that matter recovered from the bin
 Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmake`,
 `pkg-config` or OpenSSL requirement: TLS is `rustls` with `webpki-roots`.
 
+The repository builds two programs: the **desktop app** (`odm`) and the **command-line
+tools** (`odm-cli`, `odm-bt`). The app is a separate crate because it is a different
+program with a different dependency tree — the library they share is the `odm` crate at
+the root.
+
 ```sh
+# The app (a separate crate: the egui/eframe dependency tree lives there)
+cargo build --release --manifest-path desktop/Cargo.toml
+install -m755 desktop/target/release/odm ~/.local/bin/odm
+
+# The command-line tools
 cargo build --release
-install -m755 target/release/riptide ~/.local/bin/riptide
+install -m755 target/release/odm-cli ~/.local/bin/odm-cli
+
 cargo test                                        # 355 tests: unit + protocol + end-to-end
 cargo test --manifest-path desktop/Cargo.toml    # 3 tests: the window's own interface
 ```
+
+On Linux the app needs the X11 development packages at build time
+(`libx11-dev libxkbcommon-dev libgl1-mesa-dev`); at run time it needs X11 or Wayland and
+nothing else.
 
 On Windows the binary is the same program; only the directory it keeps its files in changes.
 See [Platform support](#platform-support), including how to build a static Linux binary, and
@@ -90,14 +142,14 @@ be one file to read rather than a `cfg` in every module.
 
 | | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| Config | `$XDG_CONFIG_HOME/riptide`, else `~/.config/riptide` | same | `%APPDATA%\riptide` |
-| State: queue, quota window, projects, mirrors | `$XDG_DATA_HOME/riptide`, else `~/.local/share/riptide` | same | `%LOCALAPPDATA%\riptide` |
+| Config | `$XDG_CONFIG_HOME/odm`, else `~/.config/odm` | same | `%APPDATA%\odm` |
+| State: queue, quota window, projects, mirrors | `$XDG_DATA_HOME/odm`, else `~/.local/share/odm` | same | `%LOCALAPPDATA%\odm` |
 | Default downloads | `~/Downloads` | `~/Downloads` | `%USERPROFILE%\Downloads` |
 | Home directory | `$HOME` | `$HOME` | `%USERPROFILE%`, else `%HOMEDRIVE%%HOMEPATH%` |
 
 State goes to `%LOCALAPPDATA%` and not `%APPDATA%` on purpose: the queue points at part files
 sitting on *this* disk, and config that roams to a machine without them is a queue of downloads
-that cannot resume. `riptide config path` and `riptide config show` print what was resolved —
+that cannot resume. `odm-cli config path` and `odm-cli config show` print what was resolved —
 including the last resort, the working directory, if the environment names no home at all.
 
 The layout is a pure function of the environment, so the platform table above is asserted on
@@ -127,9 +179,9 @@ file fails the `x86_64-pc-windows-msvc` line while the Linux line still passes.
 `macos-latest` and `windows-latest` with clippy and rustfmt; `cargo check --all-targets` for
 `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`; a fully
 static musl binary proven static with `ldd`; `x86_64-apple-darwin` cross-built from the arm64
-macOS runner; and the container image built, run and stopped. **That workflow has not run** —
-this repository has no remote yet — so the non-Linux jobs are written and reviewed but
-unexecuted. The executed evidence is Linux, below.
+macOS runner; and the container image built, run and stopped. **That workflow runs on every
+push** — the repository has a remote now — so the non-Linux jobs are executed evidence
+rather than a promise, and the Linux results are reproduced below.
 
 ## Headless and containers
 
@@ -142,7 +194,7 @@ the binary.
 ```sh
 docker compose -f deploy/compose.yaml up -d      # builds and runs it
 curl http://127.0.0.1:1001/health
-docker exec riptide riptide list
+docker exec odm-cli odm-cli list
 ```
 
 State, configuration, projects, mirrors and the default download directory all live under
@@ -153,19 +205,19 @@ one thing a download manager must never have.
 
 The port is published on the host's **loopback only** by default, so nothing on the network can
 reach it and no token is needed. Reaching it from elsewhere means doing both halves of the change
-in one edit: publish the port, and set `RIPTIDE_DAEMON_TOKEN`. With a token configured the daemon
+in one edit: publish the port, and set `ODM_DAEMON_TOKEN`. With a token configured the daemon
 requires it on every route, `/health` and the control page included.
 
 **Stopping is a signal, not a kill.** `docker stop`, `systemctl stop` and `kubectl delete` all
-send SIGTERM. Riptide handles it: running jobs stop at the next chunk boundary, record themselves
+send SIGTERM. Open Download Manager handles it: running jobs stop at the next chunk boundary, record themselves
 as `paused` with the bytes they do have, and the process exits **0** instead of dying by signal
 (which is what an orchestrator reports as a crash). In a container that handler is not a nicety
 but the whole mechanism: a container's PID 1 has signals with default actions *discarded* — the
 kernel does not deliver them to init in a PID namespace — so without a handler `docker stop`
 would send SIGTERM, have it ignored, wait out its timeout and then SIGKILL.
 
-The same rule applies to the commands a one-shot job runs instead of the daemon. `riptide
-download`, `riptide grab --download` and `riptide queue` all handle the signal, leave the job
+The same rule applies to the commands a one-shot job runs instead of the daemon. `odm-cli
+download`, `odm-cli grab --download` and `odm-cli queue` all handle the signal, leave the job
 `paused`, and exit **0**: a unit with `Restart=on-failure` must not be restarted for a stop it
 asked for itself. They report the affected jobs as `stopped`, never as `failed` — a failure is a
 404 or a checksum mismatch, and the message says which it is.
@@ -179,14 +231,14 @@ the validators are written at the end of a run, an interrupted crawl re-fetches 
 finished rather than mistaking a truncated file for a current one.
 
 ```ini
-# ~/.config/systemd/user/riptide.service
+# ~/.config/systemd/user/odm-cli.service
 [Unit]
-Description=Riptide download daemon
+Description=Open Download Manager download daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/riptide daemon --addr 127.0.0.1:1001
+ExecStart=%h/.local/bin/odm-cli daemon --addr 127.0.0.1:1001
 Restart=on-failure
 # SIGTERM is handled; this is how long it may take. The daemon stops at five seconds and
 # names anything that is still running.
@@ -234,11 +286,11 @@ note: checking inside a chroot with unprivileged user namespaces
            60 /image/usr
            60 /image/usr/local
            60 /image/usr/local/bin
-     11984160 /image/usr/local/bin/riptide
+     11984160 /image/usr/local/bin/odm-cli
 
 == 3. where it keeps its files ==
-   no HOME    -> ./.config/riptide/config.json
-   HOME=/data -> /data/.config/riptide/config.json
+   no HOME    -> ./.config/odm/config.json
+   HOME=/data -> /data/.config/odm/config.json
 
 == 4. a real download ==
    6 MiB over 4 connections: … 100.0%  6.00 MB / 6.00 MB  —done → /data/Downloads/payload.bin
@@ -271,95 +323,95 @@ asserted against the released binary, with no container or chroot involved, by
 
 ```sh
 # A single download, 16 connections, capped at 4 MB/s.
-riptide download https://example.com/ubuntu.iso -n 16 --limit 4M
+odm-cli download https://example.com/ubuntu.iso -n 16 --limit 4M
 
 # Resume after Ctrl-C, a crash, or a reboot.
-riptide queue
+odm-cli queue
 
 # Inspect before committing.
-riptide probe https://example.com/file.iso
+odm-cli probe https://example.com/file.iso
 
 # Authenticated, with a referer and a SOCKS proxy.
-riptide download https://example.com/private.zip \
+odm-cli download https://example.com/private.zip \
     --referer https://example.com/page --auth alice:s3cret \
     --proxy socks5://127.0.0.1:9050
 
 # Against IIS/SharePoint: SPNEGO (`Negotiate`), completed with NTLM.
-riptide download https://intranet.corp/report.xlsx --auth 'negotiate:CORP\alice:s3cret'
+odm-cli download https://intranet.corp/report.xlsx --auth 'negotiate:CORP\alice:s3cret'
 # ...or the same credentials as bare NTLM messages.
-riptide download https://intranet.corp/report.xlsx --auth 'ntlm:CORP\alice:s3cret'
+odm-cli download https://intranet.corp/report.xlsx --auth 'ntlm:CORP\alice:s3cret'
 
 # Capture a stream, preferring 1080p, from a manifest URL.
-riptide download https://cdn.example.com/master.m3u8 -q 1080
+odm-cli download https://cdn.example.com/master.m3u8 -q 1080
 
 # Find what a page offers, then fetch it.
-riptide grab https://example.com/downloads --depth 2 --include '*.zip' --include '*.iso'
-riptide grab https://example.com/downloads --download --output-dir ~/Downloads
+odm-cli grab https://example.com/downloads --depth 2 --include '*.zip' --include '*.iso'
+odm-cli grab https://example.com/downloads --download --output-dir ~/Downloads
 
 # Keep a page and everything it needs to render, rewritten to work from disk.
-riptide grab --archive -o ~/Offline https://example.com/docs/
+odm-cli grab --archive -o ~/Offline https://example.com/docs/
 
 # See the queue.
-riptide list
-riptide show 3f1a9c02
+odm-cli list
+odm-cli show 3f1a9c02
 
 # Stay inside a data budget: at most 500 MB per hour, shared by every job.
-riptide queue --quota 500M --quota-window 1h
+odm-cli queue --quota 500M --quota-window 1h
 # ...or make it the standing policy.
-riptide config set quota_bytes 500M
-riptide config set quota_window_secs 3600
+odm-cli config set quota_bytes 500M
+odm-cli config set quota_window_secs 3600
 
 # Only publish the file if its bytes are the ones you expect.
-riptide download https://example.com/ubuntu.iso --checksum sha256:9f86d081884c7d65...
+odm-cli download https://example.com/ubuntu.iso --checksum sha256:9f86d081884c7d65...
 # A bare digest works too, and its length says which algorithm it is.
-riptide download https://example.com/ubuntu.iso --checksum 9f86d081884c7d65...
+odm-cli download https://example.com/ubuntu.iso --checksum 9f86d081884c7d65...
 
 # Keep a file in step with one URL, hourly, and fetch the first copy now.
-riptide project add feed --url https://example.com/feed.json --every 1h --start-now
+odm-cli project add feed --url https://example.com/feed.json --every 1h --start-now
 # Re-crawl a page daily and fetch whatever it offers.
-riptide project add mirror --kind site --url https://example.com/downloads \
+odm-cli project add mirror --kind site --url https://example.com/downloads \
     --every 1d --download -o ~/Mirror
 # Or keep a daily offline mirror of a section of a site.
-riptide project add offline --kind site --url https://example.com/docs/ \
+odm-cli project add offline --kind site --url https://example.com/docs/ \
     --every 1d --archive -o ~/Offline
 # The daemon runs due projects; `cron` users can run them from a timer instead.
-riptide project tick
+odm-cli project tick
 ```
 
 A job that runs out of budget is **paused**, not failed: the partial file is kept and
-`riptide queue` continues it once the window refills.
+`odm-cli queue` continues it once the window refills.
 
-`riptide` keeps its configuration and job state under your platform's config/data
-directories; `riptide config path` and `riptide state-dir` print the exact locations.
+`odm-cli` keeps its configuration and job state under your platform's config/data
+directories; `odm-cli config path` and `odm-cli state-dir` print the exact locations.
 Every setting is editable from the CLI, and byte-valued settings accept the same `500M`
 shorthand:
 
 ```sh
-riptide config show
-riptide config set connections 16
-riptide config set speed_limit 4M
-riptide config set quota_bytes 500M
+odm-cli config show
+odm-cli config set connections 16
+odm-cli config set speed_limit 4M
+odm-cli config set quota_bytes 500M
 ```
 
 ## Recurring projects
 
 IDM's *periodic synchronization* and its *scheduled site grabber* are the same idea — a
-named definition meant to run again — so Riptide stores both the same way, one JSON
+named definition meant to run again — so Open Download Manager stores both the same way, one JSON
 document per project under `state_dir/projects/`, and selects the behaviour with `--kind`.
 
 ```sh
-riptide project add feed --url https://example.com/feed.json --every 1h --start-now
-riptide project add mirror --kind site --url https://example.com/downloads \
+odm-cli project add feed --url https://example.com/feed.json --every 1h --start-now
+odm-cli project add mirror --kind site --url https://example.com/downloads \
     --every 1d --download -o ~/Mirror
-riptide project add offline --kind site --url https://example.com/docs \
+odm-cli project add offline --kind site --url https://example.com/docs \
     --every 1d --archive -o ~/OfflineDocs
 
-riptide project list           # name, interval, when each next runs, how the last run went
-riptide project show feed
-riptide project run feed       # now, whatever the schedule says
-riptide project tick           # everything that is due — the command for cron
-riptide project disable feed   # stop it running, keep the files
-riptide project remove feed    # forget the schedule, keep the files
+odm-cli project list           # name, interval, when each next runs, how the last run went
+odm-cli project show feed
+odm-cli project run feed       # now, whatever the schedule says
+odm-cli project tick           # everything that is due — the command for cron
+odm-cli project disable feed   # stop it running, keep the files
+odm-cli project remove feed    # forget the schedule, keep the files
 ```
 
 A `file` project asks the server whether the copy on disk is still current before moving
@@ -388,7 +440,7 @@ unchanged site costs one request per target and no body bytes. Targets are fetch
 time on purpose: an unattended job should be gentle with the origin. `--max-downloads`
 (500 by default) caps how many a single run will pull from a page that lists thousands.
 
-`riptide daemon` runs due projects itself, up to 30 seconds late, and the control page
+`odm-cli daemon` runs due projects itself, up to 30 seconds late, and the control page
 lists them. Everything a project transfers goes through the same engine as an interactive
 download, so it is governed by the same global and per-file speed ceilings, the same
 per-server connection ceiling and the same quota.
@@ -400,8 +452,8 @@ plus the stylesheets, scripts, images and fonts they need in order to look right
 markup rewritten so the copy works from disk.
 
 ```sh
-riptide grab --archive -o ~/Offline/docs https://example.com/docs/
-riptide project add offline --kind site --url https://example.com/docs/ \
+odm-cli grab --archive -o ~/Offline/docs https://example.com/docs/
+odm-cli project add offline --kind site --url https://example.com/docs/ \
     --every 1d --archive -o ~/Offline/docs
 ```
 
@@ -422,25 +474,25 @@ result:
   HTML and CSS are the maps to everything else, so a `304` on them would mean never noticing
   that an image they point at had changed. They are small; images, fonts and scripts carry
   `If-None-Match`, so a run in which nothing changed moves no bodies at all and reports
-  `unchanged`. What the server said is kept in `_riptide/validators.json` **inside the
+  `unchanged`. What the server said is kept in `_odm/validators.json` **inside the
   archive**, so a mirror that is copied or moved keeps its record and the next run is still
   incremental — a repeat `grab --archive` costs one conditional request per asset, not a
   re-download.
 - **An archive is not a mirror of a server.** Video, installers and archives are things to
   *download*, not things a page needs in order to render, so they are not swept up — point
-  `riptide grab --download` at the page for those. `--max-assets` (or `--max-downloads` for a
+  `odm-cli grab --download` at the page for those. `--max-assets` (or `--max-downloads` for a
   `site` project) caps how many assets a single run will hold.
 
 ## Browser integration
 
 ```sh
-riptide daemon                       # 127.0.0.1:1001
+odm-cli daemon                       # 127.0.0.1:1001
 ```
 
 Then load `extension/` as an unpacked extension. The extension cancels the browser's own
 download and re-queues it with the daemon, forwarding cookies, `Referer` and `User-Agent` so
 authenticated downloads keep working. It also scans the current page for media and offers a
-"Download with Riptide" context menu. See [`extension/README.md`](extension/README.md) for the
+"Download with Open Download Manager" context menu. See [`extension/README.md`](extension/README.md) for the
 protocol tables and the permission rationale.
 
 Scripts can use the daemon directly:
@@ -466,16 +518,16 @@ drive it from another machine — a NAS, a container, a second laptop — give i
 it wider:
 
 ```sh
-riptide daemon --generate-token-file ~/.config/riptide/token   # 32 random bytes, mode 0600
-riptide daemon --token-file ~/.config/riptide/token --addr 0.0.0.0:1001
+odm-cli daemon --generate-token-file ~/.config/odm/token   # 32 random bytes, mode 0600
+odm-cli daemon --token-file ~/.config/odm/token --addr 0.0.0.0:1001
 ```
 
 Once a token is set **every** route needs it: the JSON API, the control page, `/health`, and the
 WebSocket handshake the extension uses.
 
 ```sh
-curl -s -H "Authorization: Bearer $(cat ~/.config/riptide/token)" http://127.0.0.1:1001/api/jobs
-curl -s "http://127.0.0.1:1001/api/jobs?token=$(cat ~/.config/riptide/token)"   # same thing
+curl -s -H "Authorization: Bearer $(cat ~/.config/odm/token)" http://127.0.0.1:1001/api/jobs
+curl -s "http://127.0.0.1:1001/api/jobs?token=$(cat ~/.config/odm/token)"   # same thing
 ```
 
 Where the token can come from, in order of precedence:
@@ -483,8 +535,8 @@ Where the token can come from, in order of precedence:
 | Source | Why it exists |
 | --- | --- |
 | `--token-file PATH` | Per-run control; a *path*, so the secret is not in `argv`, which `ps` shows to every user |
-| `RIPTIDE_DAEMON_TOKEN` | Containers and service managers, which can inject a secret without a file |
-| `daemon_token_file` setting (`riptide config set daemon_token_file /etc/riptide/token`) | Set once and forgotten; `config set … none` unsets it |
+| `ODM_DAEMON_TOKEN` | Containers and service managers, which can inject a secret without a file |
+| `daemon_token_file` setting (`odm-cli config set daemon_token_file /etc/odm/token`) | Set once and forgotten; `config set … none` unsets it |
 
 A configured source that cannot be read (missing file, empty file, empty variable) is a **startup
 failure**, never a quiet fall back to "no token". A misspelled path must not turn authentication
@@ -530,15 +582,15 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 ## What the community asks for
 
 [`docs/COMMUNITY-REQUESTS.md`](docs/COMMUNITY-REQUESTS.md) surveys what IDM users and IDM
-*refugees* ask for, and Riptide's answer to each. The headlines:
+*refugees* ask for, and Open Download Manager's answer to each. The headlines:
 
-| Ask | Where it comes from | Riptide |
+| Ask | Where it comes from | Open Download Manager |
 | --- | --- | --- |
 | Run on macOS/Linux at all | IDM's own FAQ confirms Windows-only; the loudest theme in Linux/macOS threads | Native binaries, no Wine — but only Linux is built and tested today; see the [roadmap](docs/ROADMAP.md) |
 | Browser integration that survives browser policy | Chrome disabling IDM's MV2 extension; IDM's own "keep the extension enabled" advice | Loopback daemon is the integration; the extension is a thin MV3 client, and `curl` can do everything it can |
 | Never lose media again, and say so honestly when it cannot | The video panel is the reason people stay; protected streams and YouTube changes are the top failures | HLS/DASH capture and muxing; no DRM circumvention and no per-site signature layer, by design |
 | Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
-| BitTorrent and magnet links | The single most-cited reason to keep a second app installed | `riptide-bt` and the window's Torrents tab: `.torrent` files and magnet links, pieces verified by SHA-1. A second engine, not a mode of the HTTP one |
+| BitTorrent and magnet links | The single most-cited reason to keep a second app installed | `odm-bt` and the window's Torrents tab: `.torrent` files and magnet links, pieces verified by SHA-1. A second engine, not a mode of the HTTP one |
 | Checksum verification | Listed as a headline feature by neighbouring projects | `--checksum sha256:…`, verified before the rename |
 | Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick` + an optional bearer token on every route, and a `scratch` image that runs it all: `docker compose up -d`, `docker stop` and back without losing a queue |
 | No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
@@ -558,7 +610,7 @@ and ranks what to build next. The ranking, in short:
 2. **MPEG-TS remux hardening** (was item 6) — a failing `ffmpeg` now falls back to keeping the
    raw `.ts`, where before only a *missing* `ffmpeg` did.
 3. **Daemon authentication** (was item 2) — a bearer token from `--token-file`,
-   `RIPTIDE_DAEMON_TOKEN` or a config path, required on every HTTP route and on the WebSocket
+   `ODM_DAEMON_TOKEN` or a config path, required on every HTTP route and on the WebSocket
    handshake, compared in constant time. Off-loopback binds now carry a startup note saying what
    the token does and does not protect.
 4. **Linux + macOS + Windows support** (was item 1) — one `src/platform.rs` holding the layout,
@@ -578,8 +630,8 @@ and ranks what to build next. The ranking, in short:
    Windows archives and pushes the image to GHCR, and a CI job that builds the image, serves
    `/health` and `/` from it, stops it with SIGTERM and checks both the exit code and the log.
    Auditing the item afterwards turned up two things it had not covered, both fixed here: a
-   stop asked for by a signal was still reported as a **failure** by `riptide download`,
-   `riptide grab --download` and `riptide queue` — the first two exited 1 as well, so a unit
+   stop asked for by a signal was still reported as a **failure** by `odm-cli download`,
+   `odm-cli grab --download` and `odm-cli queue` — the first two exited 1 as well, so a unit
    with `Restart=on-failure` would restart on a stop it had asked for itself — and the
    Dockerfile's static check used Alpine's `ldd`, whose output for a static binary is not
    glibc's. See [Headless and containers](#headless-and-containers).
@@ -608,7 +660,7 @@ runner, because they need nothing but a compiler.
 
 1. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
    the queue and state but deliberately **not** a mode of the HTTP engine. (Shipped as
-   `riptide-bt`, and in the window's Torrents tab, with magnet links.)
+   `odm-bt`, and in the window's Torrents tab, with magnet links.)
 
 Nothing else on the roadmap's numbered list remains. The two things that were recorded as
 "cannot be verified on this host" are now handled the only way they can be without the
@@ -631,10 +683,10 @@ installed (but crashes on MPEG-TS input, so the remux path still cannot be verif
 IDM binary turned out to still be on disk and disassemblable with `objdump` — 854,785
 instructions — where the original report said no disassembler was ever available.
 
-## How Riptide differs from IDM
+## How Open Download Manager differs from IDM
 
 Some of IDM's mechanisms are load-bearing for its business model and not for downloading.
-Riptide keeps the parts that make transfers fast and drops the parts that exist to own the
+Open Download Manager keeps the parts that make transfers fast and drops the parts that exist to own the
 browser.
 
 **Kept, because they are the actual engineering:**
@@ -648,10 +700,10 @@ browser.
 
 **Dropped, deliberately:**
 
-| IDM | Riptide | Reason |
+| IDM | Open Download Manager | Reason |
 | --- | --- | --- |
 | Kernel filter drivers (`idmwfp*.sys`, `idmtdi*.sys`) | None | Needs kernel code, driver signing and admin rights to do what a userspace proxy client already does |
-| Redirects browser traffic through IDM's proxy | Nothing — Riptide runs its own HTTP stack | No interception of unrelated browsing, and no TLS man-in-the-middle requirement |
+| Redirects browser traffic through IDM's proxy | Nothing — Open Download Manager runs its own HTTP stack | No interception of unrelated browsing, and no TLS man-in-the-middle requirement |
 | `declarativeNetRequest` rules to silently rewrite downloads | `downloads.onCreated` + explicit cancel | Visible, reversible, and hands the download back to the browser if the daemon is down |
 | Native messaging host (`IDMMsgHost.exe`) trusted by PID | WebSocket on loopback, optional bearer token off it | No registry keys or per-OS host manifests, and no "trust whatever connects" assumption — the peer presents a secret instead of being inferred from a process id |
 | Merge-based completion | Direct positional writes + `rename` | The merge step is the single most common IDM complaint |
@@ -682,7 +734,7 @@ against this implementation (§12 there). The short version:
 - **MMS is not supported.** IDM really implements it (`MMSCn` in its own strings), but the
   protocol was dropped by Windows Media Services in 2008 and `mms://` links are effectively
   extinct.
-- **`multipart/byteranges` responses are not parsed** (Riptide always asks for one range per
+- **`multipart/byteranges` responses are not parsed** (Open Download Manager always asks for one range per
   request, so a conforming server never sends them).
 
 **Daemon**
@@ -734,7 +786,7 @@ against this implementation (§12 there). The short version:
 
 - **MPEG-TS remux needs `ffmpeg` on `PATH`.** When `ffmpeg` is missing **or fails**, the raw
   `.ts` is kept and a warning is printed, rather than emitting a broken `.mp4` or losing the
-  download. Set `RIPTIDE_FFMPEG` to a specific binary to override the lookup. The remux to a
+  download. Set `ODM_FFMPEG` to a specific binary to override the lookup. The remux to a
   *valid* `.mp4` has never been executed here — this host's `ffmpeg` segfaults on every
   MPEG-TS input — so what is tested is that no input can make the capture *fail*.
 - **Live HLS playlists are not re-polled** — a capture covers the manifest as it stood when it
@@ -752,21 +804,21 @@ against this implementation (§12 there). The short version:
   built instead of preventing it from appearing.
 - **A checksum is an extra gate, not a substitute for HTTPS.** It proves the bytes match an
   expectation you already have from somewhere else; it does not tell you where to get that
-  expectation. Riptide never fetches a `.sha256` sidecar or trusts a digest served over the
+  expectation. Open Download Manager never fetches a `.sha256` sidecar or trusts a digest served over the
   same connection.
 
 **Limits**
 
 - **A quota pauses between chunks, not inside one.** If the remaining budget cannot fit the
   next chunk the charge is refused outright, so a job can pause with up to one chunk of budget
-  unspent. It continues on the next `riptide queue` after the window refills. The window is a
+  unspent. It continues on the next `odm-cli queue` after the window refills. The window is a
   fixed span from the first byte charged, not a wall-clock bucket.
 
 **Recurring projects**
 
 - **A server with neither `ETag` nor `Last-Modified` cannot be synchronized, only
   re-downloaded.** Such a run logs a warning and fetches the file again every time, because
-  there is nothing to ask the server about. Riptide does not guess with a size or a
+  there is nothing to ask the server about. Open Download Manager does not guess with a size or a
   timestamp.
 - **The daemon's project ticker polls every 30 seconds**, so a project runs up to half a
   minute after its scheduled time. Missed slots are not replayed: a project that was
@@ -803,7 +855,7 @@ against this implementation (§12 there). The short version:
 - **The manifest is rewritten from what a run saw**, so a URL that no page references any
   more loses its entry — while its file stays on disk, as above.
 
-**Whole features IDM has that Riptide does not**
+**Whole features IDM has that Open Download Manager does not**
 
 - **No PAC evaluation, no FTPS, no MMS.** See the protocol section above for each.
 - **No antivirus-on-completion hook**, no self-updater, no installation wizard, and no UI
@@ -825,16 +877,16 @@ against this implementation (§12 there). The short version:
   untested unsafe filesystem code is a worse trade than reserving the space.
 - **With no home directory in the environment, both platforms fall back to `.`** — the working
   directory — exactly as before this was made platform-aware. Nothing is written until a command
-  needs it, and `riptide config path` prints what was resolved rather than leaving you to guess.
+  needs it, and `odm-cli config path` prints what was resolved rather than leaving you to guess.
 - **A deep archive can exceed Windows' 260-character `MAX_PATH`**, because one URL becomes one
   nested path and `std` does not add the `\\?\` prefix for you. Shorten the archive root, or
   enable long paths on the machine.
 - **The daemon's token file carries no mode on Windows.** `--generate-token-file` writes `0600`
-  on Unix; on Windows the file inherits the ACL of its directory (`%LOCALAPPDATA%\riptide` is
+  on Unix; on Windows the file inherits the ACL of its directory (`%LOCALAPPDATA%\odm` is
   per-user by default), because inheriting the correct ACL beats guessing one.
 - **Completion is a `rename`,** which on Windows fails with a sharing violation if another
   process holds the part file open *without* `FILE_SHARE_DELETE` (a virus scanner, usually).
-  Riptide's own handle is not a problem — Rust opens files with share-delete — and the failure is
+  Open Download Manager's own handle is not a problem — Rust opens files with share-delete — and the failure is
   reported with the file left exactly where it was, so a retry succeeds once the process lets go.
 - HTTP/2 is requested but **multiplexing is not exploited**: each range is still its own
   request stream, and the connection count is what drives the speedup.
@@ -857,7 +909,7 @@ honours `If-None-Match` and `Range`, 10 that archive a small site and then read 
 output back to check that every rewritten reference resolves, and 4 that start the released
 **binary**, send it a real signal, and check what it does about it — three to the daemon
 (SIGTERM mid-download, SIGINT, an idle stop that must not wait) and one to a foreground
-`riptide download`. Three more live in the window's own crate and drive the interface
+`odm-cli download`. Three more live in the window's own crate and drive the interface
 with simulated clicks.
 
 The end-to-end ones assert that
@@ -935,7 +987,7 @@ binary, send it **SIGTERM** (and, as a control, SIGINT) while a trickling origin
 and assert that the process exits **0** with a line saying what stopped it — a signal death has
 no exit code, which is what an orchestrator reports as a crash — that the interrupted job is on
 disk as `paused` with some bytes but not all of them, and that an idle daemon stops *immediately*
-rather than sitting out its five-second grace. One of the four signals a foreground `riptide
+rather than sitting out its five-second grace. One of the four signals a foreground `odm-cli
 download` instead of the daemon, which is the shape a one-shot job has, and asserts additionally
 that nothing in the output calls the stop a failure: that command used to exit 1 for it, so a
 `Restart=on-failure` unit would have restarted on every stop it asked for itself. The unit tests

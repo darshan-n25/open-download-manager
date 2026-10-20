@@ -11,7 +11,7 @@
 //! that only reads it as SPNEGO, the challenge is unwrapped from the server's
 //! reply, and the proof is bound to the challenge the server chose. It is **not**
 //! evidence about real IIS or Active Directory behaviour, and it says nothing
-//! about the Kerberos path, which Riptide does not implement.
+//! about the Kerberos path, which Open Download Manager does not implement.
 
 #![allow(clippy::field_reassign_with_default)]
 
@@ -22,12 +22,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use riptide::auth::base64_encode;
-use riptide::auth::spnego::{self, Mech};
-use riptide::config::Config;
-use riptide::engine::Engine;
-use riptide::job::{Job, JobKind, JobState};
-use riptide::scheduler::Scheduler;
+use odm::auth::base64_encode;
+use odm::auth::spnego::{self, Mech};
+use odm::config::Config;
+use odm::engine::Engine;
+use odm::job::{Job, JobKind, JobState};
+use odm::scheduler::Scheduler;
 
 const USER: &str = "alice";
 const DOMAIN: &str = "CORP";
@@ -254,7 +254,7 @@ impl MockServer {
         input.extend_from_slice(&self.challenge);
         input.extend_from_slice(blob);
 
-        let key = riptide::auth::ntlm::ntowfv2(USER, DOMAIN, PASSWORD);
+        let key = odm::auth::ntlm::ntowfv2(USER, DOMAIN, PASSWORD);
         use hmac::{Hmac, Mac};
         let mut mac = Hmac::<md5::Md5>::new_from_slice(&key).expect("any key length");
         mac.update(&input);
@@ -339,7 +339,7 @@ fn authed_job(url: &str, output: &Path, creds: &str) -> Job {
     job.min_chunk = 4096;
     job.max_retries = 1;
     job.output_provisional = false;
-    job.ctx.auth = riptide::auth::parse_auth_spec(creds);
+    job.ctx.auth = odm::auth::parse_auth_spec(creds);
     job
 }
 

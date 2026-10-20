@@ -1,7 +1,7 @@
 //! Parsing of a `.torrent` metainfo file into a structured `Torrent`.
 
 use crate::bt::bencode::{self, Value};
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use sha1::{Digest, Sha1};
 
 #[derive(Debug, Clone)]
@@ -20,7 +20,7 @@ impl Torrent {
         let root = bencode::decode_one_doc(data)?;
         let info = root
             .dict_get(b"info")
-            .ok_or_else(|| RiptideError::other("missing info dict"))?;
+            .ok_or_else(|| OdmError::other("missing info dict"))?;
         let info_bytes = reencode(info)?;
         let mut h = Sha1::new();
         h.update(&info_bytes);
@@ -58,17 +58,17 @@ impl Torrent {
     fn from_info(info: &crate::bt::bencode::Value, info_hash: [u8; 20]) -> Result<Self> {
         let name = info
             .dict_get_str(b"name")
-            .ok_or_else(|| RiptideError::other("missing name"))?
+            .ok_or_else(|| OdmError::other("missing name"))?
             .to_string();
         let piece_length =
             info.dict_get_int(b"piece length")
-                .ok_or_else(|| RiptideError::other("missing piece length"))? as u64;
+                .ok_or_else(|| OdmError::other("missing piece length"))? as u64;
         let pieces_raw = info
             .dict_get(b"pieces")
             .and_then(|v| v.as_bytes())
-            .ok_or_else(|| RiptideError::other("missing pieces"))?;
+            .ok_or_else(|| OdmError::other("missing pieces"))?;
         if pieces_raw.len() % 20 != 0 {
-            return Err(RiptideError::other("pieces length not multiple of 20"));
+            return Err(OdmError::other("pieces length not multiple of 20"));
         }
         let mut pieces = Vec::with_capacity(pieces_raw.len() / 20);
         for chunk in pieces_raw.chunks(20) {
@@ -78,7 +78,7 @@ impl Torrent {
         }
         let length = info
             .dict_get_int(b"length")
-            .ok_or_else(|| RiptideError::other("multi-file torrents not supported yet"))?
+            .ok_or_else(|| OdmError::other("multi-file torrents not supported yet"))?
             as u64;
 
         Ok(Torrent {
@@ -106,7 +106,7 @@ impl Torrent {
         h.update(&info_bytes);
         let info_hash: [u8; 20] = h.finalize().into();
         if info_hash != expected {
-            return Err(RiptideError::other(
+            return Err(OdmError::other(
                 "the metadata a peer sent is for a different torrent",
             ));
         }

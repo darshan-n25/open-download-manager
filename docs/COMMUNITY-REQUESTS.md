@@ -1,7 +1,7 @@
 # What the IDM community asks for
 
 A survey of what users of Internet Download Manager ask for, and what people looking for an
-IDM alternative ask for instead — with Riptide's current answer to each.
+IDM alternative ask for instead — with Open Download Manager's current answer to each.
 
 This is the community-facing counterpart to
 [`IDM-REVERSE-ENGINEERING.md`](IDM-REVERSE-ENGINEERING.md) (what the shipped binary does) and
@@ -50,14 +50,14 @@ What users do with that:
   use" (third-party guide, 2026) *(read in full)*. Several GitHub projects exist purely to
   automate that Wine setup.
 
-**Riptide:** answered in the code rather than in a roadmap. Rust, one codebase for
+**Open Download Manager:** answered in the code rather than in a roadmap. Rust, one codebase for
 Linux/macOS/Windows, no Wine, no filter driver — the integration point is a loopback daemon,
 which is a normal thing to run on any of the three. The platform differences are one file
 (`src/platform.rs`), the platform module is compiled for seven targets from a single machine
 (`scripts/check-portability.sh`), and `.github/workflows/ci.yml` runs the whole suite natively on
-`ubuntu-latest`, `macos-latest` and `windows-latest`. What that workflow has **not** done is run,
-because this repository has no remote — so the Linux answer is verified and the Windows and macOS
-answers are compiled and tested-as-code, not executed. The line between those two is kept explicit
+`ubuntu-latest`, `macos-latest` and `windows-latest`. The workflow runs on every push, because the
+repository has a remote now — so the Windows and macOS answers are executed on native runners,
+not only compiled and tested-as-code. The line between those two is kept explicit
 in [`ROADMAP.md`](ROADMAP.md) Part 2.
 
 ## 2. Browser integration that survives the browser changing
@@ -76,7 +76,7 @@ happens:
   ("Feature Request: Integrated Download Manager like IDM", connect.mozilla.org) — the request
   lists pause/resume, batch download and multi-connection as the wants *(snippet)*.
 
-**Riptide:** the daemon is the integration, and the extension is a thin client — MV3, no native
+**Open Download Manager:** the daemon is the integration, and the extension is a thin client — MV3, no native
 messaging host, no PID-based trust, and no monkeying with the browser's proxy settings. The
 practical difference: everything the extension can do, `curl http://127.0.0.1:1001/api/...` and
 the CLI can do too, so a browser policy change degrades the *convenience* rather than the
@@ -94,11 +94,11 @@ browsers and video sites is great … even the small button to download videos c
 * YouTube specifically: a genre of guides exists just for "IDM not showing the download option /
   not detecting videos after a YouTube change" *(search results, not an IDM statement)*.
 
-**Riptide:** HLS and DASH manifests are first-class — `EXT-X-*` including byteranges and AES-128
+**Open Download Manager:** HLS and DASH manifests are first-class — `EXT-X-*` including byteranges and AES-128
 keys, `SegmentTemplate`/`SegmentTimeline`/`SegmentList`, and separate audio+video renditions
 muxed into one file. *No* DRM circumvention, ever: a Widevine-protected stream is not a download
-manager's problem to solve, and Riptide says so rather than failing obscurely. Nor is there a
-per-site YouTube layer: Riptide fetches manifests it is given, and does not implement signature
+manager's problem to solve, and Open Download Manager says so rather than failing obscurely. Nor is there a
+per-site YouTube layer: Open Download Manager fetches manifests it is given, and does not implement signature
 cipher recovery.
 
 ## 4. Speed, resume, batch
@@ -108,9 +108,9 @@ times", "paste like 100 link at the same time and all of them will be downloaded
 of 1 Gb I'll download it in 30 min with a normal browser and 10 min with IDM" (IDM front page;
 r/Piracy) *(both snippets/read in full)*.
 
-**Riptide:** dynamic segmented transfer with runtime re-splitting, `If-Range` conditional resume,
+**Open Download Manager:** dynamic segmented transfer with runtime re-splitting, `If-Range` conditional resume,
 crash-safe state next to the output file, a persistent queue, and per-server ceilings. Batch is
-the queue plus `riptide queue`/the daemon API; there is no "paste 100 URLs" *dialog*, because
+the queue plus `odm-cli queue`/the daemon API; there is no "paste 100 URLs" *dialog*, because
 pasting 100 URLs into an argument list is what a shell already does.
 
 ## 5. BitTorrent and magnet links — the request that keeps a second app installed
@@ -131,7 +131,7 @@ else … I had four tools doing the job of one" (MUO) *(snippet)*.
 **Not in IDM either.** IDM downloads `.torrent` *files*; it does not speak BitTorrent. So this is
 a request from the wider audience rather than something IDM users get today.
 
-**Riptide:** absent, deliberately. A BitTorrent client is a second engine — peer wire protocol,
+**Open Download Manager:** absent, deliberately. A BitTorrent client is a second engine — peer wire protocol,
 DHT, piece selection, seeding policy, its own scheduler — and bolting it onto a segmented HTTP
 engine would make both worse. If it ever happens it will be a separate binary sharing the queue
 and the state store, not a mode of `download`.
@@ -143,7 +143,7 @@ checks" is listed as a headline capability by Flux Download Manager, and aria2c'
 routinely summarised as "BitTorrent/magnet, **checksum verification**, RPC daemon mode"
 *(snippets)*.
 
-**Riptide:** absent. This is the cheapest real gap on this page — a `--checksum sha256:…` that
+**Open Download Manager:** absent. This is the cheapest real gap on this page — a `--checksum sha256:…` that
 verifies before the final rename fits the existing "write to a temp, then rename" path exactly,
 and would turn a silently corrupted download into a failed one.
 
@@ -157,7 +157,7 @@ Requests cluster around "run it somewhere that is not my desktop, and talk to it
 * IDM's own answer is the scheduler plus periodic synchronization, which is a desktop-shaped
   answer to a server-shaped question (see §9).
 
-**Riptide:** the daemon, its JSON API, the CLI, and `project tick` for cron are the closest match
+**Open Download Manager:** the daemon, its JSON API, the CLI, and `project tick` for cron are the closest match
 on this page — you can run the daemon on a NAS and drive it over HTTP, with an optional bearer
 token required on every route (HTTP and the WebSocket handshake alike) so binding it beyond
 loopback is a decision rather than an accident. As of the packaging work there is something to
@@ -178,7 +178,7 @@ zero-tracking" (FluxDown, Medium); alternativeto's "open source" filter on the I
 serial detected" popup, trial resets, and wanting the popups to stop (r/Piracy threads)
 *(snippets)*.
 
-**Riptide:** none of it. No account, no telemetry, no self-updater, no installer, no nag. That
+**Open Download Manager:** none of it. No account, no telemetry, no self-updater, no installer, no nag. That
 is not a feature to build; it is a feature to *not build*, and it is the one place where the
 design brief and the community's most emotional request agree for free.
 
@@ -188,7 +188,7 @@ IDM's scheduler and "periodic synchronization of files" are recurring answers in
 keeping a local copy fresh *(IDM front page, read in full)*. The complaint that follows is
 usually that a missed schedule is either replayed in a burst or silently skipped.
 
-**Riptide:** `project` does file sync and scheduled site crawls, with the deliberate difference
+**Open Download Manager:** `project` does file sync and scheduled site crawls, with the deliberate difference
 documented in `FEATURE_MAP.md` §5: the next run is measured from the **end** of the previous one,
 so downtime collapses missed slots into one catch-up run instead of replaying them. Archiving
 (§10) rides on the same runner.
@@ -199,7 +199,7 @@ IDM advertises "complete start page with all pictures, styles, and scripts for o
 and "convert the links in downloaded html files to the local files", and the binary carries the
 matching strings (`[OBSERVED]`, see §8b of the reverse-engineering document).
 
-**Riptide:** `grab --archive` and `site --archive` projects, with the placement and rewriting
+**Open Download Manager:** `grab --archive` and `site --archive` projects, with the placement and rewriting
 rules written down in `README.md`. See `FEATURE_MAP.md` §8.
 
 ## What is left, ranked by what this survey suggests

@@ -2326,6 +2326,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "odm"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "cbc",
+ "clap",
+ "futures-util",
+ "hex",
+ "hmac",
+ "humantime",
+ "md-5",
+ "md4",
+ "percent-encoding",
+ "quick-xml 0.36.2",
+ "rand 0.8.8",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "odm-desktop"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "egui-lucide",
+ "egui_extras",
+ "hex",
+ "odm",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "winresource",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2921,56 +2971,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "riptide"
-version = "0.1.0"
-dependencies = [
- "aes",
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "cbc",
- "clap",
- "futures-util",
- "hex",
- "hmac",
- "humantime",
- "md-5",
- "md4",
- "percent-encoding",
- "quick-xml 0.36.2",
- "rand 0.8.8",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "thiserror 2.0.21",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "riptide-desktop"
-version = "0.1.0"
-dependencies = [
- "eframe",
- "egui",
- "egui-lucide",
- "egui_extras",
- "hex",
- "reqwest",
- "riptide",
- "serde",
- "serde_json",
- "tokio",
- "winresource",
 ]
 
 [[package]]

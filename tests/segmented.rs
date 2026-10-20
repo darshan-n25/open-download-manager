@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use riptide::config::Config;
-use riptide::engine::Engine;
-use riptide::grabber::{self, GrabberConfig};
-use riptide::job::{Job, JobKind, JobState};
-use riptide::scheduler::Scheduler;
+use odm::config::Config;
+use odm::engine::Engine;
+use odm::grabber::{self, GrabberConfig};
+use odm::job::{Job, JobKind, JobState};
+use odm::scheduler::Scheduler;
 
 /// Sentinel for "send the whole slice".
 const NO_TRUNCATE: usize = usize::MAX;
@@ -203,7 +203,7 @@ async fn serve(sock: &mut TcpStream, srv: Arc<TestServer>) {
         };
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
-             Content-Length: {total}\r\n{ranges_hdr}ETag: \"Riptide-Test-ETag\"\r\n\
+             Content-Length: {total}\r\n{ranges_hdr}ETag: \"ODM-Test-ETag\"\r\n\
              Connection: close\r\n\r\n"
         );
         let _ = sock.write_all(resp.as_bytes()).await;
@@ -238,7 +238,7 @@ async fn serve(sock: &mut TcpStream, srv: Arc<TestServer>) {
     resp.push_str("Content-Type: application/octet-stream\r\n");
     resp.push_str(&format!("Content-Length: {}\r\n", slice.len()));
     resp.push_str(ranges_hdr);
-    resp.push_str("ETag: \"Riptide-Test-ETag\"\r\n");
+    resp.push_str("ETag: \"ODM-Test-ETag\"\r\n");
     if let Some(cr) = content_range {
         resp.push_str(&cr);
     }
@@ -575,7 +575,7 @@ async fn probe_reports_size_and_resumability() {
     let j = engine.job();
     assert_eq!(j.total, Some(data.len() as u64));
     assert!(j.resumable);
-    assert_eq!(j.etag.as_deref(), Some("\"Riptide-Test-ETag\""));
+    assert_eq!(j.etag.as_deref(), Some("\"ODM-Test-ETag\""));
     assert_eq!(j.kind, JobKind::Http);
 }
 

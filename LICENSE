@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 Riptide contributors
+Copyright (c) 2026 Open Download Manager contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -24,11 +24,11 @@ SOFTWARE.
 
 ## Note on provenance
 
-Riptide is a clean-room reimplementation. It contains no code from Internet Download
+Open Download Manager is a clean-room reimplementation. It contains no code from Internet Download
 Manager, which is proprietary software by Tonec FZE. The behavioural design was derived
 from static analysis of publicly distributed binaries that the author had installed, and
 that analysis is documented in `docs/IDM-REVERSE-ENGINEERING.md` so the derivation can be
 checked.
 
-"Internet Download Manager" and "IDM" are trademarks of Tonec FZE. Riptide is not
+"Internet Download Manager" and "IDM" are trademarks of Tonec FZE. Open Download Manager is not
 affiliated with, endorsed by, or derived from Tonec's source code.

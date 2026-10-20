@@ -14,7 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::archive::{self, ArchiveConfig};
 use crate::config::Config;
 use crate::engine::{Engine, ProgressFn, ProgressSample};
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::grabber::{self, GrabberConfig, TargetKind};
 use crate::job::{Job, JobKind, JobState};
 use crate::project::{self, Project, ProjectKind, ProjectRunner, ProjectStore, RunOutcome};
@@ -24,10 +24,10 @@ use crate::util;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "riptide",
+    name = "odm-cli",
     version,
-    about = "Riptide — a fast, cross-platform download manager",
-    long_about = "Riptide downloads files over HTTP/HTTPS/FTP with parallel ranged connections, \
+    about = "Open Download Manager — a fast, cross-platform download manager",
+    long_about = "Open Download Manager downloads files over HTTP/HTTPS/FTP with parallel ranged connections, \
                   resumes safely after a crash, captures HLS and DASH video, and exposes a \
                   localhost daemon for browser integration.\n\n\
                   Modeled behaviourally on Internet Download Manager."
@@ -343,7 +343,7 @@ pub enum ConfigAction {
         #[arg(long)]
         force: bool,
     },
-    /// Set one key, e.g. `riptide config set connections 16`.
+    /// Set one key, e.g. `odm-cli config set connections 16`.
     Set { key: String, value: String },
 }
 
@@ -485,7 +485,7 @@ pub struct ProjectAddArgs {
 pub async fn run(cli: Cli) -> Result<()> {
     // Must happen before anything calls `Config::load`.
     if let Some(p) = &cli.config {
-        std::env::set_var("RIPTIDE_CONFIG", p);
+        std::env::set_var("ODM_CONFIG", p);
     }
     let quiet = cli.quiet;
 
@@ -523,7 +523,7 @@ fn build_ctx(net: &NetOpts, cfg: &Config) -> Result<crate::job::RequestContext> 
     };
     if let Some(a) = &net.auth {
         ctx.auth = Some(crate::auth::parse_auth_spec(a).ok_or_else(|| {
-            RiptideError::other(format!(
+            OdmError::other(format!(
                 "cannot parse --auth {a:?}; expected `user:pass`, `basic:user:pass`, \
                  `digest:user:pass`, `bearer:token`, `ntlm:DOMAIN\\user:pass`, or \
                  `negotiate:DOMAIN\\user:pass`"
@@ -533,7 +533,7 @@ fn build_ctx(net: &NetOpts, cfg: &Config) -> Result<crate::job::RequestContext> 
     for h in &net.headers {
         let (k, v) = h
             .split_once(':')
-            .ok_or_else(|| RiptideError::other(format!("--header {h:?} must be 'Name: value'")))?;
+            .ok_or_else(|| OdmError::other(format!("--header {h:?} must be 'Name: value'")))?;
         ctx.headers
             .push((k.trim().to_string(), v.trim().to_string()));
     }
@@ -600,7 +600,7 @@ pub fn parse_when(s: &str) -> Result<u64> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('+') {
         let d = humantime::parse_duration(rest)
-            .map_err(|e| RiptideError::other(format!("bad duration {rest:?}: {e}")))?;
+            .map_err(|e| OdmError::other(format!("bad duration {rest:?}: {e}")))?;
         return Ok(util::now_ms() + d.as_millis() as u64);
     }
     if let Ok(t) = humantime::parse_rfc3339(s) {
@@ -610,7 +610,7 @@ pub fn parse_when(s: &str) -> Result<u64> {
             .unwrap_or(0);
         return Ok(ms);
     }
-    Err(RiptideError::other(format!(
+    Err(OdmError::other(format!(
         "cannot read {s:?} as a time; use a relative span like +30m or an RFC 3339 timestamp"
     )))
 }
@@ -630,7 +630,7 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
     let mut urls = args.urls.clone();
     if let Some(f) = &args.input_file {
         let text = std::fs::read_to_string(f)
-            .map_err(|e| RiptideError::other(format!("cannot read {}: {e}", f.display())))?;
+            .map_err(|e| OdmError::other(format!("cannot read {}: {e}", f.display())))?;
         for line in text.lines() {
             let line = line.trim();
             if !line.is_empty() && !line.starts_with('#') {
@@ -640,13 +640,13 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
     }
     urls.retain(|u| !u.trim().is_empty());
     if urls.is_empty() {
-        return Err(RiptideError::other(
+        return Err(OdmError::other(
             "nothing to download: pass a URL or --input-file",
         ));
     }
 
     if args.checksum.is_some() && urls.len() > 1 {
-        return Err(RiptideError::other(
+        return Err(OdmError::other(
             "--checksum applies to a single download; one digest cannot describe several \
              files",
         ));
@@ -707,7 +707,7 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
                 // was told and left a resumable partial, so it exits 0.
                 if stopped_not_failed(&sched, &id) {
                     stopped += 1;
-                    eprintln!("{}: stopped — resume with `riptide queue`", label);
+                    eprintln!("{}: stopped — resume with `odm-cli queue`", label);
                 } else {
                     failed += 1;
                     eprintln!("{}: failed: {e}", label);
@@ -722,10 +722,10 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
     signals.abort();
 
     if stopped > 0 && !quiet {
-        eprintln!("{stopped} download(s) stopped before finishing; run `riptide queue` to resume");
+        eprintln!("{stopped} download(s) stopped before finishing; run `odm-cli queue` to resume");
     }
     if failed > 0 {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "{failed} of the requested downloads did not complete"
         )));
     }
@@ -734,7 +734,7 @@ async fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<()> {
 
 /// Whether a job that came back with an error was *stopped* rather than broken.
 ///
-/// The engine records a signalled job as `Paused` — the part file is intact and `riptide
+/// The engine records a signalled job as `Paused` — the part file is intact and `odm-cli
 /// queue` resumes it — and a real error as `Failed`. Counting the first as a failure is what
 /// makes a supervisor's own `SIGTERM` look like a crash to the supervisor: a `systemd` unit
 /// with `Restart=on-failure`, or a Kubernetes job, would restart or page on a stop it asked
@@ -757,7 +757,7 @@ fn stopped_not_failed(sched: &Scheduler, id: &str) -> bool {
 fn spawn_stop_signal(stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let why = wait_for_stop().await;
-        eprintln!("\n{why} — stopping transfers; resume with `riptide queue`");
+        eprintln!("\n{why} — stopping transfers; resume with `odm-cli queue`");
         stop.store(true, Ordering::SeqCst);
     })
 }
@@ -862,7 +862,7 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
     let mut cfg = Config::load();
 
     if args.checksum.is_some() && args.archive {
-        return Err(RiptideError::other(
+        return Err(OdmError::other(
             "--checksum does not apply to --archive: an archive is many files, and one \
              digest cannot describe them",
         ));
@@ -939,7 +939,7 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
             }
         }
         if report.quota_paused {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "the download quota ran out part-way through the archive; {} file(s) were \
                  written into {} and will be re-checked on the next run",
                 report.written,
@@ -950,7 +950,7 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
             for f in &report.failures {
                 eprintln!("failed: {f}");
             }
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "{} of {} file(s) could not be archived",
                 report.failures.len(),
                 report.held()
@@ -974,14 +974,14 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
 
     if args.checksum.is_some() {
         if !args.download {
-            return Err(RiptideError::other(
+            return Err(OdmError::other(
                 "--checksum has no effect without --download",
             ));
         }
         if targets.len() != 1 {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "--checksum needs a single download, but the crawl found {} links; run \
-                 `riptide download --checksum … <url>` on the one you want",
+                 `odm-cli download --checksum … <url>` on the one you want",
                 targets.len()
             )));
         }
@@ -1068,10 +1068,10 @@ async fn cmd_grab(args: GrabArgs, quiet: bool) -> Result<()> {
     }
     signals.abort();
     if stopped > 0 {
-        eprintln!("{stopped} download(s) stopped before finishing; run `riptide queue` to resume");
+        eprintln!("{stopped} download(s) stopped before finishing; run `odm-cli queue` to resume");
     }
     if failed > 0 {
-        return Err(RiptideError::other(format!("{failed} download(s) failed")));
+        return Err(OdmError::other(format!("{failed} download(s) failed")));
     }
     Ok(())
 }
@@ -1099,7 +1099,7 @@ async fn cmd_daemon(args: DaemonArgs) -> Result<()> {
         crate::auth::token::write_token_file(path)?;
         println!("wrote a new daemon token to {}", path.display());
         println!(
-            "start the daemon with:  riptide daemon --token-file {}",
+            "start the daemon with:  odm-cli daemon --token-file {}",
             path.display()
         );
         return Ok(());
@@ -1109,7 +1109,7 @@ async fn cmd_daemon(args: DaemonArgs) -> Result<()> {
         crate::auth::token::load(args.token_file.as_deref(), cfg.daemon_token_file.as_deref())?;
 
     if args.print_endpoint {
-        println!("ws://{}/?cid=riptide", cfg.daemon_addr);
+        println!("ws://{}/?cid=odm-cli", cfg.daemon_addr);
         println!("subprotocol: {}", crate::daemon::WS_PROTOCOL);
         println!("http api:    http://{}/api/jobs", cfg.daemon_addr);
         println!(
@@ -1132,7 +1132,7 @@ async fn cmd_daemon(args: DaemonArgs) -> Result<()> {
         why = wait_for_stop() => {
             eprintln!(
                 "\n{why} — stopping; running jobs save their place at the next chunk boundary \
-                 and resume with `riptide queue`"
+                 and resume with `odm-cli queue`"
             );
             stop.store(true, Ordering::SeqCst);
             match sched.wait_for_idle(SHUTDOWN_GRACE).await {
@@ -1178,7 +1178,7 @@ async fn cmd_probe(args: ProbeArgs) -> Result<()> {
             "port": parsed.port,
             "user": parsed.user,
             "path": parsed.path,
-            "note": "run `riptide download` to learn the size; FTP has no metadata request",
+            "note": "run `odm-cli download` to learn the size; FTP has no metadata request",
         });
         if args.json {
             println!("{}", serde_json::to_string_pretty(&info)?);
@@ -1289,7 +1289,7 @@ fn cmd_show(id: &str) -> Result<()> {
     let store = store()?;
     let job = store
         .load(id)
-        .map_err(|_| RiptideError::other(format!("no job with id {id:?}")))?;
+        .map_err(|_| OdmError::other(format!("no job with id {id:?}")))?;
     println!("{}", serde_json::to_string_pretty(&job)?);
     Ok(())
 }
@@ -1305,9 +1305,9 @@ fn cmd_pause(id: &str) -> Result<()> {
     let store = store()?;
     let mut job = store
         .load(id)
-        .map_err(|_| RiptideError::other(format!("no job with id {id:?}")))?;
+        .map_err(|_| OdmError::other(format!("no job with id {id:?}")))?;
     if job.state.is_terminal() {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "job {id} is already {:?}",
             job.state
         )));
@@ -1315,7 +1315,7 @@ fn cmd_pause(id: &str) -> Result<()> {
     job.state = JobState::Paused;
     job.touch();
     store.save(&job)?;
-    println!("paused {id} (resume with `riptide queue`)");
+    println!("paused {id} (resume with `odm-cli queue`)");
     Ok(())
 }
 
@@ -1332,13 +1332,13 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
             None
         } else {
             Some(util::parse_size(spec).ok_or_else(|| {
-                RiptideError::other(format!("cannot read {spec:?} as a size; try 500M or 1G"))
+                OdmError::other(format!("cannot read {spec:?} as a size; try 500M or 1G"))
             })?)
         };
     }
     if let Some(span) = &args.quota_window {
         let d = humantime::parse_duration(span.trim())
-            .map_err(|e| RiptideError::other(format!("bad quota window {span:?}: {e}")))?;
+            .map_err(|e| OdmError::other(format!("bad quota window {span:?}: {e}")))?;
         cfg.quota_window_secs = d.as_secs().max(1);
     }
     let mut sched = Scheduler::new(cfg)?;
@@ -1411,12 +1411,12 @@ async fn cmd_queue(args: QueueArgs, quiet: bool) -> Result<()> {
         println!("download quota: {}", sched.quota.describe());
     }
     if stopped > 0 {
-        println!("{stopped} job(s) stopped before finishing; run `riptide queue` again to resume");
+        println!("{stopped} job(s) stopped before finishing; run `odm-cli queue` again to resume");
     }
     if quota_paused > 0 {
         println!(
             "{quota_paused} job(s) paused on the download quota; \
-             run `riptide queue` again once the window refills"
+             run `odm-cli queue` again once the window refills"
         );
     }
     if failed > 0 {
@@ -1472,7 +1472,7 @@ fn coerce_setting(key: &str, parsed: serde_json::Value) -> Result<serde_json::Va
     }
     match crate::util::parse_size(s) {
         Some(n) => Ok(Value::Number(n.into())),
-        None => Err(RiptideError::other(format!(
+        None => Err(OdmError::other(format!(
             "{key} wants a byte count or \"none\", got {s:?} (try 500M, 2048, or none)"
         ))),
     }
@@ -1492,7 +1492,7 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
         ConfigAction::Init { force } => {
             let path = Config::path();
             if path.exists() && !force {
-                return Err(RiptideError::other(format!(
+                return Err(OdmError::other(format!(
                     "{} already exists (use --force to overwrite)",
                     path.display()
                 )));
@@ -1507,11 +1507,11 @@ fn cmd_config(args: ConfigArgs) -> Result<()> {
             let mut v = serde_json::to_value(&cfg)?;
             let obj = v
                 .as_object_mut()
-                .ok_or_else(|| RiptideError::other("configuration is not an object"))?;
+                .ok_or_else(|| OdmError::other("configuration is not an object"))?;
             if !obj.contains_key(&key) {
                 let mut known: Vec<&String> = obj.keys().collect();
                 known.sort();
-                return Err(RiptideError::other(format!(
+                return Err(OdmError::other(format!(
                     "unknown setting {key:?}; known settings: {}",
                     known
                         .iter()
@@ -1559,7 +1559,7 @@ async fn cmd_project_add(
 ) -> Result<()> {
     project::validate_name(&a.name)?;
     if store.exists(&a.name) {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "a project named {:?} already exists; remove it first, or choose another name",
             a.name
         )));
@@ -1592,7 +1592,7 @@ async fn cmd_project_add(
     p.quality = a.quality.clone();
     if let Some(spec) = &a.checksum {
         if kind != ProjectKind::File {
-            return Err(RiptideError::other(
+            return Err(OdmError::other(
                 "--checksum applies to `--kind file`; a `site` project downloads many files, \
                  and one digest cannot describe them",
             ));
@@ -1616,7 +1616,7 @@ async fn cmd_project_add(
             std::fs::create_dir_all(&p.output).ok();
         }
     } else if a.download || a.archive {
-        return Err(RiptideError::other(
+        return Err(OdmError::other(
             "--download and --archive only apply to `--kind site`; a `file` project always \
              fetches its URL",
         ));
@@ -1635,7 +1635,7 @@ async fn cmd_project_add(
         store.save(&p)?;
         report_run(&p.name, outcome, p.last_error.as_deref());
         if outcome.is_failure() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "project {:?} was created, but its first run did not succeed",
                 p.name
             )));
@@ -1656,7 +1656,7 @@ async fn cmd_project_add(
         println!("  output {}", p.output.display());
         if p.next_run_ms.is_some() && !a.start_now {
             println!(
-                "  run it now with `riptide project run {}`, or let the daemon run it \
+                "  run it now with `odm-cli project run {}`, or let the daemon run it \
                  when it is due",
                 p.name
             );
@@ -1796,9 +1796,7 @@ async fn cmd_project_run(cfg: &Config, store: &ProjectStore, name: &str) -> Resu
     store.save(&p)?;
     report_run(&p.name, outcome, p.last_error.as_deref());
     if outcome.is_failure() {
-        return Err(RiptideError::other(format!(
-            "project {name:?} did not succeed"
-        )));
+        return Err(OdmError::other(format!("project {name:?} did not succeed")));
     }
     Ok(())
 }
@@ -1838,7 +1836,7 @@ async fn cmd_project_tick(
     }
     if !failed.is_empty() {
         // A non-zero exit is what makes `cron` able to tell somebody.
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "{} project(s) failed: {}",
             failed.len(),
             failed.join(", ")
@@ -1924,8 +1922,8 @@ mod tests {
         };
 
         assert_eq!(
-            coerce("daemon_token_file", "/etc/riptide/token").unwrap(),
-            json!("/etc/riptide/token")
+            coerce("daemon_token_file", "/etc/odm/token").unwrap(),
+            json!("/etc/odm/token")
         );
         // The switch-off words mean "unset", not "a file called none", which would otherwise
         // look like it worked and then fail at daemon start.

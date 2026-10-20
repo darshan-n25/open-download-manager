@@ -13,7 +13,7 @@ use quick_xml::Reader;
 use url::Url;
 
 use crate::engine::Engine;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::job::{MediaSegmentRef, MediaSpec};
 
 /// One `<Representation>`, flattened together with everything inherited from its
@@ -128,14 +128,14 @@ impl Rep {
             }
 
             let (Some(dur), Some(pd)) = (self.duration, self.period_duration) else {
-                return Err(RiptideError::Manifest(format!(
+                return Err(OdmError::Manifest(format!(
                     "representation {:?} has a SegmentTemplate with neither a SegmentTimeline \
                      nor a usable @duration/@period duration",
                     self.id
                 )));
             };
             if dur == 0 {
-                return Err(RiptideError::Manifest(
+                return Err(OdmError::Manifest(
                     "SegmentTemplate @duration is zero".into(),
                 ));
             }
@@ -169,7 +169,7 @@ impl Rep {
                 .collect());
         }
 
-        Err(RiptideError::Manifest(format!(
+        Err(OdmError::Manifest(format!(
             "representation {:?} exposes no segments (only SegmentTemplate, SegmentList and \
              SegmentBase are understood)",
             self.id
@@ -320,7 +320,7 @@ fn local_name(e: &BytesStart<'_>) -> String {
 fn attr_map(e: &BytesStart<'_>) -> Result<HashMap<String, String>> {
     let mut m = HashMap::new();
     for a in e.attributes() {
-        let a = a.map_err(|err| RiptideError::Manifest(format!("bad XML attribute: {err}")))?;
+        let a = a.map_err(|err| OdmError::Manifest(format!("bad XML attribute: {err}")))?;
         let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
         // Strip any namespace prefix from the attribute name too.
         let key = match key.split_once(':') {
@@ -366,7 +366,7 @@ struct Frame {
 /// Parse an MPD into a flat list of representations.
 pub fn parse_mpd(xml: &str, manifest_url: &str) -> Result<(Vec<Rep>, Option<f64>)> {
     let mpd_base = {
-        let u = Url::parse(manifest_url).map_err(|e| RiptideError::Manifest(e.to_string()))?;
+        let u = Url::parse(manifest_url).map_err(|e| OdmError::Manifest(e.to_string()))?;
         let mut b = u.clone();
         b.set_query(None);
         b.set_fragment(None);
@@ -394,7 +394,7 @@ pub fn parse_mpd(xml: &str, manifest_url: &str) -> Result<(Vec<Rep>, Option<f64>
     loop {
         let ev = reader
             .read_event_into(&mut buf)
-            .map_err(|e| RiptideError::Manifest(format!("XML error: {e}")))?;
+            .map_err(|e| OdmError::Manifest(format!("XML error: {e}")))?;
         match ev {
             Event::Start(e) => {
                 text.clear();
@@ -549,7 +549,7 @@ pub fn parse_mpd(xml: &str, manifest_url: &str) -> Result<(Vec<Rep>, Option<f64>
     }
 
     if reps.is_empty() {
-        return Err(RiptideError::Manifest(
+        return Err(OdmError::Manifest(
             "MPD contains no <Representation> elements".into(),
         ));
     }
@@ -724,13 +724,13 @@ pub async fn resolve(engine: &mut Engine) -> Result<MediaSpec> {
     };
 
     let video = video.ok_or_else(|| {
-        RiptideError::Manifest("could not choose a video representation from the MPD".into())
+        OdmError::Manifest("could not choose a video representation from the MPD".into())
     })?;
 
     let init = video.init_url();
     let segments = video.segments()?;
     if segments.is_empty() {
-        return Err(RiptideError::Manifest(
+        return Err(OdmError::Manifest(
             "selected DASH representation expands to zero segments".into(),
         ));
     }

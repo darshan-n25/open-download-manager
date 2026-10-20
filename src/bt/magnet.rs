@@ -4,7 +4,7 @@
 //! trackers. The piece hashes have to be fetched from the swarm itself, which
 //! is what [`crate::bt::metadata`] does.
 
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 #[derive(Clone, Debug)]
 pub struct Magnet {
@@ -22,10 +22,10 @@ impl Magnet {
         let text = text.trim();
         let rest = text
             .strip_prefix("magnet:")
-            .ok_or_else(|| RiptideError::other("not a magnet link"))?;
+            .ok_or_else(|| OdmError::other("not a magnet link"))?;
         let rest = rest
             .strip_prefix('?')
-            .ok_or_else(|| RiptideError::other("not a magnet link"))?;
+            .ok_or_else(|| OdmError::other("not a magnet link"))?;
 
         let mut info_hash: Option<[u8; 20]> = None;
         let mut name = None;
@@ -56,7 +56,7 @@ impl Magnet {
         }
 
         let info_hash =
-            info_hash.ok_or_else(|| RiptideError::other("the magnet link has no btih topic"))?;
+            info_hash.ok_or_else(|| OdmError::other("the magnet link has no btih topic"))?;
         Ok(Magnet {
             info_hash,
             name,
@@ -77,20 +77,20 @@ fn decode_info_hash(text: &str) -> Result<[u8; 20]> {
     if text.len() == 40 {
         let mut out = [0u8; 20];
         hex::decode_to_slice(&text, &mut out)
-            .map_err(|e| RiptideError::other(format!("bad info hash: {e}")))?;
+            .map_err(|e| OdmError::other(format!("bad info hash: {e}")))?;
         return Ok(out);
     }
     if text.len() == 32 {
         let bytes = base32_decode(&text.to_ascii_uppercase())
-            .ok_or_else(|| RiptideError::other("bad base32 info hash"))?;
+            .ok_or_else(|| OdmError::other("bad base32 info hash"))?;
         if bytes.len() != 20 {
-            return Err(RiptideError::other("bad base32 info hash"));
+            return Err(OdmError::other("bad base32 info hash"));
         }
         let mut out = [0u8; 20];
         out.copy_from_slice(&bytes);
         return Ok(out);
     }
-    Err(RiptideError::other(
+    Err(OdmError::other(
         "an info hash is 40 hex or 32 base32 digits",
     ))
 }

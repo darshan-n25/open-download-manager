@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Riptide in an image, for the machines that have no desktop: a NAS, a home server, a
+# Open Download Manager in an image, for the machines that have no desktop: a NAS, a home server, a
 # Raspberry-Pi-class box, a Kubernetes job.
 #
 # Two stages, because the runtime one is empty on purpose. The daemon is the whole program:
@@ -30,7 +30,7 @@ RUN cargo fetch --locked
 COPY src ./src
 # `--locked` so the image is built from the lockfile in this commit and not from whatever
 # the registry has today. `tests/` is deliberately absent: nothing here runs them.
-RUN cargo build --release --locked --bin riptide
+RUN cargo build --release --locked --bin odm-cli
 
 # Fail the build rather than publish an image whose entrypoint cannot start. The runtime
 # stage is `scratch`, which has no loader at all, so a binary carrying a `PT_INTERP` segment
@@ -38,18 +38,18 @@ RUN cargo build --release --locked --bin riptide
 # rather than the more familiar `ldd` because Alpine's `ldd` is a separate program whose
 # wording on a static binary is not glibc's, and a check that looks for the wrong words
 # passes — or fails — for the wrong reason.
-RUN if readelf --program-headers target/release/riptide | grep -q INTERP; then \
-      echo "riptide needs a dynamic loader, which a scratch image does not have" >&2; \
+RUN if readelf --program-headers target/release/odm-cli | grep -q INTERP; then \
+      echo "odm-cli needs a dynamic loader, which a scratch image does not have" >&2; \
       exit 1; \
     fi
-RUN target/release/riptide --version
+RUN target/release/odm-cli --version
 
 # -- runtime -----------------------------------------------------------------
 FROM scratch
 
-COPY --from=build /src/target/release/riptide /usr/local/bin/riptide
+COPY --from=build /src/target/release/odm-cli /usr/local/bin/odm-cli
 
-# `scratch` sets no PATH, and a bare `docker exec riptide riptide list` would then fail to find
+# `scratch` sets no PATH, and a bare `docker exec odm-cli odm-cli list` would then fail to find
 # the binary at all (the fallback search path is `/bin:/usr/bin`).
 ENV PATH=/usr/local/bin
 
@@ -73,5 +73,5 @@ EXPOSE 1001
 #
 # The binary is PID 1 and reaps its own children, and it handles SIGTERM itself, so no init
 # shim is needed for `docker stop` to be clean.
-ENTRYPOINT ["/usr/local/bin/riptide"]
+ENTRYPOINT ["/usr/local/bin/odm-cli"]
 CMD ["daemon", "--addr", "0.0.0.0:1001"]

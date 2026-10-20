@@ -8,7 +8,7 @@ use crate::segment::DEFAULT_MIN_CHUNK;
 /// IDM also forwards the browser's own `User-Agent` when the extension captures a link.
 pub const DEFAULT_UA: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/124.0.0.0 Safari/537.36 Riptide/0.1";
+     Chrome/124.0.0.0 Safari/537.36 Open Download Manager/0.1";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -99,8 +99,8 @@ pub fn home_dir() -> PathBuf {
 
 impl Config {
     pub fn path() -> PathBuf {
-        // `RIPTIDE_CONFIG` wins, for tests and for running several profiles.
-        if let Some(p) = std::env::var_os("RIPTIDE_CONFIG") {
+        // `ODM_CONFIG` wins, for tests and for running several profiles.
+        if let Some(p) = std::env::var_os("ODM_CONFIG") {
             return PathBuf::from(p);
         }
         crate::platform::layout().config.join("config.json")

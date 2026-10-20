@@ -1,6 +1,6 @@
-# Riptide browser integration
+# Open Download Manager browser integration
 
-A Manifest V3 extension that hands downloads to the local `riptide daemon`. It is
+A Manifest V3 extension that hands downloads to the local `odm-cli daemon`. It is
 intentionally small: the browser detects links and supplies session state, the daemon does
 the downloading.
 
@@ -37,14 +37,14 @@ ever sent. The Rust side pins the same encoding in
 ## Start the daemon first
 
 ```sh
-riptide daemon                 # listens on 127.0.0.1:1001 by default
-riptide daemon --print-endpoint
+odm-cli daemon                 # listens on 127.0.0.1:1001 by default
+odm-cli daemon --print-endpoint
 ```
 
 The badge stays on `!` until the daemon answers.
 
-If the daemon was started with a token — `riptide daemon --token-file PATH`, the
-`RIPTIDE_DAEMON_TOKEN` environment variable, or the `daemon_token_file` setting — put the same
+If the daemon was started with a token — `odm-cli daemon --token-file PATH`, the
+`ODM_DAEMON_TOKEN` environment variable, or the `daemon_token_file` setting — put the same
 value in the popup's **Daemon token** field under *Settings*. A browser cannot set a header on a
 WebSocket handshake, so the extension sends it as `?token=…` on the socket URL and as an
 `Authorization: Bearer` header on its HTTP reads; without it the daemon answers `401` and the
@@ -60,13 +60,13 @@ because the credential is only presented at handshake time.
 - **Scans the active page** for `<video>`/`<audio>`/`<source>` sources and links to media,
   archives and manifests. `.m3u8`/`.mpd` candidates are tagged `stream` and captured as HLS
   or DASH.
-- **Context menu**: "Download with Riptide" on any link, video, audio or image.
+- **Context menu**: "Download with Open Download Manager" on any link, video, audio or image.
 - **Shows the queue** with live progress, read from the daemon's HTTP API.
 
 ## Protocol
 
 The extension speaks the same two channels the shipped IDM extension uses, minus the parts
-Riptide deliberately drops.
+Open Download Manager deliberately drops.
 
 **WebSocket** `ws://127.0.0.1:1001/?cid=…&rnd=…`, subprotocol
 `plugin.v3.internetdownloadmanager.com`, handshake version `16845059` (`0x01010903`). When the
@@ -95,7 +95,7 @@ decoder expects (`%`, `,`, `;`, `=`, `#`).
 `ADD` is the only message that starts work. `kind` is optional: when omitted the daemon
 infers `hls`/`dash`/`ftp`/`http` from the URL.
 
-The daemon's opcode *numbers* are Riptide's own. IDM's server-side enumeration is not present
+The daemon's opcode *numbers* are Open Download Manager's own. IDM's server-side enumeration is not present
 in its shipped extension (only the dispatcher is), so the numbers are not claimed to match
 IDM's; the framing, the handshake and the subprotocol string are.
 
@@ -119,9 +119,9 @@ daemon.
 
 | permission | reason |
 | --- | --- |
-| `downloads` | observe and cancel the browser's own download so Riptide can take over |
+| `downloads` | observe and cancel the browser's own download so Open Download Manager can take over |
 | `cookies` | forward the session cookies the page would have sent, so authenticated downloads work |
-| `contextMenus` | the "Download with Riptide" entries |
+| `contextMenus` | the "Download with Open Download Manager" entries |
 | `scripting`, `activeTab` | scan the current page for media, only when you press **Scan** |
 | `storage` | settings |
 | `notifications` | report queued/failed downloads |
@@ -133,9 +133,9 @@ configuration is touched, and no native messaging host is installed.
 
 ## Deliberate differences from IDM's extension
 
-| IDM | Riptide | Why |
+| IDM | Open Download Manager | Why |
 | --- | --- | --- |
 | Redirects requests via `declarativeNetRequest` rules so the browser's download never starts | Cancels in `downloads.onCreated` | Reversible, visible in the downloads UI, no silent traffic rewriting |
 | Installs `IDMMsgHost.exe` as a native messaging host and trusts anything reaching its named pipe | WebSocket on loopback | No per-OS host manifest or registry key, and the peer is an actual TCP endpoint |
-| Points the browser at IDM's own proxy to capture traffic | Nothing — Riptide drives its own HTTP stack | No interception of unrelated browsing |
+| Points the browser at IDM's own proxy to capture traffic | Nothing — Open Download Manager drives its own HTTP stack | No interception of unrelated browsing |
 | Trust is established from the peer PID | Optional bearer token; loopback-only with no token | A malicious local process could queue downloads either way; this at least cannot redirect traffic. Off loopback the daemon asks for a shared secret instead of inferring an identity, and refuses a `POST` whose content type a cross-origin page could have produced |

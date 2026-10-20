@@ -1,9 +1,9 @@
-//! BitTorrent support, shipped as the sibling binary `riptide-bt`.
+//! BitTorrent support, shipped as the sibling binary `odm-bt`.
 //!
 //! Deliberately **not** a mode of the HTTP engine: a swarm is a different
 //! transport (peer-to-peer pieces, bencoded metadata, a tracker, SHA-1 piece
 //! hashes) and pretending otherwise would twist both. What it *shares* with
-//! `riptide` is the management layer — configuration, the state directory, the
+//! `odm-cli` is the management layer — configuration, the state directory, the
 //! queue, the quota budget and the scheduler's slot accounting — so a machine
 //! running both binaries keeps one queue and one budget.
 //!

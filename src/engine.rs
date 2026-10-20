@@ -27,7 +27,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit};
 
 use crate::auth::{self, AuthKind, DigestSession};
 use crate::config::Config;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::job::{Job, JobKind, JobState, Segment, SegmentState};
 use crate::net::{NetClient, ServerLimits};
 use crate::quota::Quota;
@@ -498,7 +498,7 @@ impl Engine {
             let resp = rb.send().await?;
 
             if resp.status() == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-                return Err(RiptideError::AuthFailed(
+                return Err(OdmError::AuthFailed(
                     "proxy authentication required (set credentials in the proxy URL)".into(),
                 ));
             }
@@ -507,7 +507,7 @@ impl Engine {
             }
 
             let Some(spec) = self.job.ctx.auth.clone() else {
-                return Err(RiptideError::AuthRequired {
+                return Err(OdmError::AuthRequired {
                     scheme: "unknown".into(),
                 });
             };
@@ -532,7 +532,7 @@ impl Engine {
             match spec.kind {
                 AuthKind::Digest => {
                     let Some(chal) = auth::parse_digest_challenge(&challenge) else {
-                        return Err(RiptideError::AuthRequired {
+                        return Err(OdmError::AuthRequired {
                             scheme: "digest".into(),
                         });
                     };
@@ -561,14 +561,14 @@ impl Engine {
                 }
                 AuthKind::Basic | AuthKind::Bearer => {
                     // Both are preemptive; a 401 means the credentials are simply wrong.
-                    return Err(RiptideError::AuthFailed(format!(
+                    return Err(OdmError::AuthFailed(format!(
                         "{:?} credentials rejected",
                         spec.kind
                     )));
                 }
             }
         }
-        Err(RiptideError::AuthFailed(
+        Err(OdmError::AuthFailed(
             "authentication did not converge after 3 attempts".into(),
         ))
     }
@@ -612,10 +612,10 @@ impl Engine {
             return Ok(());
         }
         if status == StatusCode::NOT_FOUND {
-            return Err(RiptideError::other(format!("404 Not Found: {url}")));
+            return Err(OdmError::other(format!("404 Not Found: {url}")));
         }
         if !status.is_success() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "server returned HTTP {status} for {url}"
             )));
         }
@@ -758,7 +758,7 @@ impl Engine {
             _ => {
                 if self.job.resumable && self.job.total.is_some() {
                     match self.run_segmented().await {
-                        Err(RiptideError::NoRangeSupport) => {
+                        Err(OdmError::NoRangeSupport) => {
                             tracing::info!(
                                 "server ignored Range mid-flight; falling back to a single stream"
                             );
@@ -781,7 +781,7 @@ impl Engine {
                 Ok(())
             }
             Err(e) => {
-                let quota = matches!(e, RiptideError::QuotaExhausted(_));
+                let quota = matches!(e, OdmError::QuotaExhausted(_));
                 self.job.state = if self.cancel.load(Ordering::SeqCst) || quota {
                     JobState::Paused
                 } else {
@@ -861,7 +861,7 @@ impl Engine {
     }
 
     async fn run_segmented(&mut self) -> Result<()> {
-        let total = self.job.total.ok_or(RiptideError::NoRangeSupport)?;
+        let total = self.job.total.ok_or(OdmError::NoRangeSupport)?;
         let part = self.job.part_path();
         let sink = Arc::new(Sink::create(&part, Some(total))?);
 
@@ -896,20 +896,18 @@ impl Engine {
         // finished, it is simply waiting for the window to refill.
         if let Some(q) = st.stop_reason() {
             self.emit_progress();
-            return Err(RiptideError::QuotaExhausted(q));
+            return Err(OdmError::QuotaExhausted(q));
         }
         if let Some(msg) = st.error_message() {
             self.emit_progress();
-            return Err(RiptideError::other(msg));
+            return Err(OdmError::other(msg));
         }
         if self.cancel.load(Ordering::SeqCst) {
             self.emit_progress();
-            return Err(RiptideError::Cancelled);
+            return Err(OdmError::Cancelled);
         }
         if !st.all_done() {
-            return Err(RiptideError::other(
-                "download ended with unfinished segments",
-            ));
+            return Err(OdmError::other("download ended with unfinished segments"));
         }
 
         self.job.downloaded = total;
@@ -936,7 +934,7 @@ impl Engine {
 
         loop {
             if self.cancel.load(Ordering::SeqCst) {
-                return Err(RiptideError::Cancelled);
+                return Err(OdmError::Cancelled);
             }
             let extra = vec![("Accept-Encoding".to_string(), "identity".to_string())];
             // Held for the whole response, including the body loop below.
@@ -958,10 +956,10 @@ impl Engine {
 
             if resp.status() == StatusCode::PARTIAL_CONTENT {
                 // We asked for no range and got one; treat as fatal confusion.
-                return Err(RiptideError::other("unexpected 206 in single-stream mode"));
+                return Err(OdmError::other("unexpected 206 in single-stream mode"));
             }
             if !resp.status().is_success() {
-                return Err(RiptideError::other(format!(
+                return Err(OdmError::other(format!(
                     "HTTP {} in single-stream mode",
                     resp.status()
                 )));
@@ -978,7 +976,7 @@ impl Engine {
             let mut ok = false;
             loop {
                 if self.cancel.load(Ordering::SeqCst) {
-                    return Err(RiptideError::Cancelled);
+                    return Err(OdmError::Cancelled);
                 }
                 let next = tokio::time::timeout(shared.read_timeout, stream.next()).await;
                 match next {
@@ -1013,9 +1011,7 @@ impl Engine {
             }
             attempts += 1;
             if attempts > self.job.max_retries {
-                return Err(RiptideError::other(
-                    "too many restarts in single-stream mode",
-                ));
+                return Err(OdmError::other("too many restarts in single-stream mode"));
             }
             if self.job.total.is_some() {
                 // The server told us the length, so we can resume with a Range header even
@@ -1035,7 +1031,7 @@ impl Engine {
                     continue;
                 }
             }
-            return Err(RiptideError::other("stream interrupted and cannot resume"));
+            return Err(OdmError::other("stream interrupted and cannot resume"));
         }
 
         if let Some(total) = self.job.total {
@@ -1238,7 +1234,7 @@ impl Fetcher {
             Conditional::Fresh((bytes, _)) => Ok(bytes),
             // Unreachable: a `304` is only possible in answer to a conditional request, and
             // an unconditional one sent none.
-            Conditional::NotModified => Err(RiptideError::other(format!(
+            Conditional::NotModified => Err(OdmError::other(format!(
                 "{url}: the server answered 304 to an unconditional request"
             ))),
         }
@@ -1262,14 +1258,14 @@ impl Fetcher {
             return Ok(Conditional::NotModified);
         }
         if !resp.status().is_success() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "HTTP {} fetching {url}",
                 resp.status()
             )));
         }
         if let Some(len) = resp.content_length() {
             if len > max {
-                return Err(RiptideError::other(format!(
+                return Err(OdmError::other(format!(
                     "refusing to buffer {len} bytes from {url} (limit {max})"
                 )));
             }
@@ -1280,7 +1276,7 @@ impl Fetcher {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if buf.len() as u64 + chunk.len() as u64 > max {
-                return Err(RiptideError::other(format!(
+                return Err(OdmError::other(format!(
                     "resource {url} exceeds {max} bytes"
                 )));
             }
@@ -1293,7 +1289,7 @@ impl Fetcher {
     pub async fn to_file(&self, url: &str, dest: &Path) -> Result<u64> {
         match self.to_file_cond(url, dest, &[], u64::MAX).await? {
             Conditional::Fresh((n, _)) => Ok(n),
-            Conditional::NotModified => Err(RiptideError::other(format!(
+            Conditional::NotModified => Err(OdmError::other(format!(
                 "{url}: the server answered 304 to an unconditional request"
             ))),
         }
@@ -1312,7 +1308,7 @@ impl Fetcher {
         max: u64,
     ) -> Result<Conditional<(u64, FetchMeta)>> {
         if self.cancel.load(Ordering::SeqCst) {
-            return Err(RiptideError::Cancelled);
+            return Err(OdmError::Cancelled);
         }
         let _slot = self.permit(url).await;
         let resp = self.conditional_request(url, cond).send().await?;
@@ -1320,14 +1316,14 @@ impl Fetcher {
             return Ok(Conditional::NotModified);
         }
         if !resp.status().is_success() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "HTTP {} fetching {url}",
                 resp.status()
             )));
         }
         if let Some(len) = resp.content_length() {
             if len > max {
-                return Err(RiptideError::other(format!(
+                return Err(OdmError::other(format!(
                     "refusing to fetch {len} bytes from {url} (limit {max})"
                 )));
             }
@@ -1344,7 +1340,7 @@ impl Fetcher {
             match tokio::time::timeout(self.read_timeout, stream.next()).await {
                 Err(_) => {
                     let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(RiptideError::other(format!("read timeout on {url}")));
+                    return Err(OdmError::other(format!("read timeout on {url}")));
                 }
                 Ok(None) => break,
                 Ok(Some(Err(e))) => {
@@ -1357,7 +1353,7 @@ impl Fetcher {
                     if written + n > max {
                         drop(file);
                         let _ = tokio::fs::remove_file(&tmp).await;
-                        return Err(RiptideError::other(format!(
+                        return Err(OdmError::other(format!(
                             "resource {url} exceeds {max} bytes"
                         )));
                     }
@@ -1385,7 +1381,7 @@ impl Fetcher {
         max: u64,
     ) -> Result<Vec<u8>> {
         if self.cancel.load(Ordering::SeqCst) {
-            return Err(RiptideError::Cancelled);
+            return Err(OdmError::Cancelled);
         }
         let mut rb = self.request(url);
         if let Some((start, end)) = range {
@@ -1395,7 +1391,7 @@ impl Fetcher {
         let _slot = self.permit(url).await;
         let resp = rb.send().await?;
         if !resp.status().is_success() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "HTTP {} fetching {url}",
                 resp.status()
             )));
@@ -1408,12 +1404,12 @@ impl Fetcher {
         let mut stream = resp.bytes_stream();
         loop {
             match tokio::time::timeout(self.read_timeout, stream.next()).await {
-                Err(_) => return Err(RiptideError::other(format!("read timeout on {url}"))),
+                Err(_) => return Err(OdmError::other(format!("read timeout on {url}"))),
                 Ok(None) => break,
                 Ok(Some(Err(e))) => return Err(e.into()),
                 Ok(Some(Ok(chunk))) => {
                     if buf.len() as u64 + chunk.len() as u64 > max {
-                        return Err(RiptideError::other(format!(
+                        return Err(OdmError::other(format!(
                             "segment {url} exceeds {max} bytes"
                         )));
                     }
@@ -1488,11 +1484,11 @@ async fn transfer_segment(
                 // segment, and it is why `done` is advanced per write rather than per segment.
                 attempt += 1;
             }
-            Err(RiptideError::NoRangeSupport) => {
+            Err(OdmError::NoRangeSupport) => {
                 st.fail("server stopped honouring byte ranges");
                 return;
             }
-            Err(RiptideError::QuotaExhausted(q)) => {
+            Err(OdmError::QuotaExhausted(q)) => {
                 // A spent budget is not a segment failure. Stop the whole run and leave
                 // every segment's progress intact, so the job resumes where it left off
                 // once the window refills.
@@ -1549,10 +1545,10 @@ async fn stream_range(
     }
     if status == StatusCode::OK {
         // Server ignored our Range and is sending the whole entity.
-        return Err(RiptideError::NoRangeSupport);
+        return Err(OdmError::NoRangeSupport);
     }
     if status != StatusCode::PARTIAL_CONTENT {
-        return Err(RiptideError::other(format!("unexpected HTTP {status}")));
+        return Err(OdmError::other(format!("unexpected HTTP {status}")));
     }
 
     // Trust Content-Range over our own arithmetic: some servers shift the start.
@@ -1580,7 +1576,7 @@ async fn stream_range(
 
     loop {
         if shared.cancel.load(Ordering::SeqCst) {
-            return Err(RiptideError::Cancelled);
+            return Err(OdmError::Cancelled);
         }
         // Re-read the boundary every chunk: a re-split may have shortened us.
         let live_end = h.end.load(Ordering::SeqCst);
@@ -1685,7 +1681,7 @@ impl AuthExchange {
 
 /// Perform the 3-leg NTLM handshake and return the final `Authorization` value.
 ///
-/// Both of Riptide's NTLM-shaped schemes run through here, because the messages are
+/// Both of Open Download Manager's NTLM-shaped schemes run through here, because the messages are
 /// identical and only the wrapping differs: `NTLM` sends them bare, and `Negotiate`
 /// sends them inside SPNEGO (see [`auth::spnego`]).
 async fn ntlm_exchange(
@@ -1714,7 +1710,7 @@ async fn ntlm_exchange(
             .iter()
             .find_map(|h| auth::ntlm::challenge_from_header(h))
             .ok_or_else(|| {
-                RiptideError::AuthFailed(
+                OdmError::AuthFailed(
                     "server did not offer an NTLM challenge, so there is nothing to answer".into(),
                 )
             })?,
@@ -1724,7 +1720,7 @@ async fn ntlm_exchange(
                 .find_map(|h| auth::spnego::negotiate_payload(h))
                 .and_then(|payload| auth::spnego::parse_server_token(&payload))
                 .ok_or_else(|| {
-                    RiptideError::AuthFailed(
+                    OdmError::AuthFailed(
                         "the server answered with an unreadable Negotiate token. A server \
                          configured for Kerberos only often replies with an empty or \
                          Kerberos-only challenge, which an NTLM client cannot answer; \
@@ -1736,8 +1732,8 @@ async fn ntlm_exchange(
             // Say this in the right words. Failing with "not an NTLM message" would
             // leave the user guessing at their server's Kerberos configuration.
             if challenge.mech() == Some(auth::spnego::Mech::Kerberos) {
-                return Err(RiptideError::AuthFailed(
-                    "the server answered Negotiate with a Kerberos token. Riptide \
+                return Err(OdmError::AuthFailed(
+                    "the server answered Negotiate with a Kerberos token. Open Download Manager \
                      implements SPNEGO with NTLM as the inner mechanism and has no \
                      Kerberos implementation, so a Kerberos-only server cannot be \
                      authenticated against; enable NTLM on the server, or use \
@@ -1746,20 +1742,18 @@ async fn ntlm_exchange(
                 ));
             }
             if challenge.is_reject() {
-                return Err(RiptideError::AuthFailed(
-                    "the server rejected the offered mechanism, which for Riptide is \
+                return Err(OdmError::AuthFailed(
+                    "the server rejected the offered mechanism, which for Open Download Manager is \
                      NTLMSSP alone"
                         .into(),
                 ));
             }
 
             let token = challenge.token.as_deref().ok_or_else(|| {
-                RiptideError::AuthFailed(
-                    "the Negotiate challenge carried no mechanism token".into(),
-                )
+                OdmError::AuthFailed("the Negotiate challenge carried no mechanism token".into())
             })?;
             auth::ntlm::parse_type2(token).ok_or_else(|| {
-                RiptideError::AuthFailed(
+                OdmError::AuthFailed(
                     "the Negotiate challenge did not contain an NTLM message".into(),
                 )
             })?

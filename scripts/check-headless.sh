@@ -26,7 +26,7 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO"
 
-BIN=${BIN:-target/x86_64-unknown-linux-gnu/release/riptide}
+BIN=${BIN:-target/x86_64-unknown-linux-gnu/release/odm-cli}
 ROOT=${ROOT:-$(mktemp -d)}
 WORK=${WORK:-$(mktemp -d)}
 PORT_DAEMON=${PORT_DAEMON:-18091}
@@ -82,7 +82,7 @@ in_image_exec() {
 daemon_pid() {
   local pid
   for _ in $(seq 1 100); do
-    for pid in $(pgrep -x riptide); do
+    for pid in $(pgrep -x odm-cli); do
       if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qF "0.0.0.0:$PORT_DAEMON"; then
         echo "$pid"
         return 0
@@ -106,7 +106,7 @@ echo "   $(stat -c '%s bytes' "$BIN"), ldd says: $(ldd "$BIN" 2>&1 | tr -d '\t')
 echo
 echo "== 2. an image that is one file =="
 mkdir -p "$ROOT/usr/local/bin" "$ROOT/data"
-cp "$BIN" "$ROOT/usr/local/bin/riptide"
+cp "$BIN" "$ROOT/usr/local/bin/odm-cli"
 find "$ROOT" -mindepth 1 -printf '   %10s %p\n' | sed "s#$ROOT#/image#"
 if [ -n "$(find "$ROOT" -mindepth 1 -not -path "$ROOT/usr*" -not -path "$ROOT/data*")" ]; then
   fail "the rootfs should hold nothing but the binary and /data"
@@ -116,9 +116,9 @@ echo
 echo "== 3. where it keeps its files =="
 if [ "$IMAGE" = chroot ]; then
   echo -n "   no HOME    -> "
-  env -i PATH="$PATH" unshare -r chroot "$ROOT" /usr/local/bin/riptide config path
+  env -i PATH="$PATH" unshare -r chroot "$ROOT" /usr/local/bin/odm-cli config path
 fi
-echo -n "   HOME=/data -> "; in_image /usr/local/bin/riptide config path
+echo -n "   HOME=/data -> "; in_image /usr/local/bin/odm-cli config path
 
 echo
 echo "== 4. a real download =="
@@ -130,7 +130,7 @@ for _ in $(seq 1 100); do
   curl -sf -o /dev/null "http://127.0.0.1:$PORT_ORIGIN/" && break
   sleep 0.1
 done
-in_image /usr/local/bin/riptide download \
+in_image /usr/local/bin/odm-cli download \
     "http://127.0.0.1:$PORT_ORIGIN/payload.bin" -n 4 >"$WORK/dl.log" 2>&1 \
   || fail "the download failed: $(cat "$WORK/dl.log")"
 got="$ROOT/data/Downloads/payload.bin"
@@ -140,7 +140,7 @@ echo "   6 MiB over 4 connections: $(tr -d '\n' <"$WORK/dl.log")"
 
 echo
 echo "== 5. the daemon serves the API, with a job in flight =="
-"$ROOT/usr/local/bin/riptide" --help >/dev/null 2>&1 || fail "the copied binary is not executable"
+"$ROOT/usr/local/bin/odm-cli" --help >/dev/null 2>&1 || fail "the copied binary is not executable"
 if curl -sf -o /dev/null "http://127.0.0.1:$PORT_DAEMON/health" 2>/dev/null; then
   fail "something already serves port $PORT_DAEMON (a leftover daemon?); stop it or set PORT_DAEMON"
 fi
@@ -149,7 +149,7 @@ fi
 dd if=/dev/urandom of="$WORK/slow.bin" bs=1M count=12 status=none
 python3 "$ORIGIN_SERVER" "$PORT_SLOW" "$WORK" --slow >"$WORK/slow.log" 2>&1 &
 SLOW=$!
-in_image_exec /usr/local/bin/riptide daemon --addr "0.0.0.0:$PORT_DAEMON" >"$WORK/daemon.log" 2>&1 &
+in_image_exec /usr/local/bin/odm-cli daemon --addr "0.0.0.0:$PORT_DAEMON" >"$WORK/daemon.log" 2>&1 &
 WRAPPER=$!
 trap 'kill $ORIGIN $SLOW $WRAPPER 2>/dev/null' EXIT
 for _ in $(seq 1 100); do
@@ -202,9 +202,9 @@ echo "   exit=$code after $((SECONDS - t0))s"
 grep -q SIGTERM "$WORK/daemon.log" || fail "the stop did not say what stopped it"
 sed 's/^/   | /' "$WORK/daemon.log" | tail -4
 echo "   the queue afterwards:"
-in_image /usr/local/bin/riptide list | sed 's/^/   /'
+in_image /usr/local/bin/odm-cli list | sed 's/^/   /'
 # Interrupted, resumable, and never a failure: the whole point of handling the signal.
-in_image /usr/local/bin/riptide list --json >"$WORK/queue.json"
+in_image /usr/local/bin/odm-cli list --json >"$WORK/queue.json"
 python3 - "$WORK/queue.json" <<'PY' || fail "the interrupted job was not left resumable"
 import json, sys
 for j in json.load(open(sys.argv[1])):

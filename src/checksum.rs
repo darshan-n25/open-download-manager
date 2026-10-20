@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
-/// Checksum algorithms Riptide can verify.
+/// Checksum algorithms Open Download Manager can verify.
 ///
 /// `sha256` and `sha512` are the ones to reach for. `sha1` and `md5` are here because release
 /// pages still publish them; they are accepted so a checksum next to a download can be used
@@ -97,7 +97,7 @@ impl Checksum {
     pub fn parse(spec: &str) -> Result<Self> {
         let spec = spec.trim();
         if spec.is_empty() {
-            return Err(RiptideError::other(
+            return Err(OdmError::other(
                 "empty --checksum; expected e.g. sha256:<hex>",
             ));
         }
@@ -112,7 +112,7 @@ impl Checksum {
             None => {
                 let hex = spec.replace([' ', ':'], "");
                 let algorithm = Algorithm::from_hex_len(hex.len()).ok_or_else(|| {
-                    RiptideError::other(format!(
+                    OdmError::other(format!(
                         "cannot tell which algorithm {:?} is a digest for; expected 32 (md5), \
                          40 (sha1), 64 (sha256) or 128 (sha512) hex characters, or write \
                          e.g. sha256:<hex>",
@@ -125,7 +125,7 @@ impl Checksum {
 
         let digest = digest.trim().to_ascii_lowercase();
         if digest.len() != algorithm.hex_len() {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "{} digest {:?} is {} hex characters, expected {}",
                 algorithm.as_str(),
                 digest,
@@ -134,7 +134,7 @@ impl Checksum {
             )));
         }
         if !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "{} digest {:?} is not hexadecimal",
                 algorithm.as_str(),
                 digest
@@ -228,7 +228,7 @@ pub fn verify_and_discard_on_mismatch(checksum: &Checksum, path: &Path) -> Resul
         Ok(actual) if actual == checksum.digest => Ok(actual),
         Ok(actual) => {
             let _ = std::fs::remove_file(path);
-            Err(RiptideError::ChecksumMismatch {
+            Err(OdmError::ChecksumMismatch {
                 algorithm: checksum.algorithm.as_str().to_string(),
                 expected: checksum.digest.clone(),
                 actual,
@@ -354,10 +354,7 @@ mod tests {
         )
         .unwrap();
         let err = verify_file(&ck, &p).await.unwrap_err();
-        assert!(
-            matches!(err, RiptideError::ChecksumMismatch { .. }),
-            "{err}"
-        );
+        assert!(matches!(err, OdmError::ChecksumMismatch { .. }), "{err}");
         assert!(!p.exists(), "the bad working file must be gone");
     }
 

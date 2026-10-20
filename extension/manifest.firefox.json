@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "Riptide Integration",
+  "name": "Open Download Manager Integration",
   "version": "0.1.0",
-  "description": "Hands downloads to the Riptide daemon: parallel connections, resume, HLS/DASH capture.",
+  "description": "Hands downloads to the Open Download Manager daemon: parallel connections, resume, HLS/DASH capture.",
   "browser_specific_settings": {
     "gecko": {
-      "id": "riptide@localhost",
+      "id": "odm@localhost",
       "strict_min_version": "115.0"
     }
   },
@@ -25,7 +25,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Riptide"
+    "default_title": "Open Download Manager"
   },
   "options_ui": {
     "page": "popup.html#options",

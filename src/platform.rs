@@ -1,6 +1,6 @@
 //! Everything that differs between operating systems, in one place.
 //!
-//! Riptide runs on Linux, macOS and Windows, and the differences between them are small
+//! Open Download Manager runs on Linux, macOS and Windows, and the differences between them are small
 //! enough to deserve one module rather than a `cfg` in every file:
 //!
 //! * **Where files live.** Windows has no `HOME`; it has `%USERPROFILE%`, and roaming
@@ -56,7 +56,7 @@ pub const UNIX: Spec = Spec {
         from_env: &["XDG_CONFIG_HOME"],
         under_home: ".config",
     },
-    app: "riptide",
+    app: "odm",
 };
 
 /// The Windows conventions.
@@ -75,7 +75,7 @@ pub const WINDOWS: Spec = Spec {
         from_env: &["APPDATA"],
         under_home: "AppData/Roaming",
     },
-    app: "riptide",
+    app: "odm",
 };
 
 /// The conventions of the platform this binary was built for.
@@ -117,8 +117,8 @@ pub fn layout() -> Layout {
 fn layout_for(spec: &Spec, get: &dyn Fn(&str) -> Option<OsString>) -> Layout {
     // Last resort: no home directory anywhere. `.` is what the program used to do, and it
     // is wrong in a subtle way (the files move with the working directory), so it stays a
-    // documented last resort rather than a silent one — `riptide config path` and
-    // `riptide config show` print what was resolved.
+    // documented last resort rather than a silent one — `odm-cli config path` and
+    // `odm-cli config show` print what was resolved.
     let home = spec
         .home
         .iter()
@@ -261,16 +261,16 @@ mod tests {
             ],
         );
         assert_eq!(l.home, PathBuf::from("/home/me"));
-        assert_eq!(l.data, PathBuf::from("/srv/data/riptide"));
-        assert_eq!(l.config, PathBuf::from("/srv/config/riptide"));
+        assert_eq!(l.data, PathBuf::from("/srv/data/odm"));
+        assert_eq!(l.config, PathBuf::from("/srv/config/odm"));
         assert_eq!(l.downloads(), PathBuf::from("/home/me/Downloads"));
     }
 
     #[test]
     fn unix_falls_back_to_the_home_directory() {
         let l = layout_of(&UNIX, &[("HOME", "/home/me")]);
-        assert_eq!(l.data, PathBuf::from("/home/me/.local/share/riptide"));
-        assert_eq!(l.config, PathBuf::from("/home/me/.config/riptide"));
+        assert_eq!(l.data, PathBuf::from("/home/me/.local/share/odm"));
+        assert_eq!(l.config, PathBuf::from("/home/me/.config/odm"));
     }
 
     #[test]
@@ -286,11 +286,11 @@ mod tests {
         assert_eq!(l.home, PathBuf::from(r"C:\Users\me"));
         assert_eq!(
             l.data,
-            PathBuf::from(r"C:\Users\me\AppData\Local").join("riptide")
+            PathBuf::from(r"C:\Users\me\AppData\Local").join("odm")
         );
         assert_eq!(
             l.config,
-            PathBuf::from(r"C:\Users\me\AppData\Roaming").join("riptide")
+            PathBuf::from(r"C:\Users\me\AppData\Roaming").join("odm")
         );
         // The one path that must never be the working directory: Windows sets no `HOME`,
         // and a `HOME`-only lookup would have produced `.` here.
@@ -308,13 +308,13 @@ mod tests {
             l.data,
             PathBuf::from(r"C:\Users\me")
                 .join("AppData/Local")
-                .join("riptide")
+                .join("odm")
         );
         assert_eq!(
             l.config,
             PathBuf::from(r"C:\Users\me")
                 .join("AppData/Roaming")
-                .join("riptide")
+                .join("odm")
         );
     }
 
@@ -348,15 +348,15 @@ mod tests {
                 ("XDG_CONFIG_HOME", ""),
             ],
         );
-        assert_eq!(l.data, PathBuf::from("/home/me/.local/share/riptide"));
-        assert_eq!(l.config, PathBuf::from("/home/me/.config/riptide"));
+        assert_eq!(l.data, PathBuf::from("/home/me/.local/share/odm"));
+        assert_eq!(l.config, PathBuf::from("/home/me/.config/odm"));
     }
 
     #[test]
     fn with_no_environment_at_all_the_last_resort_is_the_working_directory() {
         let l = layout_of(&UNIX, &[]);
         assert_eq!(l.home, PathBuf::from("."));
-        assert_eq!(l.data, PathBuf::from("./.local/share/riptide"));
+        assert_eq!(l.data, PathBuf::from("./.local/share/odm"));
     }
 
     #[test]

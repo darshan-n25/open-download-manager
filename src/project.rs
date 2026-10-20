@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::archive;
 use crate::config::Config;
 use crate::engine::{Engine, SharedLimits};
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::grabber::{self, GrabberConfig};
 use crate::job::{Job, JobKind};
 use crate::net::ServerLimits;
@@ -326,21 +326,21 @@ fn human_span(ms: u64) -> String {
 /// writing outside its directory.
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(RiptideError::other("project name must not be empty"));
+        return Err(OdmError::other("project name must not be empty"));
     }
     if name.len() > 64 {
-        return Err(RiptideError::other(
+        return Err(OdmError::other(
             "project name must be at most 64 characters",
         ));
     }
     if name == "." || name == ".." {
-        return Err(RiptideError::other("project name must not be `.` or `..`"));
+        return Err(OdmError::other("project name must not be `.` or `..`"));
     }
     if let Some(c) = name
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
     {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "project name may only contain letters, digits, `-`, `_` and `.` (found {c:?}); \
              it is also used as the file name"
         )));
@@ -352,20 +352,20 @@ pub fn validate_name(name: &str) -> Result<()> {
 pub fn parse_interval(s: &str) -> Result<u64> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(RiptideError::other("interval must not be empty"));
+        return Err(OdmError::other("interval must not be empty"));
     }
     // A bare number means seconds, matching how `--limit 500` means 500 bytes; requiring a
     // unit for the one time interval that is naturally a plain count would be pedantry.
     let secs = if s.chars().all(|c| c.is_ascii_digit()) {
         s.parse::<u64>()
-            .map_err(|e| RiptideError::other(format!("cannot parse interval {s:?}: {e}")))?
+            .map_err(|e| OdmError::other(format!("cannot parse interval {s:?}: {e}")))?
     } else {
         humantime::parse_duration(s)
-            .map_err(|e| RiptideError::other(format!("cannot parse interval {s:?}: {e}")))?
+            .map_err(|e| OdmError::other(format!("cannot parse interval {s:?}: {e}")))?
             .as_secs()
     };
     if secs < MIN_INTERVAL_SECS {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "interval must be at least {MIN_INTERVAL_SECS}s (got {})",
             s
         )));
@@ -415,9 +415,9 @@ impl ProjectStore {
         let path = self.path_for(name);
         let data = std::fs::read(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                RiptideError::NoSuchProject(name.to_string())
+                OdmError::NoSuchProject(name.to_string())
             } else {
-                RiptideError::Io(e)
+                OdmError::Io(e)
             }
         })?;
         Ok(serde_json::from_slice(&data)?)
@@ -643,7 +643,7 @@ impl ProjectRunner {
                 );
                 RunOutcome::Updated
             }
-            Err(RiptideError::QuotaExhausted(msg)) => {
+            Err(OdmError::QuotaExhausted(msg)) => {
                 tracing::info!(project = %project.name, reason = %msg, "paused on the download quota");
                 project.last_error = Some(msg.to_string());
                 RunOutcome::QuotaPaused
@@ -756,7 +756,7 @@ impl ProjectRunner {
                     bytes = bytes.saturating_add(engine.job().downloaded);
                     fetched += 1;
                 }
-                Err(RiptideError::QuotaExhausted(msg)) => {
+                Err(OdmError::QuotaExhausted(msg)) => {
                     project.last_fetched = Some(fetched);
                     project.last_skipped = Some(skipped);
                     project.last_bytes = Some(bytes);
@@ -995,7 +995,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ProjectStore::open(dir.path()).unwrap();
         match store.load("nope") {
-            Err(RiptideError::NoSuchProject(n)) => assert_eq!(n, "nope"),
+            Err(OdmError::NoSuchProject(n)) => assert_eq!(n, "nope"),
             other => panic!("expected NoSuchProject, got {other:?}"),
         }
     }

@@ -20,12 +20,10 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use riptide::config::Config;
-use riptide::grabber::GrabberConfig;
-use riptide::job::JobKind;
-use riptide::project::{
-    parse_interval, Project, ProjectKind, ProjectRunner, ProjectStore, RunOutcome,
-};
+use odm::config::Config;
+use odm::grabber::GrabberConfig;
+use odm::job::JobKind;
+use odm::project::{parse_interval, Project, ProjectKind, ProjectRunner, ProjectStore, RunOutcome};
 
 /// Deterministic pseudo-random bytes so a mismatch is obvious in a diff.
 fn body_of(seed: u64, len: usize) -> Vec<u8> {
@@ -796,9 +794,9 @@ async fn running_a_project_moves_its_next_run_to_a_full_interval_away() {
     let mut p = file_project("s", &srv.url("/s.bin"), &out, 3600);
     // Pretend the schedule is long overdue — a laptop that was shut for a week.
     p.next_run_ms = Some(1_000);
-    assert!(p.is_due(riptide::util::now_ms()));
+    assert!(p.is_due(odm::util::now_ms()));
 
-    let before = riptide::util::now_ms();
+    let before = odm::util::now_ms();
     let runner = ProjectRunner::new(cfg);
     assert_eq!(runner.run(&mut p).await, RunOutcome::Updated);
 
@@ -808,7 +806,7 @@ async fn running_a_project_moves_its_next_run_to_a_full_interval_away() {
         "the next run is a whole interval after this one, not a catch-up of every missed \
          slot (next={next}, before={before})"
     );
-    assert!(!p.is_due(riptide::util::now_ms()));
+    assert!(!p.is_due(odm::util::now_ms()));
 }
 
 #[tokio::test]
@@ -821,7 +819,7 @@ async fn the_store_reports_only_what_is_due_and_keeps_the_files_across_runs() {
     let out = dir.path().join("d.bin");
 
     let mut p = file_project("d", &srv.url("/d.bin"), &out, 60);
-    let now = riptide::util::now_ms();
+    let now = odm::util::now_ms();
     p.next_run_ms = Some(now + 600_000); // not due for ten minutes
     store.save(&p).unwrap();
     assert!(store.due(now).unwrap().is_empty());
@@ -841,7 +839,7 @@ async fn the_store_reports_only_what_is_due_and_keeps_the_files_across_runs() {
     );
     assert_eq!(std::fs::read(&out).unwrap(), body);
     assert!(!store
-        .due(riptide::util::now_ms())
+        .due(odm::util::now_ms())
         .unwrap()
         .iter()
         .any(|x| x.name == "d"));
@@ -857,7 +855,7 @@ async fn a_disabled_project_is_not_due_and_does_not_run() {
     p.enabled = false;
     store.save(&p).unwrap();
     assert!(
-        store.due(riptide::util::now_ms()).unwrap().is_empty(),
+        store.due(odm::util::now_ms()).unwrap().is_empty(),
         "a project the user switched off never runs by itself"
     );
 }
@@ -872,7 +870,7 @@ async fn the_schedulers_due_sweep_runs_and_saves_what_is_due() {
     let cfg = test_config(&dir.path().join("state"), &dir.path().join("dl"));
 
     let store = ProjectStore::open_in_state_dir(&cfg.state_dir).unwrap();
-    let now = riptide::util::now_ms();
+    let now = odm::util::now_ms();
     let out = dir.path().join("t.bin");
     let mut due = file_project("due", &srv.url("/t.bin"), &out, 60);
     due.next_run_ms = Some(now - 1);
@@ -892,7 +890,7 @@ async fn the_schedulers_due_sweep_runs_and_saves_what_is_due() {
     broken.max_downloads = 1;
     store.save(&broken).unwrap();
 
-    let sched = riptide::scheduler::Scheduler::new(cfg).unwrap();
+    let sched = odm::scheduler::Scheduler::new(cfg).unwrap();
     let runner = ProjectRunner::with_limits(
         sched.cfg.clone(),
         sched.global.clone(),
@@ -951,11 +949,11 @@ fn intervals_accept_the_units_a_person_types() {
 fn a_project_name_can_never_escape_its_directory() {
     for bad in ["../x", "a/b", "", ".", "..", "a b"] {
         assert!(
-            riptide::project::validate_name(bad).is_err(),
+            odm::project::validate_name(bad).is_err(),
             "{bad:?} must be refused"
         );
     }
-    riptide::project::validate_name("nightly-feed.v2").unwrap();
+    odm::project::validate_name("nightly-feed.v2").unwrap();
 }
 
 #[test]

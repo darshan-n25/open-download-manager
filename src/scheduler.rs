@@ -1,7 +1,7 @@
 //! Queue execution and scheduling.
 //!
 //! IDM exposes a queue width plus a scheduler that can hold a job until a start time and
-//! shut the machine down when the queue drains. Riptide implements the queue width, a
+//! shut the machine down when the queue drains. Open Download Manager implements the queue width, a
 //! scheduled start time per job, and the same "hold the job in the queue and retry" idea
 //! that IDM's Tips file describes ("leave this file alone in the queue of IDM scheduler
 //! and start the queue. IDM scheduler will retry downloading the file every 30 seconds").
@@ -245,7 +245,7 @@ impl Scheduler {
                 .clone()
                 .acquire_owned()
                 .await
-                .map_err(|e| crate::error::RiptideError::other(e.to_string()))?;
+                .map_err(|e| crate::error::OdmError::other(e.to_string()))?;
             this.execute_with(job, progress).await
         })
     }
@@ -280,7 +280,7 @@ impl Scheduler {
                 Ok(r) => out.push(r),
                 Err(e) => {
                     tracing::error!(job = %id, error = %e, "worker task failed");
-                    out.push(Err(crate::error::RiptideError::other(e.to_string())));
+                    out.push(Err(crate::error::OdmError::other(e.to_string())));
                 }
             }
         }

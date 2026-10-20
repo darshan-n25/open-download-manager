@@ -1,6 +1,6 @@
 // Open Download Manager — the native desktop app (egui/eframe).
 //
-// Standalone: starts the riptide daemon in-process on 127.0.0.1:1001, so the user
+// Standalone: starts the odm-cli daemon in-process on 127.0.0.1:1001, so the user
 // just runs the exe (like IDM) without launching a separate daemon. The UI talks
 // to the daemon's HTTP API.
 //
@@ -10,7 +10,7 @@
 
 use eframe::egui;
 use egui_lucide::Lucide;
-use riptide::config::Config;
+use odm::config::Config;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -715,7 +715,7 @@ impl App {
                         egui::Color32::from_rgb(167, 139, 250),
                         |s| {
                             s.status =
-                                "Set limits with `riptide config set` (speed_limit, quota_bytes)"
+                                "Set limits with `odm-cli config set` (speed_limit, quota_bytes)"
                                     .into();
                         },
                     );
@@ -1194,7 +1194,7 @@ impl App {
                 );
                 ui.label(
                     egui::RichText::new(
-                        "Create one with `riptide project add` — a file kept in sync, a site \
+                        "Create one with `odm-cli project add` — a file kept in sync, a site \
                          re-crawled on a schedule, or an offline mirror.",
                     )
                     .size(13.0)
@@ -1421,7 +1421,7 @@ impl App {
     /// A magnet link has no file information of its own, so the torrent file is
     /// fetched from the swarm first and the download follows from there.
     fn add_magnet(&mut self, link: &str) {
-        let magnet = match riptide::bt::magnet::Magnet::parse(link) {
+        let magnet = match odm::bt::magnet::Magnet::parse(link) {
             Ok(m) => m,
             Err(e) => {
                 self.status = format!("magnet link: {e}");
@@ -1459,7 +1459,7 @@ impl App {
             };
             rt.block_on(async {
                 let progress_jobs = jobs.clone();
-                let progress: riptide::bt::engine::ProgressFn = Arc::new(move |p| {
+                let progress: odm::bt::engine::ProgressFn = Arc::new(move |p| {
                     if let Ok(mut list) = progress_jobs.lock() {
                         // The magnet added exactly one job, and it is the last one.
                         if let Some(job) = list.last_mut() {
@@ -1472,7 +1472,7 @@ impl App {
                         }
                     }
                 });
-                match riptide::bt::engine::download_magnet(
+                match odm::bt::engine::download_magnet(
                     &magnet,
                     &out_dir,
                     Some(progress),
@@ -1513,7 +1513,7 @@ impl App {
 
     /// Start a torrent download on a worker thread.
     fn add_torrent(&mut self, path: &std::path::Path) {
-        let torrent = match riptide::bt::engine::read_torrent(path) {
+        let torrent = match odm::bt::engine::read_torrent(path) {
             Ok(t) => t,
             Err(e) => {
                 self.status = format!("{}: {e}", path.display());
@@ -1553,7 +1553,7 @@ impl App {
             rt.block_on(async {
                 let peer_id = *b"-RT0001-0123456789ab";
                 let peers =
-                    match riptide::bt::tracker::announce(&torrent, &peer_id, 6881, torrent.length)
+                    match odm::bt::tracker::announce(&torrent, &peer_id, 6881, torrent.length)
                         .await
                     {
                         Ok(p) => p,
@@ -1569,7 +1569,7 @@ impl App {
                 set_torrent_state(&jobs, &out_path, "downloading");
                 let progress_jobs = jobs.clone();
                 let progress_path = out_path.clone();
-                let progress: riptide::bt::engine::ProgressFn = Arc::new(move |p| {
+                let progress: odm::bt::engine::ProgressFn = Arc::new(move |p| {
                     if let Ok(mut list) = progress_jobs.lock() {
                         if let Some(job) = list.iter_mut().find(|j| j.output == progress_path) {
                             job.downloaded = p.downloaded;
@@ -1578,7 +1578,7 @@ impl App {
                         }
                     }
                 });
-                match riptide::bt::engine::download_with(
+                match odm::bt::engine::download_with(
                     &torrent,
                     &peers,
                     &out_path,
@@ -1780,7 +1780,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Open Download Manager\n\n  USAGE:\n    odm\n\n  A native download manager: HTTP/HTTPS with resume, a download\n  quota, checksum verification, HLS/DASH capture, recurring projects, offline\n  site archiving, and BitTorrent with magnet links.\n\n  The daemon it needs is started with it; the command-line tools\n  `riptide` and `riptide-bt` are installed alongside."
+            "Open Download Manager\n\n  USAGE:\n    odm\n\n  A native download manager: HTTP/HTTPS with resume, a download\n  quota, checksum verification, HLS/DASH capture, recurring projects, offline\n  site archiving, and BitTorrent with magnet links.\n\n  The daemon it needs is started with it; the command-line tools\n  `odm-cli` and `odm-bt` are installed alongside."
         );
         return;
     }
@@ -1800,7 +1800,7 @@ fn main() {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            let bound = match riptide::daemon::bind(&cfg).await {
+            let bound = match odm::daemon::bind(&cfg).await {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!(
@@ -1808,7 +1808,7 @@ fn main() {
                         cfg.daemon_addr
                     );
                     cfg.daemon_addr = "127.0.0.1:0".to_string();
-                    match riptide::daemon::bind(&cfg).await {
+                    match odm::daemon::bind(&cfg).await {
                         Ok(b) => b,
                         Err(e) => {
                             eprintln!("cannot start the daemon: {e}");
@@ -1823,11 +1823,11 @@ fn main() {
                 .map(|a| a.to_string())
                 .unwrap_or_default();
             let _ = DAEMON_ADDR.set(format!("http://{addr}"));
-            let auth = riptide::auth::token::load(None, cfg.daemon_token_file.as_deref())
+            let auth = odm::auth::token::load(None, cfg.daemon_token_file.as_deref())
                 .ok()
                 .flatten()
                 .map(std::sync::Arc::new);
-            let _ = riptide::daemon::serve_on(listener, sched, auth).await;
+            let _ = odm::daemon::serve_on(listener, sched, auth).await;
         });
     });
     std::thread::sleep(Duration::from_millis(600));

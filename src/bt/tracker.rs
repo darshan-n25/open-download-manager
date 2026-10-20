@@ -2,7 +2,7 @@
 //! &downloaded=0&left=<bytes>&compact=1
 
 use crate::bt::torrent::Torrent;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 #[derive(Debug, Clone)]
 pub struct Peer {
@@ -40,16 +40,16 @@ pub async fn announce_at(
     );
     let client = reqwest::Client::builder()
         .build()
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     let resp = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     let body = resp
         .bytes()
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     // compact peers: 6 bytes each (4 ip + 2 port)
     let val = crate::bt::bencode::decode_one_doc(&body)?;
     // peers may be in "peers" (compact) or "peers" list

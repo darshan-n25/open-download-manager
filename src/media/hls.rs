@@ -6,7 +6,7 @@
 use url::Url;
 
 use crate::engine::Engine;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::job::{MediaKey, MediaSegmentRef, MediaSpec};
 
 /// One `#EXT-X-STREAM-INF` entry.
@@ -176,11 +176,11 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist> {
             };
             let len: u64 = len
                 .parse()
-                .map_err(|_| RiptideError::Manifest("bad EXT-X-BYTERANGE length".into()))?;
+                .map_err(|_| OdmError::Manifest("bad EXT-X-BYTERANGE length".into()))?;
             let start = match off {
                 Some(o) => o
                     .parse()
-                    .map_err(|_| RiptideError::Manifest("bad EXT-X-BYTERANGE offset".into()))?,
+                    .map_err(|_| OdmError::Manifest("bad EXT-X-BYTERANGE offset".into()))?,
                 None => byte_cursor,
             };
             byte_cursor = start + len;
@@ -230,7 +230,7 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist> {
                 .map(parse_resolution)
                 .unwrap_or((None, None));
             variants.push(Variant {
-                url: Url::parse(&url).map_err(|e| RiptideError::Manifest(e.to_string()))?,
+                url: Url::parse(&url).map_err(|e| OdmError::Manifest(e.to_string()))?,
                 bandwidth: attr(&a, "BANDWIDTH").and_then(|v| v.parse().ok()),
                 average_bandwidth: attr(&a, "AVERAGE-BANDWIDTH").and_then(|v| v.parse().ok()),
                 width: w,
@@ -257,7 +257,7 @@ pub fn parse(text: &str, base: &Url) -> Result<Playlist> {
         }));
     }
     if segments.is_empty() && init_url.is_none() {
-        return Err(RiptideError::Manifest(
+        return Err(OdmError::Manifest(
             "M3U8 contains neither variants nor segments".into(),
         ));
     }
@@ -282,9 +282,7 @@ pub fn select_variant<'a>(
     preference: Option<&str>,
 ) -> Result<&'a Variant> {
     if variants.is_empty() {
-        return Err(RiptideError::Manifest(
-            "no variants in master playlist".into(),
-        ));
+        return Err(OdmError::Manifest("no variants in master playlist".into()));
     }
     let pref = preference.unwrap_or("best").trim().to_ascii_lowercase();
 
@@ -366,7 +364,7 @@ async fn load_media(
     depth: usize,
 ) -> Result<(Option<Variant>, MediaPlaylist)> {
     if depth > 3 {
-        return Err(RiptideError::Manifest(
+        return Err(OdmError::Manifest(
             "playlist nesting is deeper than expected".into(),
         ));
     }

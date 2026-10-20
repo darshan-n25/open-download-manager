@@ -1,11 +1,11 @@
-//! Riptide binary entry point.
+//! Open Download Manager binary entry point.
 
 use std::process::ExitCode;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use riptide::cli::{self, Cli};
+use odm::cli::{self, Cli};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -15,13 +15,13 @@ async fn main() -> ExitCode {
     match cli::run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("riptide: {e}");
+            eprintln!("odm-cli: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Log to stderr so stdout stays clean for piping (`riptide list --json`, `riptide grab`).
+/// Log to stderr so stdout stays clean for piping (`odm-cli list --json`, `odm-cli grab`).
 fn init_tracing(verbose: u8, quiet: bool) {
     let level = if quiet {
         "error"
@@ -34,7 +34,7 @@ fn init_tracing(verbose: u8, quiet: bool) {
         }
     };
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("riptide={level}")));
+        .unwrap_or_else(|_| EnvFilter::new(format!("odm-cli={level}")));
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

@@ -12,13 +12,13 @@
 //!
 //! (A real framed sample ships inside `IDMMsgHost.exe`: `MSG#0#17#1#0:9:`.)
 //!
-//! Riptide implements the same listen address, the same subprotocol, and the same framing,
+//! Open Download Manager implements the same listen address, the same subprotocol, and the same framing,
 //! with a small documented opcode set — see [`msg`]. It additionally exposes a plain JSON
 //! HTTP API on the same port, so scripts and the CLI can drive it without a browser, and
 //! so the protocol surface is testable with ordinary tools.
 //!
 //! Honest limitation: IDM's server-side opcode enum is not in the shipped extension (the
-//! extension only contains the *dispatcher*), so only the subset Riptide itself defines is
+//! extension only contains the *dispatcher*), so only the subset Open Download Manager itself defines is
 //! guaranteed. The framing, the handshake shape and the subprotocol string are as observed.
 
 use std::sync::atomic::AtomicBool;
@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::auth::token::Auth;
 use crate::config::Config;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::job::{Job, JobKind, JobState, RequestContext};
 use crate::project::ProjectRunner;
 use crate::scheduler::Scheduler;
@@ -46,7 +46,7 @@ pub const PROJECT_TICK_SECS: u64 = 30;
 /// The subprotocol string the shipped Chrome extension requests.
 pub const WS_PROTOCOL: &str = "plugin.v3.internetdownloadmanager.com";
 
-/// Opcode set. IDM's own numbering is not fully recoverable; these values are Riptide's
+/// Opcode set. IDM's own numbering is not fully recoverable; these values are Open Download Manager's
 /// and are documented in `docs/FEATURE-MAP.md`.
 pub mod msg {
     /// Browser → daemon: announce the extension and its protocol version.
@@ -69,7 +69,7 @@ pub mod msg {
 ///
 /// Observed literally as the decimal `16845059` in `IDMGCEExt`'s bundled script
 /// (`S(this, 2, 5, 0, [112, 91, 1028:1031, 0, 16845059, clientId, 15, manifestVersion], …)`),
-/// which is `0x01010903`. Riptide accepts any version and only logs a mismatch, so a future
+/// which is `0x01010903`. Open Download Manager accepts any version and only logs a mismatch, so a future
 /// IDM build with a bumped constant still interoperates.
 pub const PROTOCOL_VERSION: u64 = 16845059;
 
@@ -212,7 +212,7 @@ pub fn drain_frames(buf: &str) -> (Vec<Message>, String) {
 pub fn job_from_message(cfg: &Config, m: &Message) -> Result<Job> {
     let url = m
         .get("url")
-        .ok_or_else(|| RiptideError::other("ADD message has no url"))?
+        .ok_or_else(|| OdmError::other("ADD message has no url"))?
         .to_string();
 
     // An explicit `kind` wins; otherwise infer it from the URL, so a `.m3u8` handed over by
@@ -282,7 +282,7 @@ async fn respond(ws: &mut WsStream<'_>, m: Message) -> Result<()> {
     let text = encode_frame(&m);
     ws.send(tokio_tungstenite::tungstenite::Message::Text(text))
         .await
-        .map_err(|e| RiptideError::other(format!("websocket send failed: {e}")))?;
+        .map_err(|e| OdmError::other(format!("websocket send failed: {e}")))?;
     Ok(())
 }
 
@@ -342,7 +342,7 @@ async fn handle_ws(
             Ok(resp)
         })
         .await
-        .map_err(|e| RiptideError::other(format!("websocket handshake failed: {e}")))?;
+        .map_err(|e| OdmError::other(format!("websocket handshake failed: {e}")))?;
 
     tracing::info!(%peer, protocol = WS_PROTOCOL, "extension connected");
 
@@ -399,7 +399,7 @@ async fn handle_ws(
                         // is 0 when unlimited, which is the common case.
                         .with("quota", sched.quota.limit_bytes().unwrap_or(0).to_string())
                         .with("quotawin", sched.quota.window().as_secs().to_string())
-                        .with("server", format!("riptide/{}", env!("CARGO_PKG_VERSION")));
+                        .with("server", format!("odm-cli/{}", env!("CARGO_PKG_VERSION")));
                     respond(&mut ws, reply).await?;
                 }
                 msg::PING => {
@@ -545,10 +545,10 @@ async fn write_unauthorized(stream: &mut TcpStream) -> Result<()> {
                  \n\
                  Send `Authorization: Bearer <token>`. The daemon's token comes from the file \
                  given by `--token-file` (or the `daemon_token_file` setting), or from the \
-                 RIPTIDE_DAEMON_TOKEN environment variable.\n";
+                 ODM_DAEMON_TOKEN environment variable.\n";
     let head = format!(
         "HTTP/1.1 401 Unauthorized\r\n\
-         WWW-Authenticate: Bearer realm=\"riptide\"\r\n\
+         WWW-Authenticate: Bearer realm=\"odm-cli\"\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
@@ -570,7 +570,7 @@ fn ws_unauthorized() -> tokio_tungstenite::tungstenite::handshake::server::Error
     *resp.status_mut() = StatusCode::UNAUTHORIZED;
     resp.headers_mut().insert(
         "www-authenticate",
-        HeaderValue::from_static("Bearer realm=\"riptide\""),
+        HeaderValue::from_static("Bearer realm=\"odm-cli\""),
     );
     resp
 }
@@ -582,7 +582,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            return Err(RiptideError::Protocol(
+            return Err(OdmError::Protocol(
                 "connection closed before headers".into(),
             ));
         }
@@ -592,7 +592,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             break;
         }
         if buf.len() > 64 * 1024 {
-            return Err(RiptideError::Protocol("request headers too large".into()));
+            return Err(OdmError::Protocol("request headers too large".into()));
         }
     }
 
@@ -832,7 +832,7 @@ async fn handle_http(
         // "Stop queue" pauses what is in flight rather than cancelling it: the engine's
         // cancel handle belongs to the running job, and the honest way to stop a download
         // without losing its partial is to let it reach a chunk boundary and record
-        // `Paused`. That is what the CLI's `riptide pause` does for one job, applied to
+        // `Paused`. That is what the CLI's `odm-cli pause` does for one job, applied to
         // all of them.
         ("POST", "/api/queue/start") => {
             let this = sched.clone();
@@ -1021,7 +1021,7 @@ fn message_from_json(url: &str, v: &serde_json::Value) -> Message {
 }
 
 const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Riptide</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Open Download Manager</title>
 <style>
 :root{--bg:#0f172a;--panel:#1e293b;--panel2:#334155;--text:#e2e8f0;--muted:#94a3b8;--accent:#3b82f6;--accent2:#22c55e;--danger:#ef4444;--warn:#f59e0b;--border:#334155}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1064,7 +1064,7 @@ li:last-child{border:0}
 .empty{text-align:center;padding:2rem;color:var(--muted)}
 </style></head>
 <body>
-<header><h1>⚡ Riptide</h1><span class="sub">download daemon · 127.0.0.1:1001</span>
+<header><h1>⚡ Open Download Manager</h1><span class="sub">download daemon · 127.0.0.1:1001</span>
  <div style="margin-left:auto" class="row">
   <span id="status" class="muted">● connecting…</span>
  </div></header>
@@ -1090,7 +1090,7 @@ li:last-child{border:0}
  <div class="card">
   <h2>Projects</h2>
   <ul id="projects"></ul>
-  <p class="muted" style="margin-top:.6rem;font-size:.78rem">Created with <code style="background:var(--panel2);padding:.1rem .3rem;border-radius:3px">riptide project add</code>. The daemon runs them when due.</p>
+  <p class="muted" style="margin-top:.6rem;font-size:.78rem">Created with <code style="background:var(--panel2);padding:.1rem .3rem;border-radius:3px">odm-cli project add</code>. The daemon runs them when due.</p>
  </div>
  <div class="card">
   <h2>System</h2>
@@ -1174,7 +1174,7 @@ async function refresh(){
         <div><b>${escape(pr.name)}</b> <span class="muted">— ${pr.kind}${pr.archive?' (archive)':''}</span><br>
         <span class="muted" style="font-size:.78rem">${escape(pr.output)} · next in ${pr.next_run_in} · last ${pr.last_run}${pr.last_found!=null?` · ${pr.last_found} files`:''}</span></div>
         <button class="ghost" onclick="runProject('${pr.name}')">Run now</button></div></li>`
-    ).join('') : '<li class="muted">No projects. Add one with <code style="background:var(--panel2);padding:.1rem .3rem;border-radius:3px">riptide project add</code>.</li>';
+    ).join('') : '<li class="muted">No projects. Add one with <code style="background:var(--panel2);padding:.1rem .3rem;border-radius:3px">odm-cli project add</code>.</li>';
 
     document.getElementById('sys').innerHTML = `
       <div class="kv"><b>Status</b><span style="color:#4ade80">● online</span></div>
@@ -1241,7 +1241,7 @@ pub async fn bind(cfg: &Config) -> Result<(TcpListener, Arc<Scheduler>, Arc<Atom
     let sched = Arc::new(sched);
     let listener = TcpListener::bind(&cfg.daemon_addr)
         .await
-        .map_err(|e| RiptideError::other(format!("cannot bind {}: {e}", cfg.daemon_addr)))?;
+        .map_err(|e| OdmError::other(format!("cannot bind {}: {e}", cfg.daemon_addr)))?;
     Ok((listener, sched, stop))
 }
 
@@ -1264,7 +1264,7 @@ pub async fn serve_on(
         "daemon listening — browser extension endpoint and JSON API"
     );
     eprintln!(
-        "Riptide daemon listening on http://{addr}  ({})",
+        "Open Download Manager daemon listening on http://{addr}  ({})",
         if auth.is_some() {
             "bearer token required"
         } else {
@@ -1308,8 +1308,8 @@ fn exposure_notes(addr: std::net::SocketAddr, authenticated: bool) -> Vec<String
         vec![format!(
             "warning: {addr} is not a loopback address and no token is configured, so anyone \
              who can reach this port can queue downloads and read the job list. Configure one \
-             with `riptide daemon --generate-token-file <path>` and `--token-file <path>`, or \
-             the RIPTIDE_DAEMON_TOKEN environment variable."
+             with `odm-cli daemon --generate-token-file <path>` and `--token-file <path>`, or \
+             the ODM_DAEMON_TOKEN environment variable."
         )]
     }
 }
@@ -1696,7 +1696,7 @@ mod tests {
         let warned = exposure_notes(lan, false);
         assert_eq!(warned.len(), 1);
         assert!(warned[0].starts_with("warning:"), "{}", warned[0]);
-        assert!(warned[0].contains("RIPTIDE_DAEMON_TOKEN"), "{}", warned[0]);
+        assert!(warned[0].contains("ODM_DAEMON_TOKEN"), "{}", warned[0]);
 
         // Off loopback with a token: still worth saying the transport is plain.
         let noted = exposure_notes(lan, true);

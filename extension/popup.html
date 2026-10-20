@@ -3,14 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Riptide</title>
+    <title>Open Download Manager</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <header>
       <div class="brand">
         <span class="mark">≫</span>
-        <span>Riptide</span>
+        <span>Open Download Manager</span>
       </div>
       <span id="status" class="pill pill-off">offline</span>
     </header>
@@ -20,7 +20,7 @@
     <section id="offline-hint" class="card hidden">
       <strong>The daemon is not running.</strong>
       <p class="small muted">Start it on the machine you want the files saved to:</p>
-      <code class="block">riptide daemon</code>
+      <code class="block">odm-cli daemon</code>
     </section>
 
     <section class="card">
@@ -31,7 +31,7 @@
       <p id="scan-note" class="small muted">Scan for video, audio and downloadable links.</p>
       <ul id="media" class="media"></ul>
       <div class="row right">
-        <button id="send-selected" class="primary" type="button" disabled>Send to Riptide</button>
+        <button id="send-selected" class="primary" type="button" disabled>Send to Open Download Manager</button>
       </div>
     </section>
 

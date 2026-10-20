@@ -3,7 +3,7 @@
 //!
 //! IDM's grabber offers this next to plain link harvesting ("Complete start page with all
 //! pictures, styles, and scripts for offline browsing", "Convert the links in downloaded
-//! html files to the local files for offline browsing"). Riptide's grabber deliberately only
+//! html files to the local files for offline browsing"). Open Download Manager's grabber deliberately only
 //! *found* targets; this module is the other half.
 //!
 //! Three decisions shape everything here:
@@ -22,7 +22,7 @@
 //!    mean never noticing that an image their text points at has changed. They are small.
 //!    Images, fonts and scripts are conditional, so an unchanged archive moves no bodies.
 //!
-//! Like the rest of Riptide, every byte goes through [`crate::engine::Fetcher`], so an
+//! Like the rest of Open Download Manager, every byte goes through [`crate::engine::Fetcher`], so an
 //! archive is subject to the same global and per-file ceilings, the same per-server
 //! connection ceiling and the same download quota as an interactive download.
 
@@ -33,7 +33,7 @@ use regex::Regex;
 use url::Url;
 
 use crate::engine::{Conditional, Fetcher};
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::grabber;
 use crate::grabber::GrabberConfig;
 use crate::project::Validator;
@@ -43,7 +43,7 @@ use crate::util;
 const HOST_DIR: &str = "_hosts";
 
 /// The reserved top-level directory holding the archive's own bookkeeping.
-pub const BOOKKEEPING_DIR: &str = "_riptide";
+pub const BOOKKEEPING_DIR: &str = "_odm";
 
 /// Where an archive remembers what the server said about each asset, so a later run can ask
 /// instead of pulling the body again.
@@ -213,7 +213,7 @@ pub fn load_validators(root: &Path) -> BTreeMap<String, Validator> {
 /// Remember an archive's validators for the next run.
 pub fn save_validators(root: &Path, map: &BTreeMap<String, Validator>) -> Result<()> {
     let json = serde_json::to_vec_pretty(map)
-        .map_err(|e| RiptideError::other(format!("serializing the archive manifest: {e}")))?;
+        .map_err(|e| OdmError::other(format!("serializing the archive manifest: {e}")))?;
     util::atomic_write(&manifest_path(root), &json)?;
     Ok(())
 }
@@ -683,17 +683,17 @@ struct Archiver<'a> {
 /// An archive of a file is a download, and the error says so rather than producing an empty
 /// directory.
 pub fn start_page(start: &str) -> Result<Url> {
-    let url = Url::parse(start).map_err(RiptideError::Url)?;
+    let url = Url::parse(start).map_err(OdmError::Url)?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "an archive needs an http(s) page to start from, not a {} URL",
             url.scheme()
         )));
     }
     if role_of(&url) != Role::Page {
-        return Err(RiptideError::other(format!(
+        return Err(OdmError::other(format!(
             "{start} is a file, not a page: an archive starts from a document, and a plain \
-             file is what `riptide download` and `riptide grab --download` are for"
+             file is what `odm-cli download` and `odm-cli grab --download` are for"
         )));
     }
     Ok(url)
@@ -746,12 +746,12 @@ pub async fn archive(
             Ok(()) => {}
             // The budget is a process-wide resource that refills on its own, so this is not
             // a failure: it is the run stopping where it is.
-            Err(RiptideError::QuotaExhausted(msg)) => {
+            Err(OdmError::QuotaExhausted(msg)) => {
                 a.report.quota_paused = true;
                 a.report.failures.push(format!("download quota: {msg}"));
                 break;
             }
-            Err(RiptideError::Cancelled) => break,
+            Err(OdmError::Cancelled) => break,
             Err(e) => {
                 let detail = format!("{shown}: {e}");
                 tracing::debug!(%detail, "archive fetch failed");
@@ -1171,14 +1171,11 @@ mod tests {
         assert_ne!(mine, theirs);
 
         // The bookkeeping directory gets the same treatment, so a site that serves
-        // `/_riptide/validators.json` cannot overwrite the archive's own record.
-        let theirs = local_path(
-            &u("https://site.test/_riptide/validators.json"),
-            "site.test",
-        );
+        // `/_odm/validators.json` cannot overwrite the archive's own record.
+        let theirs = local_path(&u("https://site.test/_odm/validators.json"), "site.test");
         assert_eq!(
             theirs,
-            PathBuf::from("_hosts/site.test/_riptide/validators.json")
+            PathBuf::from("_hosts/site.test/_odm/validators.json")
         );
         assert_ne!(theirs, manifest_path(Path::new("")));
     }

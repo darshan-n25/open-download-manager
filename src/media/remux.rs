@@ -3,24 +3,24 @@
 //! Fragmented MP4 (`fMP4`) segments concatenate directly into a valid MP4 — the
 //! initialisation segment carries the headers and each media segment carries fragments.
 //! MPEG-TS does not: it needs a real remux, so an external `ffmpeg` is used when present.
-//! When `ffmpeg` is **absent, or present and failing**, Riptide keeps the raw `.ts` rather
+//! When `ffmpeg` is **absent, or present and failing**, Open Download Manager keeps the raw `.ts` rather
 //! than silently producing a broken `.mp4` or losing the download.
 //!
 //! This matters because IDM's own changelog is full of "some MP4 could not be assembled,
-//! resulting in separate audio and video tracks" and "TS videos stopped at 99%". Riptide
+//! resulting in separate audio and video tracks" and "TS videos stopped at 99%". Open Download Manager
 //! never discards the raw track, so a failed mux is recoverable rather than destructive.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 const COPY_BUF: usize = 1 << 20;
 
-/// Locate an `ffmpeg` binary: `RIPTIDE_FFMPEG` first, then `PATH`.
+/// Locate an `ffmpeg` binary: `ODM_FFMPEG` first, then `PATH`.
 pub fn find_ffmpeg() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("RIPTIDE_FFMPEG") {
+    if let Some(p) = std::env::var_os("ODM_FFMPEG") {
         let p = PathBuf::from(p);
         if p.is_file() {
             return Some(p);
@@ -145,7 +145,7 @@ pub fn mux(video: &Path, audio: &Path, out: &Path, container: &str) -> Result<u6
         .args(["-movflags", "+faststart"])
         .arg(out)
         .status()
-        .map_err(|e| RiptideError::other(format!("failed to run ffmpeg: {e}")))?;
+        .map_err(|e| OdmError::other(format!("failed to run ffmpeg: {e}")))?;
 
     if !status.success() || !out.exists() {
         // The container may not accept a raw copy (e.g. TS video into MP4 with an
@@ -165,7 +165,7 @@ pub fn mux(video: &Path, audio: &Path, out: &Path, container: &str) -> Result<u6
             .args(["-movflags", "+faststart"])
             .arg(out)
             .status()
-            .map_err(|e| RiptideError::other(format!("failed to run ffmpeg: {e}")))?;
+            .map_err(|e| OdmError::other(format!("failed to run ffmpeg: {e}")))?;
         if !status.success() || !out.exists() {
             return keep_raw(
                 video,
@@ -195,7 +195,7 @@ fn remux_ts(ffmpeg: &Path, track: &Path, out: &Path) -> Result<u64> {
         .args(["-movflags", "+faststart"])
         .arg(out)
         .status()
-        .map_err(|e| RiptideError::other(format!("failed to run ffmpeg: {e}")))?;
+        .map_err(|e| OdmError::other(format!("failed to run ffmpeg: {e}")))?;
 
     if status.success() && out.exists() {
         return Ok(std::fs::metadata(out)?.len());
@@ -212,13 +212,11 @@ fn remux_ts(ffmpeg: &Path, track: &Path, out: &Path) -> Result<u64> {
         .args(["-c", "copy"])
         .arg(out)
         .status()
-        .map_err(|e| RiptideError::other(format!("failed to run ffmpeg: {e}")))?;
+        .map_err(|e| OdmError::other(format!("failed to run ffmpeg: {e}")))?;
     if status.success() && out.exists() {
         return Ok(std::fs::metadata(out)?.len());
     }
-    Err(RiptideError::other(
-        "ffmpeg could not remux the MPEG-TS stream",
-    ))
+    Err(OdmError::other("ffmpeg could not remux the MPEG-TS stream"))
 }
 
 /// Sniff whether a byte block looks like an ISO-BMFF (MP4) file.
@@ -252,7 +250,7 @@ mod tests {
     use super::*;
 
     /// `std::env` is process-wide, and `cargo test` runs tests on threads. Every test that
-    /// touches `RIPTIDE_FFMPEG` or `PATH` holds this lock, or it races the others.
+    /// touches `ODM_FFMPEG` or `PATH` holds this lock, or it races the others.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -349,13 +347,13 @@ mod tests {
     #[test]
     fn ts_without_ffmpeg_falls_back_to_a_ts_extension() {
         let _g = env_guard();
-        // Point RIPTIDE_FFMPEG at a nonexistent file and clear PATH so lookup fails.
+        // Point ODM_FFMPEG at a nonexistent file and clear PATH so lookup fails.
         let dir = tempfile::tempdir().unwrap();
         let track = dir.path().join("track.bin");
         std::fs::write(&track, b"\x47segment").unwrap();
         let out = dir.path().join("movie.mp4");
 
-        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", dir.path().join("nope-ffmpeg"));
+        let _ffmpeg = EnvVar::set("ODM_FFMPEG", dir.path().join("nope-ffmpeg"));
         let _path = EnvVar::set("PATH", "");
 
         let result = publish_single(&track, &out, "ts");
@@ -381,7 +379,7 @@ mod tests {
 
         // A real, executable `ffmpeg` that always fails — the broken-build case that a
         // missing binary does not cover.
-        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", failing_ffmpeg(dir.path()));
+        let _ffmpeg = EnvVar::set("ODM_FFMPEG", failing_ffmpeg(dir.path()));
         // Leave a stale partial output to prove it is cleaned up, not published.
         std::fs::write(&out, b"truncated garbage from a crashed remux").unwrap();
 
@@ -408,7 +406,7 @@ mod tests {
         std::fs::write(&audio, b"\x47audio-track").unwrap();
         let out = dir.path().join("movie.mp4");
 
-        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", failing_ffmpeg(dir.path()));
+        let _ffmpeg = EnvVar::set("ODM_FFMPEG", failing_ffmpeg(dir.path()));
         let n = mux(&video, &audio, &out, "ts").unwrap();
 
         // Same outcome as an absent ffmpeg: the video track is kept rather than an error.
@@ -431,7 +429,7 @@ mod tests {
         std::fs::write(&audio, b"audio").unwrap();
         let out = dir.path().join("movie.mp4");
 
-        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", failing_ffmpeg(dir.path()));
+        let _ffmpeg = EnvVar::set("ODM_FFMPEG", failing_ffmpeg(dir.path()));
         // `mp4` has no separate fallback name: the track is written to `out` itself.
         let n = mux(&video, &audio, &out, "mp4").unwrap();
         assert_eq!(n, 5);
@@ -457,9 +455,9 @@ mod tests {
     #[test]
     fn a_real_ffmpeg_can_never_lose_an_mpeg_ts_track() {
         let _g = env_guard();
-        // Deliberately no `RIPTIDE_FFMPEG` override: whatever ffmpeg this host has is used,
+        // Deliberately no `ODM_FFMPEG` override: whatever ffmpeg this host has is used,
         // which is the point — the test is about the host, not about a fixture.
-        let _ffmpeg = EnvVar::unset("RIPTIDE_FFMPEG");
+        let _ffmpeg = EnvVar::unset("ODM_FFMPEG");
 
         let dir = tempfile::tempdir().unwrap();
         let track = dir.path().join("track.ts");
@@ -492,7 +490,7 @@ mod tests {
     #[test]
     fn a_working_ffmpeg_remuxes_a_transport_stream_to_mp4() {
         let _g = env_guard();
-        let _ffmpeg = EnvVar::unset("RIPTIDE_FFMPEG");
+        let _ffmpeg = EnvVar::unset("ODM_FFMPEG");
         if find_ffmpeg().is_none() {
             return;
         }
@@ -531,7 +529,7 @@ mod tests {
         let fake = dir.path().join("ffmpeg");
         std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
 
-        let _ffmpeg = EnvVar::set("RIPTIDE_FFMPEG", &fake);
+        let _ffmpeg = EnvVar::set("ODM_FFMPEG", &fake);
         assert_eq!(find_ffmpeg().as_deref(), Some(fake.as_path()));
     }
 }

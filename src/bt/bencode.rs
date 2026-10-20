@@ -1,7 +1,7 @@
 //! Bencode (BitTorrent's serialization format): integers `i<n>e`, byte strings
 //! `<len>:<bytes>`, lists `l...e`, dictionaries `d...e`. No other types exist.
 
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -65,25 +65,25 @@ pub fn decode(data: &[u8]) -> Result<(Value, usize)> {
 pub fn decode_one_doc(data: &[u8]) -> Result<Value> {
     let (v, consumed) = decode(data)?;
     if consumed != data.len() {
-        return Err(RiptideError::other("trailing bytes after bencode value"));
+        return Err(OdmError::other("trailing bytes after bencode value"));
     }
     Ok(v)
 }
 
 fn decode_one(data: &[u8]) -> Result<(Value, &[u8])> {
     if data.is_empty() {
-        return Err(RiptideError::other("unexpected end of bencode"));
+        return Err(OdmError::other("unexpected end of bencode"));
     }
     match data[0] {
         b'i' => {
             let end = data
                 .iter()
                 .position(|&b| b == b'e')
-                .ok_or_else(|| RiptideError::other("unterminated integer"))?;
+                .ok_or_else(|| OdmError::other("unterminated integer"))?;
             let n: i64 = std::str::from_utf8(&data[1..end])
-                .map_err(|_| RiptideError::other("bad integer"))?
+                .map_err(|_| OdmError::other("bad integer"))?
                 .parse()
-                .map_err(|_| RiptideError::other("bad integer"))?;
+                .map_err(|_| OdmError::other("bad integer"))?;
             Ok((Value::Int(n), &data[end + 1..]))
         }
         b'l' => {
@@ -95,7 +95,7 @@ fn decode_one(data: &[u8]) -> Result<(Value, &[u8])> {
                 rest = r;
             }
             if rest.is_empty() {
-                return Err(RiptideError::other("unterminated list"));
+                return Err(OdmError::other("unterminated list"));
             }
             Ok((Value::List(items), &rest[1..]))
         }
@@ -106,14 +106,14 @@ fn decode_one(data: &[u8]) -> Result<(Value, &[u8])> {
                 let (k, r) = decode_one(rest)?;
                 let key = k
                     .as_bytes()
-                    .ok_or_else(|| RiptideError::other("dict key not a string"))?
+                    .ok_or_else(|| OdmError::other("dict key not a string"))?
                     .to_vec();
                 let (v, r2) = decode_one(r)?;
                 items.push((key, v));
                 rest = r2;
             }
             if rest.is_empty() {
-                return Err(RiptideError::other("unterminated dict"));
+                return Err(OdmError::other("unterminated dict"));
             }
             Ok((Value::Dict(items), &rest[1..]))
         }
@@ -122,19 +122,19 @@ fn decode_one(data: &[u8]) -> Result<(Value, &[u8])> {
             let colon = data
                 .iter()
                 .position(|&b| b == b':')
-                .ok_or_else(|| RiptideError::other("missing colon in string"))?;
+                .ok_or_else(|| OdmError::other("missing colon in string"))?;
             let len: usize = std::str::from_utf8(&data[..colon])
-                .map_err(|_| RiptideError::other("bad length"))?
+                .map_err(|_| OdmError::other("bad length"))?
                 .parse()
-                .map_err(|_| RiptideError::other("bad length"))?;
+                .map_err(|_| OdmError::other("bad length"))?;
             let start = colon + 1;
             let end = start + len;
             if end > data.len() {
-                return Err(RiptideError::other("string too short"));
+                return Err(OdmError::other("string too short"));
             }
             Ok((Value::Bytes(data[start..end].to_vec()), &data[end..]))
         }
-        _ => Err(RiptideError::other("invalid bencode prefix")),
+        _ => Err(OdmError::other("invalid bencode prefix")),
     }
 }
 

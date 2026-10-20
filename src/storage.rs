@@ -1,6 +1,6 @@
 //! Positional file writes.
 //!
-//! Riptide writes every segment **directly at its final offset** in a pre-allocated
+//! Open Download Manager writes every segment **directly at its final offset** in a pre-allocated
 //! sparse file. There is no "download N parts then concatenate" step — that extra
 //! assembly pass is IDM's most-complained-about behaviour (see `docs/FEATURE-MAP.md`),
 //! and skipping it means a finished download is finished instantly.

@@ -2,7 +2,7 @@
 //!
 //! [`crate::throttle::RateLimiter`] caps bytes *per second*. A quota caps bytes *per
 //! window*: "no more than 500 MB in any hour". IDM reports `Download limits exceeded!`
-//! and stops; Riptide stops too, but leaves the job **resumable** and records how long
+//! and stops; Open Download Manager stops too, but leaves the job **resumable** and records how long
 //! until the budget refills so the queue can pick it up again.
 //!
 //! The window is a fixed span measured from the first byte charged — not a sliding

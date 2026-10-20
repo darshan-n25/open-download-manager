@@ -1,4 +1,4 @@
-//! What a service manager does to a running Riptide.
+//! What a service manager does to a running Open Download Manager.
 //!
 //! `docker stop`, `systemctl stop` and `kubectl delete` all send SIGTERM and then, once the
 //! grace period is up, SIGKILL. These tests signal the compiled binary for real, because the
@@ -28,7 +28,7 @@ const STOP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// A daemon with its own configuration file and its own state directory.
 ///
-/// `RIPTIDE_CONFIG` and `HOME` are both set, and the XDG variables cleared, so a stray
+/// `ODM_CONFIG` and `HOME` are both set, and the XDG variables cleared, so a stray
 /// configuration on the machine running the tests cannot change what is under test.
 struct Fixture {
     dir: tempfile::TempDir,
@@ -50,16 +50,16 @@ impl Fixture {
         Fixture { dir, config, home }
     }
 
-    /// Any Riptide command, with the fixture's environment — the isolation the daemon gets
+    /// Any Open Download Manager command, with the fixture's environment — the isolation the daemon gets
     /// belongs to every command a service manager might run in its place.
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_riptide"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_odm-cli"));
         c.args(args)
-            .env("RIPTIDE_CONFIG", &self.config)
+            .env("ODM_CONFIG", &self.config)
             .env("HOME", &self.home)
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_CONFIG_HOME")
-            .env_remove("RIPTIDE_DAEMON_TOKEN")
+            .env_remove("ODM_DAEMON_TOKEN")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -75,15 +75,15 @@ impl Fixture {
 
     /// The queue as the CLI sees it, which is what a person would look at after a stop.
     fn list(&self) -> Vec<serde_json::Value> {
-        let out = Command::new(env!("CARGO_BIN_EXE_riptide"))
+        let out = Command::new(env!("CARGO_BIN_EXE_odm-cli"))
             .args(["list", "--json"])
-            .env("RIPTIDE_CONFIG", &self.config)
+            .env("ODM_CONFIG", &self.config)
             .env("HOME", &self.home)
             .output()
             .unwrap();
         assert!(
             out.status.success(),
-            "`riptide list` failed: {}",
+            "`odm-cli list` failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         serde_json::from_slice(&out.stdout).unwrap()
@@ -397,7 +397,7 @@ fn sigint_still_stops_the_daemon() {
     assert!(stderr.contains("interrupted"), "{stderr}");
 }
 
-/// The same stop, for `riptide download` — what a one-shot job runs instead of the daemon: a
+/// The same stop, for `odm-cli download` — what a one-shot job runs instead of the daemon: a
 /// Kubernetes `Job`, a `systemd` oneshot unit, a `cron` entry.
 ///
 /// The exit code matters as much as it does for the daemon, and for the same reason. A unit

@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::bt::torrent::Torrent;
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 
 const PEER_ID: [u8; 20] = *b"-RT0001-0123456789ab";
 /// The extension message id we advertise for `ut_metadata`.
@@ -34,14 +34,14 @@ pub async fn fetch(info_hash: &[u8; 20], peers: &[crate::bt::tracker::Peer]) -> 
         }
     }
     Err(last_error
-        .unwrap_or_else(|| RiptideError::other("no peer could give us the torrent's metadata")))
+        .unwrap_or_else(|| OdmError::other("no peer could give us the torrent's metadata")))
 }
 
 /// The metadata, piece by piece, from one peer.
 async fn fetch_from_peer(info_hash: &[u8; 20], addr: SocketAddr) -> Result<Torrent> {
     let mut stream = TcpStream::connect(addr)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
 
     // The handshake. The sixth reserved byte (index 5) says "I speak the
     // extension protocol"; without it the peer will not offer the metadata.
@@ -56,17 +56,15 @@ async fn fetch_from_peer(info_hash: &[u8; 20], addr: SocketAddr) -> Result<Torre
     stream
         .write_all(&hs)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
 
     let mut peer_hs = [0u8; 68];
     stream
         .read_exact(&mut peer_hs)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     if &peer_hs[28..48] != info_hash {
-        return Err(RiptideError::other(
-            "the peer is talking about another torrent",
-        ));
+        return Err(OdmError::other("the peer is talking about another torrent"));
     }
 
     // The peer's extension handshake: which extensions it supports. It does not
@@ -89,7 +87,7 @@ async fn fetch_from_peer(info_hash: &[u8; 20], addr: SocketAddr) -> Result<Torre
         }
     }
     let Some(peer_metadata_id) = peer_metadata_id else {
-        return Err(RiptideError::other(
+        return Err(OdmError::other(
             "the peer does not offer the metadata extension",
         ));
     };
@@ -116,7 +114,7 @@ async fn fetch_from_peer(info_hash: &[u8; 20], addr: SocketAddr) -> Result<Torre
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while total.is_none() || data.len() < total.unwrap() as usize {
         if tokio::time::Instant::now() > deadline {
-            return Err(RiptideError::other("timed out waiting for the metadata"));
+            return Err(OdmError::other("timed out waiting for the metadata"));
         }
         let msg = read_message(&mut stream, &mut buf).await?;
         if msg.len() < 3 {
@@ -162,17 +160,17 @@ async fn read_message(stream: &mut TcpStream, scratch: &mut Vec<u8>) -> Result<V
     stream
         .read_exact(scratch)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     let len = u32::from_be_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]) as usize;
     if len > 1 << 20 {
-        return Err(RiptideError::other("an oversized extension message"));
+        return Err(OdmError::other("an oversized extension message"));
     }
     scratch.clear();
     scratch.resize(len, 0);
     stream
         .read_exact(scratch)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))?;
+        .map_err(|e| OdmError::other(e.to_string()))?;
     Ok(scratch.clone())
 }
 
@@ -190,5 +188,5 @@ async fn write_extension(stream: &mut TcpStream, msg_id: u16, payload: &[u8]) ->
     stream
         .write_all(&out)
         .await
-        .map_err(|e| RiptideError::other(e.to_string()))
+        .map_err(|e| OdmError::other(e.to_string()))
 }

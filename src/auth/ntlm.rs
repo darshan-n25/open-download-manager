@@ -1,7 +1,7 @@
 //! NTLMv2 (NTLMSSP) message generation.
 //!
 //! IDM reaches NTLM through Windows SSPI (`AcquireCredentialsHandleA` from
-//! `secur32.dll`), so its implementation is opaque. Because Riptide must work on
+//! `secur32.dll`), so its implementation is opaque. Because Open Download Manager must work on
 //! Linux and macOS where SSPI does not exist, the NTLM handshake is implemented
 //! directly from the MS-NLMP specification instead.
 //!

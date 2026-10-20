@@ -7,7 +7,7 @@
 //! and SSPI-backed Negotiate (`AcquireCredentialsHandleA`).
 //!
 //! The one material difference is underneath Negotiate. IDM hands it to Windows
-//! SSPI, which can produce a real Kerberos ticket. Riptide implements SPNEGO with
+//! SSPI, which can produce a real Kerberos ticket. Open Download Manager implements SPNEGO with
 //! NTLMSSP as the inner mechanism, which covers a server that accepts NTLM inside
 //! `Negotiate` but not one configured for Kerberos only. See
 //! [`spnego`] for why that line is drawn where it is, and how the unsupported case
@@ -133,7 +133,7 @@ impl AuthSpec {
                     .ok()
                     .or_else(|| std::env::var("COMPUTERNAME").ok())
             })
-            .unwrap_or_else(|| "RIPTIDE".to_string())
+            .unwrap_or_else(|| "ODM".to_string())
     }
 
     /// Header this spec can supply *before* being challenged.

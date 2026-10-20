@@ -1,7 +1,7 @@
-// Riptide browser integration.
+// Open Download Manager browser integration.
 //
 // Talks to the local daemon over the same two channels IDM's own extension uses, minus the
-// parts Riptide deliberately drops:
+// parts Open Download Manager deliberately drops:
 //
 //   * a WebSocket on 127.0.0.1:1001 negotiating `plugin.v3.internetdownloadmanager.com`,
 //     speaking the `MSG#<id>#<type>#<a>#<b>[,k=v...];` framing;
@@ -10,7 +10,7 @@
 // Deliberately *not* done, and why:
 //   * no `declarativeNetRequest` redirect rules — cancelling in `downloads.onCreated` is
 //     reversible and never silently rewrites traffic;
-//   * no browser-proxy hijacking — Riptide drives its own HTTP client;
+//   * no browser-proxy hijacking — Open Download Manager drives its own HTTP client;
 //   * no native-messaging host — the WebSocket needs no per-OS host manifest, no registry
 //     key, and no "trust anything that connects to the pipe" assumption.
 //
@@ -26,11 +26,11 @@ importScripts('./protocol.js');
 const api = globalThis.browser ?? globalThis.chrome;
 
 const { MSG, PROTOCOL_VERSION, WS_PROTOCOL, encodeFrame, drainFrames, daemonWsUrl } =
-  globalThis.RiptideProtocol;
+  globalThis.OdmProtocol;
 
 // ---------------------------------------------------------------- configuration
 
-const DAEMON = globalThis.RiptideProtocol.DAEMON;
+const DAEMON = globalThis.OdmProtocol.DAEMON;
 const API_BASE = `http://${DAEMON.host}:${DAEMON.port}`;
 
 const IDLE_CLOSE_MS = 20_000;
@@ -38,7 +38,7 @@ const HANDSHAKE_TIMEOUT_MS = 4_000;
 const REPLY_TIMEOUT_MS = 15_000;
 
 const DEFAULTS = {
-  /** Take over browser downloads and route them to Riptide. */
+  /** Take over browser downloads and route them to Open Download Manager. */
   intercept: true,
   /** Empty means "every host"; otherwise only these hosts are intercepted. */
   allowHosts: [],
@@ -101,7 +101,7 @@ function daemonUrl(settings) {
   return daemonWsUrl({
     host: DAEMON.host,
     port: DAEMON.port,
-    cid: 'riptide-ext',
+    cid: 'odm-ext',
     token: settings.daemonToken,
     nonce: Date.now(),
   });
@@ -111,7 +111,7 @@ function wsUrlForPopup(settings) {
   return daemonWsUrl({
     host: DAEMON.host,
     port: DAEMON.port,
-    cid: 'riptide-popup',
+    cid: 'odm-cli-popup',
     token: settings.daemonToken,
     nonce: Date.now(),
   });
@@ -144,7 +144,7 @@ function onSocketClose() {
   socket = null;
   opening = null;
   setBadge(false);
-  rejectAll(new Error('the Riptide daemon closed the connection'));
+  rejectAll(new Error('the Open Download Manager daemon closed the connection'));
 }
 
 /**
@@ -212,7 +212,7 @@ async function openSocket() {
       reject(new Error(message));
     };
     const timer = setTimeout(
-      () => fail(`no answer from the Riptide daemon on ${DAEMON.host}:${DAEMON.port}`),
+      () => fail(`no answer from the Open Download Manager daemon on ${DAEMON.host}:${DAEMON.port}`),
       HANDSHAKE_TIMEOUT_MS,
     );
 
@@ -238,7 +238,7 @@ async function openSocket() {
           a: PROTOCOL_VERSION,
           kv: {
             version: String(PROTOCOL_VERSION),
-            client: `riptide-extension/${api.runtime.getManifest().version}`,
+            client: `odm-extension/${api.runtime.getManifest().version}`,
             ua: navigator.userAgent,
           },
         }),
@@ -258,7 +258,7 @@ async function openSocket() {
     });
 
     // `error` is always followed by `close`, which rejects the waiters.
-    ws.addEventListener('error', () => fail('could not reach the Riptide daemon'));
+    ws.addEventListener('error', () => fail('could not reach the Open Download Manager daemon'));
   });
 
   return opening;
@@ -272,7 +272,7 @@ async function request(type, kv = {}) {
     const id = ++seq;
     const timer = setTimeout(() => {
       waiters.delete(id);
-      reject(new Error('the Riptide daemon did not reply'));
+      reject(new Error('the Open Download Manager daemon did not reply'));
     }, REPLY_TIMEOUT_MS);
     waiters.set(id, { timer, resolve, reject });
     ws.send(encodeFrame({ id, type, kv }));
@@ -302,7 +302,7 @@ function setBadge(connected) {
     api.action.setBadgeText({ text });
     api.action.setBadgeBackgroundColor({ color: connected ? '#2f855a' : '#c53030' });
     api.action.setTitle({
-      title: connected ? 'Riptide — connected' : 'Riptide — daemon not reachable',
+      title: connected ? 'Open Download Manager — connected' : 'Open Download Manager — daemon not reachable',
     });
   } catch {
     /* the popup may not exist in some embedding hosts */
@@ -427,9 +427,9 @@ api.downloads.onCreated.addListener(async (item) => {
   const referer = item.referrer && item.referrer !== 'about:blank' ? item.referrer : '';
   try {
     const kv = await sendToDaemon(item.url, { referer, settings });
-    if (settings.notify) notify('Riptide', `Queued ${kv.url || item.url}`);
+    if (settings.notify) notify('Open Download Manager', `Queued ${kv.url || item.url}`);
   } catch (error) {
-    if (settings.notify) notify('Riptide could not take over the download', String(error.message || error));
+    if (settings.notify) notify('Open Download Manager could not take over the download', String(error.message || error));
     // Give the download back to the browser rather than losing it.
     try {
       api.downloads.download({ url: item.url });
@@ -447,11 +447,11 @@ async function installMenus() {
   } catch {
     /* first run */
   }
-  const common = { title: 'Download with Riptide' };
-  api.contextMenus.create({ id: 'riptide-link', contexts: ['link'], ...common });
-  api.contextMenus.create({ id: 'riptide-media', contexts: ['video', 'audio', 'image'], ...common });
+  const common = { title: 'Download with Open Download Manager' };
+  api.contextMenus.create({ id: 'odm-link', contexts: ['link'], ...common });
+  api.contextMenus.create({ id: 'odm-media', contexts: ['video', 'audio', 'image'], ...common });
   api.contextMenus.create({
-    id: 'riptide-page',
+    id: 'odm-page',
     title: 'Scan this page for media…',
     contexts: ['page'],
   });
@@ -464,25 +464,25 @@ api.contextMenus.onClicked.addListener(async (info, tab) => {
   const settings = await getSettings();
   const referer = tab && tab.url ? tab.url : '';
   try {
-    if (info.menuItemId === 'riptide-link' || info.menuItemId === 'riptide-media') {
+    if (info.menuItemId === 'odm-link' || info.menuItemId === 'odm-media') {
       const kv = await sendToDaemon(info.linkUrl || info.srcUrl, { referer, settings });
-      notify('Riptide', `Queued ${kv.url || info.linkUrl || info.srcUrl}`);
-    } else if (info.menuItemId === 'riptide-page' && tab) {
+      notify('Open Download Manager', `Queued ${kv.url || info.linkUrl || info.srcUrl}`);
+    } else if (info.menuItemId === 'odm-page' && tab) {
       // The popup owns the interactive list; open it so the user can pick.
       await api.storage.local.set({ focusScan: true });
       if (api.action.openPopup) await api.action.openPopup();
     }
   } catch (error) {
-    notify('Riptide failed', String(error.message || error));
+    notify('Open Download Manager failed', String(error.message || error));
   }
 });
 
 // ---------------------------------------------------------------- keepalive
 
 // A periodic, cheap round trip keeps the badge honest without holding the socket open.
-api.alarms.create('riptide-probe', { periodInMinutes: 1 });
+api.alarms.create('odm-probe', { periodInMinutes: 1 });
 api.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name !== 'riptide-probe') return;
+  if (alarm.name !== 'odm-probe') return;
   try {
     await daemonStatus();
     setBadge(true);

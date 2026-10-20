@@ -1,20 +1,20 @@
 [package]
-name = "riptide"
+name = "odm"
 version = "0.1.0"
 edition = "2021"
-description = "Riptide — an open-source, cross-platform download manager in the spirit of Internet Download Manager"
+description = "Open Download Manager — an open-source, cross-platform download manager in the spirit of Internet Download Manager"
 license = "MIT"
 
 [[bin]]
-name = "riptide"
+name = "odm-cli"
 path = "src/main.rs"
 
 [[bin]]
-name = "riptide-bt"
-path = "src/bin/riptide-bt.rs"
+name = "odm-bt"
+path = "src/bin/odm-bt.rs"
 
 [lib]
-name = "riptide"
+name = "odm"
 path = "src/lib.rs"
 
 [dependencies]

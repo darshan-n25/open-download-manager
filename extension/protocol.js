@@ -1,4 +1,4 @@
-// Riptide wire framing — the `MSG#` protocol shared by the extension and the daemon.
+// Open Download Manager wire framing — the `MSG#` protocol shared by the extension and the daemon.
 //
 // This file is deliberately a *classic* script (no `export`/`import`) so that the same bytes
 // work everywhere:
@@ -23,7 +23,7 @@
 (function (root) {
   'use strict';
 
-  /** Opcodes. Riptide's own numbering — see docs/FEATURE-MAP.md. */
+  /** Opcodes. Open Download Manager's own numbering — see docs/FEATURE-MAP.md. */
   const MSG = {
     HELLO: 1,
     HELLO_ACK: 2,
@@ -138,7 +138,7 @@
     }
   }
 
-  const RiptideProtocol = {
+  const OdmProtocol = {
     MSG,
     DAEMON,
     WS_PROTOCOL,
@@ -151,9 +151,9 @@
     drainFrames,
   };
 
-  root.RiptideProtocol = RiptideProtocol;
+  root.OdmProtocol = OdmProtocol;
   // Node's CommonJS loader picks this up; browsers never define `module`.
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = RiptideProtocol;
+    module.exports = OdmProtocol;
   }
 })(typeof globalThis !== 'undefined' ? globalThis : this);

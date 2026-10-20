@@ -1,7 +1,7 @@
 //! SPNEGO (RFC 4178), the wrapper a Windows server means when it answers
 //! `WWW-Authenticate: Negotiate`.
 //!
-//! The honest scope statement, up front: **Riptide implements SPNEGO with
+//! The honest scope statement, up front: **Open Download Manager implements SPNEGO with
 //! NTLMSSP as the inner mechanism and nothing else.** It offers one mechanism in
 //! its `mechTypes` list, the NTLMSSP OID, and carries an `NTLMSSP NEGOTIATE`
 //! message as the optimistic `mechToken`. A server that accepts NTLM inside
@@ -55,9 +55,9 @@ pub mod oid {
 /// Which mechanism a nested token belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mech {
-    /// An `NTLMSSP` message — the one mechanism Riptide can complete.
+    /// An `NTLMSSP` message — the one mechanism Open Download Manager can complete.
     Ntlm,
-    /// A Kerberos mechanism token, which Riptide cannot complete.
+    /// A Kerberos mechanism token, which Open Download Manager cannot complete.
     Kerberos,
 }
 

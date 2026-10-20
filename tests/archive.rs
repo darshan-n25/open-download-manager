@@ -20,15 +20,15 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use riptide::archive::{self, ArchiveConfig, ArchiveReport};
-use riptide::config::Config;
-use riptide::engine::Engine;
-use riptide::grabber::GrabberConfig;
-use riptide::job::{Job, JobKind};
-use riptide::net::ServerLimits;
-use riptide::project::{Project, ProjectKind, ProjectRunner, RunOutcome};
-use riptide::quota::Quota;
-use riptide::throttle::RateLimiter;
+use odm::archive::{self, ArchiveConfig, ArchiveReport};
+use odm::config::Config;
+use odm::engine::Engine;
+use odm::grabber::GrabberConfig;
+use odm::job::{Job, JobKind};
+use odm::net::ServerLimits;
+use odm::project::{Project, ProjectKind, ProjectRunner, RunOutcome};
+use odm::quota::Quota;
+use odm::throttle::RateLimiter;
 
 // ---------------------------------------------------------------------------
 // A small server that really does conditional requests
@@ -634,7 +634,7 @@ async fn a_file_url_is_refused_before_anything_is_written() {
         .await
         .unwrap_err();
     // The message has to point at the command that does want a file.
-    assert!(err.to_string().contains("riptide download"), "{err}");
+    assert!(err.to_string().contains("odm-cli download"), "{err}");
     assert!(!root.exists(), "nothing should have been created");
 }
 

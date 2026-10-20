@@ -16,10 +16,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use riptide::auth::token::Auth;
-use riptide::config::Config;
-use riptide::daemon::{self, encode_frame, msg, parse_frame, Message, PROTOCOL_VERSION};
-use riptide::project::{Project, ProjectKind, ProjectStore};
+use odm::auth::token::Auth;
+use odm::config::Config;
+use odm::daemon::{self, encode_frame, msg, parse_frame, Message, PROTOCOL_VERSION};
+use odm::project::{Project, ProjectKind, ProjectStore};
 
 /// The token the `*_with_token` fixtures require. A literal, not a generated one, so a test
 /// that forgets to send it fails for the right reason.
@@ -70,11 +70,11 @@ async fn start_daemon_full(
 }
 
 fn ws_url(addr: std::net::SocketAddr) -> String {
-    format!("ws://{addr}/?cid=riptide-test&rnd=1")
+    format!("ws://{addr}/?cid=odm-cli-test&rnd=1")
 }
 
 fn ws_url_with_token(addr: std::net::SocketAddr, token: &str) -> String {
-    format!("ws://{addr}/?cid=riptide-test&rnd=1&token={token}")
+    format!("ws://{addr}/?cid=odm-cli-test&rnd=1&token={token}")
 }
 
 #[tokio::test]
@@ -109,7 +109,7 @@ async fn the_extension_handshake_negotiates_the_expected_subprotocol() {
         Some(PROTOCOL_VERSION.to_string().as_str())
     );
     assert_eq!(reply.get("protocol"), Some(daemon::WS_PROTOCOL));
-    assert!(reply.get("server").unwrap().starts_with("riptide/"));
+    assert!(reply.get("server").unwrap().starts_with("odm-cli/"));
 }
 
 #[tokio::test]
@@ -282,7 +282,7 @@ async fn a_job_can_be_paused_resumed_and_removed_over_http() {
         serde_json::from_str(&http_get(d.addr, &format!("/api/jobs/{id}")).await).unwrap();
     assert_eq!(job["state"], "paused");
 
-    // Resume: back to `queued`, so `riptide queue` will pick it up.
+    // Resume: back to `queued`, so `odm-cli queue` will pick it up.
     let (status, _) = http_post(d.addr, &format!("/api/jobs/{id}/resume"), "{}").await;
     assert_eq!(status, 200);
     let job: serde_json::Value =
@@ -397,7 +397,7 @@ async fn the_control_page_is_served() {
     let d = start_daemon().await;
     let (status, body) = http_get_raw(d.addr, "/").await;
     assert_eq!(status, 200);
-    assert!(body.contains("Riptide"));
+    assert!(body.contains("Open Download Manager"));
     assert!(body.contains("/api/jobs"));
     assert!(
         body.contains("/api/quota"),
@@ -426,7 +426,7 @@ async fn the_http_api_lists_projects_and_refuses_names_it_does_not_have() {
         d.state_dir.join("f.bin"),
         3600,
     );
-    p.next_run_ms = Some(riptide::util::now_ms() + 600_000);
+    p.next_run_ms = Some(odm::util::now_ms() + 600_000);
     store.save(&p).unwrap();
 
     let listed: serde_json::Value =
@@ -542,7 +542,7 @@ async fn a_401_says_what_to_do_and_offers_the_scheme() {
             .contains("www-authenticate: bearer"),
         "a client should be told which scheme to use: {text}"
     );
-    assert!(text.contains("RIPTIDE_DAEMON_TOKEN"), "{text}");
+    assert!(text.contains("ODM_DAEMON_TOKEN"), "{text}");
 }
 
 #[tokio::test]

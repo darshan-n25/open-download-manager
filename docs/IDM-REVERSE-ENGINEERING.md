@@ -597,7 +597,7 @@ IDM preconfigures these, which is why "download through Tor" is a one-click opti
 
 A pass over the extracted strings (`ascii.txt` / `wide.txt`) against Tonec's advertised
 feature list turns up whole features that no amount of reading the download engine would
-reveal, because they are not in the engine. Recorded here as evidence; the Riptide status for
+reveal, because they are not in the engine. Recorded here as evidence; the Open Download Manager status for
 each is in `docs/FEATURE-MAP.md` §12.
 
 | Feature | Strings |
@@ -615,7 +615,7 @@ The antivirus string doubles as an incidental confirmation of the merge-based co
 described in §2.4: *"IDM has received \"Access Denied\" error while assembling file parts… In
 order to assemble this file, you will need to reboot your computer, select the file in IDM, and
 press on resume button."* That is IDM telling the user to work around a failed final assembly —
-the behaviour Riptide avoids by writing each range at its final offset and renaming.
+the behaviour Open Download Manager avoids by writing each range at its final offset and renaming.
 
 ---
 

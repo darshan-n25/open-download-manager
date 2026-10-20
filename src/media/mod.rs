@@ -2,12 +2,12 @@
 //!
 //! IDM's media pipeline is visible in its RTTI: `CM3UParser` with `MasterPlaylist`,
 //! `MediaPlaylist`, `MediaSegment` and `MPLVariant` for HLS, `CMp4DashReader` for DASH,
-//! plus a `-tmp_dashinit` temp file for the DASH initialisation segment. Riptide keeps
+//! plus a `-tmp_dashinit` temp file for the DASH initialisation segment. Open Download Manager keeps
 //! the same shape — parse the manifest into a flat segment plan, fetch init + segments,
 //! then produce one output file.
 //!
 //! One deliberate improvement over IDM: when a manifest carries separate video and audio
-//! renditions, Riptide downloads both and muxes them, instead of leaving the user with a
+//! renditions, Open Download Manager downloads both and muxes them, instead of leaving the user with a
 //! video file and a stray audio file ("IDM keeps downloading audio and video separately!"
 //! is one of the most common complaints about it).
 
@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::{Engine, Fetcher};
-use crate::error::{Result, RiptideError};
+use crate::error::{OdmError, Result};
 use crate::job::{JobKind, MediaKey, MediaSpec};
 
 /// Entry point used by [`crate::engine::Engine::run`].
@@ -29,7 +29,7 @@ pub async fn download(engine: &mut Engine) -> Result<()> {
     let spec = match engine.job().kind {
         JobKind::Hls => hls::resolve(engine).await?,
         JobKind::Dash => dash::resolve(engine).await?,
-        _ => return Err(RiptideError::other("not a media job")),
+        _ => return Err(OdmError::other("not a media job")),
     };
     tracing::info!(
         segments = spec.segments.len(),
@@ -167,7 +167,7 @@ async fn fetch_track(
             tasks.push(tokio::spawn(async move {
                 let n = f.to_file(&url, &dest2).await?;
                 c.fetch_add(n, Ordering::SeqCst);
-                Ok::<(), RiptideError>(())
+                Ok::<(), OdmError>(())
             }));
         }
     }
@@ -185,7 +185,7 @@ async fn fetch_track(
             .clone()
             .acquire_owned()
             .await
-            .map_err(|e| RiptideError::other(e.to_string()))?;
+            .map_err(|e| OdmError::other(e.to_string()))?;
         let f = fetcher.clone();
         let url = seg.url.clone();
         let range = seg.byte_range;
@@ -203,13 +203,13 @@ async fn fetch_track(
             let n = data.len() as u64;
             tokio::fs::write(&dest, &data).await?;
             c.fetch_add(n, Ordering::SeqCst);
-            Ok::<(), RiptideError>(())
+            Ok::<(), OdmError>(())
         }));
     }
 
     for t in tasks {
         t.await
-            .map_err(|e| RiptideError::other(format!("segment task panicked: {e}")))??;
+            .map_err(|e| OdmError::other(format!("segment task panicked: {e}")))??;
     }
 
     // Concatenate init first, then the segments in manifest order.
@@ -223,7 +223,7 @@ async fn fetch_track(
         if p.exists() {
             order.push(p);
         } else {
-            return Err(RiptideError::other(format!(
+            return Err(OdmError::other(format!(
                 "segment {} of the manifest was never downloaded",
                 i + 1
             )));
@@ -237,7 +237,7 @@ async fn fetch_track(
 async fn resolve_key(fetcher: &Fetcher, key: Option<&MediaKey>) -> Result<Option<Vec<u8>>> {
     let Some(k) = key else { return Ok(None) };
     if !k.method.eq_ignore_ascii_case("AES-128") {
-        return Err(RiptideError::Unsupported(format!(
+        return Err(OdmError::Unsupported(format!(
             "HLS encryption method {} (only AES-128 is supported)",
             k.method
         )));
@@ -247,7 +247,7 @@ async fn resolve_key(fetcher: &Fetcher, key: Option<&MediaKey>) -> Result<Option
     }
     let bytes = fetcher.to_bytes(&k.uri, 1024).await?;
     if bytes.len() < 16 {
-        return Err(RiptideError::Manifest(
+        return Err(OdmError::Manifest(
             "AES-128 key is shorter than 16 bytes".into(),
         ));
     }
@@ -265,15 +265,13 @@ pub fn decrypt_aes128_cbc(
     use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 
     if key.len() != 16 {
-        return Err(RiptideError::Manifest(
-            "AES-128 key must be 16 bytes".into(),
-        ));
+        return Err(OdmError::Manifest("AES-128 key must be 16 bytes".into()));
     }
     let mut iv_bytes = [0u8; 16];
     match iv {
         Some(v) if v.len() == 16 => iv_bytes.copy_from_slice(v),
         Some(v) => {
-            return Err(RiptideError::Manifest(format!(
+            return Err(OdmError::Manifest(format!(
                 "IV must be 16 bytes, got {}",
                 v.len()
             )))
@@ -288,7 +286,7 @@ pub fn decrypt_aes128_cbc(
     let cipher = Dec::new(key.into(), (&iv_bytes).into());
     let plain = cipher
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|e| RiptideError::Manifest(format!("AES-128-CBC padding error: {e}")))?;
+        .map_err(|e| OdmError::Manifest(format!("AES-128-CBC padding error: {e}")))?;
     Ok(plain.to_vec())
 }
 
@@ -341,7 +339,7 @@ mod tests {
     #[test]
     fn wrong_iv_length_is_rejected() {
         let err = decrypt_aes128_cbc(&[0u8; 16], Some(&[0u8; 8]), 0, &[0u8; 16]).unwrap_err();
-        assert!(matches!(err, RiptideError::Manifest(_)));
+        assert!(matches!(err, OdmError::Manifest(_)));
     }
 
     #[test]

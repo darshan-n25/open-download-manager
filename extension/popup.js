@@ -1,4 +1,4 @@
-// Riptide popup.
+// Open Download Manager popup.
 //
 // Status and the job list come from the daemon's plain JSON HTTP API; everything that
 // mutates state goes through the background page, so there is exactly one WebSocket client

@@ -2,7 +2,7 @@ use std::error::Error as _;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum RiptideError {
+pub enum OdmError {
     /// An HTTP-level failure.
     ///
     /// The message carries the whole cause chain, not `reqwest`'s summary: "builder
@@ -68,15 +68,15 @@ pub enum RiptideError {
     Other(String),
 }
 
-impl RiptideError {
+impl OdmError {
     pub fn other<S: Into<String>>(s: S) -> Self {
-        RiptideError::Other(s.into())
+        OdmError::Other(s.into())
     }
 }
 
-impl From<reqwest::Error> for RiptideError {
+impl From<reqwest::Error> for OdmError {
     fn from(e: reqwest::Error) -> Self {
-        RiptideError::Http(http_cause_chain(&e))
+        OdmError::Http(http_cause_chain(&e))
     }
 }
 
@@ -96,4 +96,4 @@ fn http_cause_chain(e: &reqwest::Error) -> String {
     out
 }
 
-pub type Result<T> = std::result::Result<T, RiptideError>;
+pub type Result<T> = std::result::Result<T, OdmError>;
