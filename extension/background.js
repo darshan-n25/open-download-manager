@@ -111,7 +111,7 @@ function wsUrlForPopup(settings) {
   return daemonWsUrl({
     host: DAEMON.host,
     port: DAEMON.port,
-    cid: 'odm-cli-popup',
+    cid: 'odm-popup',
     token: settings.daemonToken,
     nonce: Date.now(),
   });
