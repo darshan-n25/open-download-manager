@@ -1,4 +1,4 @@
-// Riptide desktop app (egui/eframe) — a native, modern download manager.
+// Open Download Manager — the native desktop app (egui/eframe).
 //
 // Standalone: starts the riptide daemon in-process on 127.0.0.1:1001, so the user
 // just runs the exe (like IDM) without launching a separate daemon. The UI talks
@@ -16,6 +16,7 @@ use std::time::Duration;
 
 /// The base URL of the in-process daemon, filled in once it has bound.
 static DAEMON_ADDR: OnceLock<String> = OnceLock::new();
+
 
 // ---------------------------------------------------------------------------
 // Data from the daemon
@@ -540,25 +541,31 @@ impl App {
                 }
             });
             ui.menu_button("Help", |ui| {
-                if ui.button("About Riptide").clicked() {
-                    self.status = "Riptide 0.1.0 — an open-source download manager".into();
+                if ui.button("About Open Download Manager").clicked() {
+                    self.status = "Open Download Manager 0.1.0 — an open-source download manager".into();
                     ui.close();
                 }
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.daemon_ok {
-                    ui.label(
-                        egui::RichText::new("● online")
-                            .color(egui::Color32::from_rgb(74, 222, 128))
-                            .size(12.0),
-                    );
-                } else {
-                    ui.label(
-                        egui::RichText::new("● starting…")
-                            .color(egui::Color32::from_rgb(251, 191, 36))
-                            .size(12.0),
-                    );
+                // The connection state is a development aid: it says whether the
+                // in-process daemon is up, which is the first question when the window
+                // looks empty. It is not part of the finished interface, so it is
+                // compiled out of a release build and only shown while developing.
+                if cfg!(debug_assertions) {
+                    if self.daemon_ok {
+                        ui.label(
+                            egui::RichText::new("● online")
+                                .color(egui::Color32::from_rgb(74, 222, 128))
+                                .size(12.0),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("● starting…")
+                                .color(egui::Color32::from_rgb(251, 191, 36))
+                                .size(12.0),
+                        );
+                    }
                 }
             });
         });
@@ -628,18 +635,34 @@ impl App {
         color: egui::Color32,
         f: F,
     ) {
-        // The click is read from the two children, never from the layout's own response:
-        // a layout's rect covers the gaps between its children, and egui can report a
-        // click there that nobody made on the button.
+        // The icon and the caption are two real buttons stacked on top of each other.
+        // An image and a label do not react to a click on their own, and a rectangle
+        // allocated by hand does not reliably get the pointer either — egui's own
+        // widgets are the ones that know how to be hovered and clicked.
+        //
+        // The style is scoped to this button: a transparent plate until the pointer
+        // arrives, a soft one while it is there, the accent while it is pressed.
+        let mut style = ui.style().as_ref().clone();
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(58, 66, 82);
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+        style.spacing.button_padding = egui::vec2(4.0, 2.0);
+
         let mut clicked = false;
-        ui.vertical(|ui| {
-            ui.set_max_width(64.0);
-            let icon_resp = ui.add(icon.size(22.0).color(color));
-            let label_resp = ui.add(egui::Label::new(
-                egui::RichText::new(label).size(11.0).color(ui.visuals().text_color()),
-            ));
-            clicked = icon_resp.clicked() || label_resp.clicked();
-            icon_resp.on_hover_text(label);
+        ui.scope(|ui| {
+            ui.set_style(style);
+            ui.vertical(|ui| {
+                ui.set_max_width(66.0);
+                let icon_response = ui.add(
+                    egui::Button::new(icon.size(22.0).color(color).image())
+                        .min_size(egui::vec2(28.0, 26.0)),
+                );
+                let label_response = ui.add(
+                    egui::Button::new(egui::RichText::new(label).size(11.0))
+                        .min_size(egui::vec2(64.0, 18.0)),
+                );
+                clicked = icon_response.clicked() || label_response.clicked();
+            });
         });
         if clicked {
             f(self);
@@ -652,27 +675,48 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut category_row = |ui: &mut egui::Ui, cat: Category| {
                 let selected = self.category == cat;
-                // The highlight is a frame *behind* the row, not a rectangle painted
-                // over it: painting over would hide the label it is meant to mark.
-                let resp = egui::Frame::new()
-                    .fill(if selected {
-                        egui::Color32::from_rgb(37, 99, 235)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    })
-                    .inner_margin(egui::Margin::symmetric(4, 2))
-                    .corner_radius(4.0)
-                    .show(ui, |ui| {
+                // The whole row is one interactive area, allocated first and painted
+                // behind the icon and the label. A side panel does not pass a
+                // hand-made `ui.interact` the click, and an image or a label does not
+                // react to one on its own — so the row is allocated with the sense,
+                // and the children are drawn inside it.
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(184.0, 22.0), egui::Sense::click());
+                if selected {
+                    ui.painter()
+                        .rect_filled(rect, 5.0, egui::Color32::from_rgb(37, 99, 235));
+                } else if response.hovered() {
+                    ui.painter()
+                        .rect_filled(rect, 5.0, egui::Color32::from_rgb(45, 50, 60));
+                }
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(rect),
+                    |ui| {
                         ui.horizontal(|ui| {
-                            ui.add(cat.icon().size(15.0).color(if selected {
-                                egui::Color32::WHITE
-                            } else {
-                                egui::Color32::from_rgb(148, 163, 184)
-                            }));
-                            ui.label(egui::RichText::new(cat.label()).size(13.0));
-                        })
-                    });
-                if resp.response.clicked() {
+                            ui.add(
+                                cat.icon()
+                                    .size(15.0)
+                                    .color(if selected {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        egui::Color32::from_rgb(148, 163, 184)
+                                    })
+                                    .image()
+                                    .sense(egui::Sense::empty()),
+                            );
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(cat.label())
+                                    .size(13.0)
+                                    .color(if selected {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        ui.visuals().text_color()
+                                    }),
+                            ));
+                        });
+                    },
+                );
+                if response.clicked() {
                     self.category = cat;
                 }
             };
@@ -775,13 +819,20 @@ impl App {
                             if self.sort.by == by {
                                 r = r.color(egui::Color32::from_rgb(96, 165, 250));
                             }
-                            let resp = ui.horizontal(|ui| {
+                            let row = ui.horizontal(|ui| {
                                 ui.add_sized([width, 20.0], egui::Label::new(r));
                                 if self.sort.by == by {
                                     ui.label(if self.sort.asc { "▲" } else { "▼" });
                                 }
                             });
-                            if resp.response.clicked() {
+                            // A label is not interactive, so the header claims the
+                            // click for itself.
+                            let resp = ui.interact(
+                                row.response.rect,
+                                ui.id().with(("sort", label)),
+                                egui::Sense::click(),
+                            );
+                            if resp.clicked() {
                                 sort_clicked = Some(by);
                             }
                         };
@@ -812,7 +863,7 @@ impl App {
                 } else {
                     egui::Color32::from_rgb(24, 26, 32)
                 };
-                let resp = egui::Frame::new()
+                let row = egui::Frame::new()
                     .fill(bg)
                     .inner_margin(egui::Margin::symmetric(8, 5))
                     .show(ui, |ui| {
@@ -905,7 +956,26 @@ impl App {
                             );
                         });
                     });
-                if resp.response.clicked() {
+                // The row is a frame of labels, so the click is claimed for the row
+                // itself — otherwise the job list cannot be selected at all.
+                let resp = ui.interact(
+                    row.response.rect,
+                    ui.id().with(("job", job.id.clone())),
+                    egui::Sense::click(),
+                );
+                if resp.hovered() && !selected {
+                    // A bar down the left edge, rather than a fill: a fill painted over
+                    // the row would hide the text it is meant to draw attention to.
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(row.response.rect.left(), row.response.rect.top()),
+                            egui::vec2(2.0, row.response.rect.height()),
+                        ),
+                        1.0,
+                        egui::Color32::from_rgb(96, 165, 250),
+                    );
+                }
+                if resp.clicked() {
                     self.selected = Some(job.id.clone());
                 }
             }
@@ -1121,6 +1191,7 @@ impl App {
                             .color(egui::Color32::from_rgb(148, 163, 184)),
                     );
                 }
+
             });
     }
 
@@ -1287,11 +1358,16 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 740.0])
             .with_min_inner_size([900.0, 560.0])
-            .with_title("Riptide"),
+            .with_title("Open Download Manager")
+            // The window's own icon, so the task bar does not show egui's default.
+            .with_icon(eframe::icon_data::from_png_bytes(
+                &include_bytes!("../assets/odm.png")[..],
+            )
+            .expect("the icon is a PNG this program wrote itself")),
         ..Default::default()
     };
     let _ = eframe::run_native(
-        "Riptide",
+        "Open Download Manager",
         options,
         Box::new(|cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
