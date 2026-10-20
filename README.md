@@ -537,7 +537,7 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 | Browser integration that survives browser policy | Chrome disabling IDM's MV2 extension; IDM's own "keep the extension enabled" advice | Loopback daemon is the integration; the extension is a thin MV3 client, and `curl` can do everything it can |
 | Never lose media again, and say so honestly when it cannot | The video panel is the reason people stay; protected streams and YouTube changes are the top failures | HLS/DASH capture and muxing; no DRM circumvention and no per-site signature layer, by design |
 | Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
-| BitTorrent and magnet links | The single most-cited reason to keep a second app installed | Deliberately absent — a second engine, not a mode of this one |
+| BitTorrent and magnet links | The single most-cited reason to keep a second app installed | `riptide-bt` and the window's Torrents tab: `.torrent` files and magnet links, pieces verified by SHA-1. A second engine, not a mode of the HTTP one |
 | Checksum verification | Listed as a headline feature by neighbouring projects | `--checksum sha256:…`, verified before the rename |
 | Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick` + an optional bearer token on every route, and a `scratch` image that runs it all: `docker compose up -d`, `docker stop` and back without losing a queue |
 | No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
@@ -583,11 +583,23 @@ and ranks what to build next. The ranking, in short:
    Dockerfile's static check used Alpine's `ldd`, whose output for a static binary is not
    glibc's. See [Headless and containers](#headless-and-containers).
 
+**The window.** `odm.exe` (or `odm` on Linux) is a native application — not a web page in
+a browser — with the layout the brief asked for: a menu bar, a toolbar of icon actions
+(Add URL, Resume, Stop, Delete, Delete Completed, Options, Scheduler, Start Queue, Stop
+Queue), a category tree down the left (All Downloads, Unfinished, Finished, Failed, and
+per-type categories), and a sortable table with File Name, Size, Status, Time left,
+Transfer rate, Last Try and Description. It is styled dark and flat, the way a modern
+application should be, rather than the grey of a 2000s-era program.
+
+It is standalone: it starts the daemon in-process, so running the program is all there is
+to do. The Torrents tab takes a `.torrent` file — dropped onto the window or typed — and a
+magnet link, and shows the transfer as it happens.
+
 **Still to build, in the order the roadmap ranks them:**
 
 1. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
    the queue and state but deliberately **not** a mode of the HTTP engine. (Shipped as
-   `riptide-bt`.)
+   `riptide-bt`, and in the window's Torrents tab, with magnet links.)
 
 Nothing else on the roadmap's numbered list remains. The two things that were recorded as
 "cannot be verified on this host" are now handled the only way they can be without the
@@ -787,7 +799,9 @@ against this implementation (§12 there). The short version:
 - **No PAC evaluation, no FTPS, no MMS.** See the protocol section above for each.
 - **No antivirus-on-completion hook**, no self-updater, no installation wizard, and no UI
   languages other than English.
-- **No BitTorrent.** IDM has none either; it only downloads `.torrent` files.
+- **No BitTorrent features beyond the basics**: single-file torrents only, HTTP trackers
+  only, no DHT, no peer exchange, no seeding, no multi-file torrents. IDM has no BitTorrent
+  at all, so this is already more than it has — but a modern client would do more.
 
 **Platform and interface**
 

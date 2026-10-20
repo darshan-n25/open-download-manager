@@ -62,6 +62,11 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
+      # The window's own tests. They drive the interface with simulated clicks, so they
+      # need no display and no mouse — the same tests run on every runner.
+      - name: Desktop interface tests
+        run: cargo test --locked --manifest-path desktop/Cargo.toml
+
       - name: Browser-extension protocol tests
         run: node --test extension/tests/protocol.test.mjs
 

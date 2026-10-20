@@ -11,7 +11,7 @@
 #define AppExeName "odm.exe"
 
 [Setup]
-AppId={{8B4B1D3E-6C2A-4E4E-9C4B-2A1F0D9E7C31}
+AppId={{3C1D9A44-77B2-4E2A-9F5E-0B4C6D2E7A19}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
@@ -45,6 +45,7 @@ Name: "addtopath"; Description: "Add riptide to PATH (for the command line)"; Gr
 Name: "autostart"; Description: "Start Riptide when you sign in"; GroupDescription: "Extra:"; Flags: unchecked
 
 [Files]
+; The window, the command-line tool and the BitTorrent companion.
 Source: "..\..\dist\windows\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\windows\riptide.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\windows\riptide-bt.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -55,6 +56,7 @@ Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoes
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
 Name: "{group}\{#AppName} (command line)"; Filename: "{app}\riptide.exe"
+Name: "{group}\{#AppName} (BitTorrent)"; Filename: "{app}\riptide-bt.exe"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 ; Autostart is a shortcut in the user's Startup folder rather than a registry key: it

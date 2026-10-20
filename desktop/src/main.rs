@@ -11,6 +11,7 @@
 use eframe::egui;
 use egui_lucide::Lucide;
 use riptide::config::Config;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -241,7 +242,7 @@ impl Default for SortState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum Tab {
     #[default]
     Downloads,
@@ -293,6 +294,11 @@ struct App {
     search: String,
     /// The daemon's configured number of connections, shown in the Add URL dialog.
     default_connections: usize,
+    /// Where the interface's controls were drawn, by name.
+    ///
+    /// egui does not expose a list of widgets, so this is how a test finds the button
+    /// it wants to click: it reads the rectangle and clicks the middle of it.
+    rects: BTreeMap<String, egui::Rect>,
     /// The torrent downloads, shared with the worker threads that run them.
     torrents: Arc<std::sync::Mutex<Vec<TorrentJob>>>,
 }
@@ -505,6 +511,17 @@ fn state_color(state: &str) -> egui::Color32 {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    /// Draw the whole interface.
+    ///
+    /// Separate from the `eframe::App` method so that a test can drive it without a
+    /// window: the interface is then exercised the way a user exercises it — a click
+    /// at a point — but in a process that needs no display and no mouse.
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let elapsed = self
             .last_refresh
@@ -516,6 +533,7 @@ impl eframe::App for App {
 
         self.menu_bar(ui);
         self.toolbar(ui);
+        self.tab_strip(ui);
 
         egui::Panel::left("categories")
             .exact_size(200.0)
@@ -764,7 +782,7 @@ impl App {
         let mut clicked = false;
         ui.scope(|ui| {
             ui.set_style(style);
-            ui.vertical(|ui| {
+            let responses = ui.vertical(|ui| {
                 ui.set_max_width(66.0);
                 let icon_response = ui.add(
                     egui::Button::new(icon.size(22.0).color(color).image())
@@ -774,8 +792,12 @@ impl App {
                     egui::Button::new(egui::RichText::new(label).size(11.0))
                         .min_size(egui::vec2(64.0, 18.0)),
                 );
-                clicked = icon_response.clicked() || label_response.clicked();
+                (icon_response, label_response)
             });
+            let (icon_response, label_response) = responses.inner;
+            self.rects
+                .insert(format!("tool.{label}"), icon_response.rect);
+            clicked = icon_response.clicked() || label_response.clicked();
         });
         if clicked {
             f(self);
@@ -866,9 +888,6 @@ impl App {
     // ----- downloads table -------------------------------------------------
     fn downloads(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Downloads, "Downloads");
-            ui.selectable_value(&mut self.tab, Tab::Projects, "Projects");
-            ui.selectable_value(&mut self.tab, Tab::Torrents, "Torrents");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let visible = self.visible_jobs();
                 let total: u64 = visible.iter().filter_map(|j| j.total).sum();
@@ -1165,12 +1184,6 @@ impl App {
 
     // ----- projects -------------------------------------------------------
     fn projects_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Downloads, "Downloads");
-            ui.selectable_value(&mut self.tab, Tab::Projects, "Projects");
-            ui.selectable_value(&mut self.tab, Tab::Torrents, "Torrents");
-        });
-        ui.separator();
         if self.projects.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.add_space(50.0);
@@ -1251,6 +1264,23 @@ impl App {
                 ui.add_space(6.0);
             }
         });
+    }
+
+    // ----- the tabs -------------------------------------------------------
+    ///
+    /// Drawn once, in the frame, rather than inside each tab: a strip that belongs to
+    /// one tab is a strip that disappears when you go to another one, and there is
+    /// then no way back.
+    fn tab_strip(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let r = ui.selectable_value(&mut self.tab, Tab::Downloads, "Downloads");
+            self.rects.insert("tab.downloads".into(), r.rect);
+            let r = ui.selectable_value(&mut self.tab, Tab::Projects, "Projects");
+            self.rects.insert("tab.projects".into(), r.rect);
+            let r = ui.selectable_value(&mut self.tab, Tab::Torrents, "Torrents");
+            self.rects.insert("tab.torrents".into(), r.rect);
+        });
+        ui.separator();
     }
 
     // ----- torrents -------------------------------------------------------
@@ -1431,10 +1461,14 @@ impl App {
                 let progress_jobs = jobs.clone();
                 let progress: riptide::bt::engine::ProgressFn = Arc::new(move |p| {
                     if let Ok(mut list) = progress_jobs.lock() {
-                        if let Some(job) = list.iter_mut().find(|j| j.state == "downloading") {
+                        // The magnet added exactly one job, and it is the last one.
+                        if let Some(job) = list.last_mut() {
                             job.downloaded = p.downloaded;
                             job.total = p.total;
                             job.speed_bps = p.speed_bps;
+                            if job.state == "connecting" {
+                                job.state = "downloading".into();
+                            }
                         }
                     }
                 });
@@ -1844,5 +1878,138 @@ fn set_torrent_state(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, path: &PathB
         if let Some(job) = list.iter_mut().find(|j| &j.output == path) {
             job.state = state.to_string();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// The interface is tested the way a person uses it — a click at a point — but
+// headlessly and deterministically: no display, no mouse, no timing, and the
+// same result every run.
+//
+// The controls are found by *name* rather than by coordinates: the window
+// records where it drew each one, so a test says "click Torrents" and not
+// "click 519,215". A layout change moves the buttons; it does not break the
+// test.
+//
+// The assertions are about the end state ("the Torrents tab is showing"), not
+// about the click having happened — which is the difference between a test and
+// a script that hopes.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An application with no daemon behind it, and no jobs.
+    fn app() -> App {
+        App {
+            default_connections: 8,
+            ..Default::default()
+        }
+    }
+
+    /// Draw one frame.
+    fn frame(app: &mut App, ctx: &egui::Context, input: egui::RawInput) {
+        let mut out = ctx.run_ui(input, |ui| app.draw(ui));
+        // A test has no renderer to hand the icon textures to, and an unapplied
+        // texture delta is an error rather than a leak.
+        out.textures_delta.clear();
+    }
+
+    /// A click at a point: the pointer arrives, the button goes down, it comes up.
+    fn click_at(pos: egui::Pos2) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Click a control by name.
+    ///
+    /// The rectangle comes from the frame that was just drawn, so the test
+    /// always clicks where the control *is*, not where it used to be.
+    fn click(app: &mut App, ctx: &egui::Context, name: &str) {
+        frame(app, ctx, egui::RawInput::default());
+        let rect = *app
+            .rects
+            .get(name)
+            .unwrap_or_else(|| panic!("there is no control called {name:?}"));
+        let pos = rect.center();
+        frame(app, ctx, click_at(pos));
+    }
+
+    #[test]
+    fn the_tabs_switch_and_the_strip_is_always_there() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+
+        // The strip is drawn in the frame, not inside a tab: it must be there
+        // whatever tab is showing.
+        for tab in [Tab::Downloads, Tab::Projects, Tab::Torrents] {
+            app.tab = tab;
+            frame(&mut app, &ctx, egui::RawInput::default());
+            for name in ["tab.downloads", "tab.projects", "tab.torrents"] {
+                assert!(
+                    app.rects.contains_key(name),
+                    "the {name:?} tab is missing while {tab:?} is showing"
+                );
+            }
+        }
+
+        // And clicking one switches to it.
+        click(&mut app, &ctx, "tab.torrents");
+        assert_eq!(app.tab, Tab::Torrents);
+        click(&mut app, &ctx, "tab.downloads");
+        assert_eq!(app.tab, Tab::Downloads);
+    }
+
+    #[test]
+    fn the_add_url_button_opens_its_dialog() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        assert!(!app.show_add, "the dialog starts closed");
+        click(&mut app, &ctx, "tool.Add URL");
+        assert!(app.show_add, "the Add URL button did not open the dialog");
+    }
+
+    #[test]
+    fn a_category_filters_the_list() {
+        let mut app = app();
+        app.jobs = vec![
+            Job {
+                id: "a".into(),
+                output: "/tmp/movie.mkv".into(),
+                state: "done".into(),
+                ..Default::default()
+            },
+            Job {
+                id: "b".into(),
+                output: "/tmp/notes.txt".into(),
+                state: "done".into(),
+                ..Default::default()
+            },
+        ];
+        app.category = Category::All;
+        assert_eq!(app.visible_jobs().len(), 2);
+        app.category = Category::Video;
+        assert_eq!(app.visible_jobs().len(), 1, "only the .mkv is a video");
+        app.category = Category::Documents;
+        assert_eq!(app.visible_jobs().len(), 1, "only the .txt is a document");
     }
 }
