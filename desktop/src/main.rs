@@ -1775,6 +1775,20 @@ fn format_time(ms: u64) -> String {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // `--help` and `--version` must not start a daemon: a question should not leave a
+    // background process behind.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "Open Download Manager\n\n  USAGE:\n    odm\n\n  A native download manager: HTTP/HTTPS with resume, a download\n  quota, checksum verification, HLS/DASH capture, recurring projects, offline\n  site archiving, and BitTorrent with magnet links.\n\n  The daemon it needs is started with it; the command-line tools\n  `riptide` and `riptide-bt` are installed alongside."
+        );
+        return;
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("odm {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // Start the daemon in-process so the app is standalone (no separate daemon needed).
     //
     // The configured address is tried first; if the port is taken — and it often is,
