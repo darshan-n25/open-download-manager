@@ -73,7 +73,8 @@ Needs a recent stable Rust toolchain (developed against 1.99). There is no `cmak
 ```sh
 cargo build --release
 install -m755 target/release/riptide ~/.local/bin/riptide
-cargo test         # 337 tests: unit + protocol + end-to-end
+cargo test                                        # 355 tests: unit + protocol + end-to-end
+cargo test --manifest-path desktop/Cargo.toml    # 3 tests: the window's own interface
 ```
 
 On Windows the binary is the same program; only the directory it keeps its files in changes.
@@ -595,6 +596,14 @@ It is standalone: it starts the daemon in-process, so running the program is all
 to do. The Torrents tab takes a `.torrent` file — dropped onto the window or typed — and a
 magnet link, and shows the transfer as it happens.
 
+**How the window is tested.** The interface is exercised the way a person uses it — a
+click at a point — but headlessly: no display, no mouse, no timing, and the same result
+every run. The controls are found by *name* rather than by coordinates, so a layout
+change moves them without breaking the test, and the assertions are about the end state
+("the Torrents tab is showing") rather than about the click having happened. Three tests
+cover the tab strip, the Add URL button and the category filter; CI runs them on every
+runner, because they need nothing but a compiler.
+
 **Still to build, in the order the roadmap ranks them:**
 
 1. **BitTorrent as a sibling binary** — the most-requested feature in the ecosystem, sharing
@@ -833,21 +842,23 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 337 tests
+cargo test                              # Rust: 355 tests
+cargo test --manifest-path desktop/Cargo.toml    # 3 more: the window's interface
 node --test extension/tests/protocol.test.mjs   # JavaScript: 15 tests
 ./scripts/check-portability.sh          # the platform module, for all 7 targets
 ./scripts/check-headless.sh             # the static binary alone in a one-file rootfs
 ```
 
-337 Rust tests: 268 unit tests across every module, 17 daemon-protocol tests driving a real
-WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
+355 Rust tests in the library and the command line — 268 unit tests across every module, 17
+daemon-protocol tests driving a real WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
 which really does byte ranges, 6 that stand up a mock `Negotiate` server, 6 that verify
 checksums end-to-end against a real HTTP server, 17 that stand up a server which really
 honours `If-None-Match` and `Range`, 10 that archive a small site and then read their own
 output back to check that every rewritten reference resolves, and 4 that start the released
 **binary**, send it a real signal, and check what it does about it — three to the daemon
 (SIGTERM mid-download, SIGINT, an idle stop that must not wait) and one to a foreground
-`riptide download`.
+`riptide download`. Three more live in the window's own crate and drive the interface
+with simulated clicks.
 
 The end-to-end ones assert that
 
