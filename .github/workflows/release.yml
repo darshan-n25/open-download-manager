@@ -1,0 +1,430 @@
+name: Release
+
+# What a release is: a page on GitHub with a download button per platform, and the
+# archives behind it. That is what a user expects to find on a download manager's
+# releases page, so this workflow builds them the way the community expects:
+#
+#   open-download-manager-<version>-windows-x64.zip   the app (GUI), with the CLI
+#   open-download-manager-<version>-macos-<arch>.tar.gz
+#   open-download-manager-<version>-linux-x86_64.tar.gz
+#   open-download-manager-cli-<version>-<target>.tar.gz   the headless build
+#   open-download-manager-extension-<version>.zip          the browser extension
+#   SHA256SUMS.txt                                   checksums for all of the above
+#
+# Everything is built on a native runner for its platform, so the binaries are the
+# ones a user would get from `cargo build` on their own machine. The release page is
+# created with `gh release create`, and the notes are the tag's commits plus the
+# install section of the README, so the page says how to use the thing as well as
+# what changed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (a release is created only for a pushed tag)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The version, read once so every job agrees on it
+  # ---------------------------------------------------------------------------
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tag=${GITHUB_REF_NAME:-v$version}
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "building $version ($tag)"
+
+  # ---------------------------------------------------------------------------
+  # The desktop app: the thing most people install
+  # ---------------------------------------------------------------------------
+  desktop:
+    name: desktop (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            binary: odm
+            exe: ""
+            # eframe's X11 backend links against these; they are build-time only.
+            packages: libx11-dev libxkbcommon-dev libgl1-mesa-dev
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            binary: odm
+            exe: ""
+            packages: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            binary: odm
+            exe: ""
+            packages: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            binary: odm.exe
+            exe: ".exe"
+            packages: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: GUI build dependencies
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Build
+        run: cargo build --release --locked --manifest-path desktop/Cargo.toml --target ${{ matrix.target }}
+
+      # The command-line tools ride along in the same archive: they are the same program
+      # without the window, they cost nothing to build once the library is compiled, and a
+      # user who wants the daemon (a NAS, a `cron` job) should not have to download a
+      # second archive to get it.
+      - name: Build the command-line tools
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin odm-cli --bin odm-bt
+
+      - name: What was built
+        shell: bash
+        run: |
+          bin="desktop/target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          "$bin" --version
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          name="open-download-manager-$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "desktop/target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/odm-cli${{ matrix.exe }}" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/odm-bt${{ matrix.exe }}" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          case "${{ matrix.archive }}" in
+            tar.gz) tar -C dist -czf "dist/$name.tar.gz" "$name" ;;
+            # `tar -a` picks the format from the extension, so this needs no 7-Zip. bsdtar
+            # on the Windows runner and GNU tar on Linux both understand it.
+            zip)    tar -C dist -a -cf "dist/$name.zip" "$name" ;;
+          esac
+          ls -l dist
+
+      # The Windows installer: a Start-menu entry, a desktop shortcut, an uninstaller and
+      # the option to put `odm-cli` on the PATH. The zip above needs no installer at all —
+      # both are published, because a zip is what people who distrust installers want and
+      # an installer is what people who want a shortcut want.
+      - name: The Windows installer
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          choco install innosetup --yes --no-progress
+          mkdir -p dist/windows
+          cp "desktop/target/${{ matrix.target }}/release/odm.exe" dist/windows/
+          cp "target/${{ matrix.target }}/release/odm-cli.exe" dist/windows/
+          cp "target/${{ matrix.target }}/release/odm-bt.exe" dist/windows/
+          # Chocolatey, a per-machine install and a per-user install each put Inno Setup
+          # somewhere else; try them in that order rather than hard-coding one.
+          iscc=""
+          for candidate in \
+            "$(cygpath "$PROGRAMFILES")/Inno Setup 6/ISCC.exe" \
+            "$(cygpath "${PROGRAMFILES(X86)}")/Inno Setup 6/ISCC.exe" \
+            "$(cygpath "$LOCALAPPDATA")/Programs/Inno Setup 6/ISCC.exe"; do
+            if [ -f "$candidate" ]; then iscc="$candidate"; break; fi
+          done
+          if [ -z "$iscc" ]; then echo "::error::Inno Setup was not found"; exit 1; fi
+          "$iscc" /DAppVersion="$VERSION" desktop/assets/odm.iss
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/open-download-manager-*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The command-line tools, for the machines with no desktop
+  # ---------------------------------------------------------------------------
+  cli:
+    name: cli (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static, so it runs on a glibc-less Linux: Alpine, a `scratch` image, a NAS.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            packages: musl-tools
+            cc: musl-gcc
+            archive: tar.gz
+            binary: odm-cli
+          # Every modern ARM Linux box that is not musl.
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            packages: gcc-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            archive: tar.gz
+            binary: odm-cli
+          # Both halves of the macOS world, from the arm64 runner.
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            packages: ""
+            cc: ""
+            archive: tar.gz
+            binary: odm-cli
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            packages: ""
+            cc: ""
+            archive: tar.gz
+            binary: odm-cli
+          # `packages: ""` rather than no key at all: an absent matrix value is not the empty
+          # string, so `if: matrix.packages != ''` would be true and the step would run `apt`
+          # with nothing to install.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            packages: ""
+            cc: ""
+            archive: zip
+            binary: odm-cli.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cross C toolchain (for ring)
+        if: matrix.packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Build
+        shell: bash
+        env:
+          # `cc` looks for `x86_64-linux-musl-gcc`, which `musl-tools` does not provide; it
+          # provides `musl-gcc`. Only the target-specific names are set, so build scripts and
+          # proc macros (built for the host) keep the host compiler.
+          CC_x86_64_unknown_linux_musl: ${{ matrix.cc }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.cc }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cc }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin odm-cli
+
+      # The claim the Linux archive makes is "static"; `ldd` is the one-line proof, and a
+      # release is a bad place to discover it is not true.
+      - name: Prove the Linux builds are static
+        if: contains(matrix.target, 'linux')
+        run: |
+          bin=target/${{ matrix.target }}/release/odm-cli
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "::error::$bin links against shared libraries"
+            exit 1
+          fi
+
+      - name: What was built
+        shell: bash
+        run: target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          name="open-download-manager-cli-$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          case "${{ matrix.archive }}" in
+            tar.gz) tar -C dist -czf "dist/$name.tar.gz" "$name" ;;
+            zip)    tar -C dist -a -cf "dist/$name.zip" "$name" ;;
+          esac
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/open-download-manager-cli-*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The browser extension: a zip the user unpacks into their browser
+  # ---------------------------------------------------------------------------
+  extension:
+    name: browser extension
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          name="open-download-manager-extension-$VERSION"
+          mkdir -p "dist/$name"
+          cp extension/manifest.json extension/background.js extension/protocol.js \
+             extension/popup.html extension/popup.css extension/popup.js \
+             extension/README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.zip" "$name"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: extension
+          path: dist/open-download-manager-extension-*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The container image
+  # ---------------------------------------------------------------------------
+  image:
+    name: image (ghcr.io)
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The image is multi-architecture, and building it on an amd64 runner means the arm64
+      # half runs under emulation. That is slow (the build stage compiles `ring`'s assembly)
+      # but simple; a native arm64 runner or a cross-compiling build stage would both be
+      # faster, and neither is worth the extra moving parts until a release actually needs it.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+
+  # ---------------------------------------------------------------------------
+  # The release page
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: [version, desktop, cli, extension]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # A checksum file, so a user can tell that what they downloaded is what was
+      # published — the same thing every serious release does.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # `gh` rather than a third-party action: one less thing to trust with a write token.
+      # The notes are generated from the commits and labels since the previous tag, so the
+      # release body does not have to be maintained by hand in two places — and the install
+      # section is appended from the README, so the page tells the user what to do with
+      # the files they just downloaded.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -eu
+          ls -l dist
+          {
+            echo
+            echo "## Install"
+            echo
+            echo "Grab the archive for your platform from the assets below, unpack it and run \`odm\`."
+            echo
+            echo "| Platform | File |"
+            echo "| --- | --- |"
+            echo "| Windows (x64) | \`open-download-manager-$VERSION-x86_64-pc-windows-msvc.zip\` → \`odm.exe\` (no installer needed) |"
+            echo "| Windows (x64), with an installer | \`open-download-manager-$VERSION-windows-x64-setup.exe\` → Start menu, shortcut, uninstaller |"
+            echo "| macOS (Apple silicon) | \`open-download-manager-$VERSION-aarch64-apple-darwin.tar.gz\` → \`odm\` |"
+            echo "| macOS (Intel) | \`open-download-manager-$VERSION-x86_64-apple-darwin.tar.gz\` → \`odm\` |"
+            echo "| Linux (x64) | \`open-download-manager-$VERSION-x86_64-unknown-linux-gnu.tar.gz\` → \`odm\` |"
+            echo "| Headless / NAS | \`open-download-manager-cli-$VERSION-x86_64-unknown-linux-musl.tar.gz\` → \`odm-cli\` |"
+            echo "| Browser extension | \`open-download-manager-extension-$VERSION.zip\` → unpack into the browser |"
+            echo
+            echo "Verify a download with \`sha256sum -c SHA256SUMS.txt\`."
+          } > notes-extra.md
+          # Only the archives, the installer and the checksum file: `dist/*` would also
+          # pick up any staging directory left behind by a build step. The list is built
+          # by hand because a glob that matches nothing is passed through as itself, and
+          # `gh` would then be asked to upload a file that does not exist.
+          files=()
+          for f in dist/*.zip dist/*.tar.gz dist/*.exe dist/SHA256SUMS.txt; do
+            if [ -e "$f" ]; then files+=("$f"); fi
+          done
+          ls -l "${files[@]}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            "${files[@]}"
+          # `--generate-notes` and `--notes-file` cannot be combined in one call, so the
+          # generated notes are fetched back and the install section is appended to them.
+          gh release view "$TAG" --json body --jq .body > body.md
+          cat notes-extra.md >> body.md
+          gh release edit "$TAG" --notes-file body.md

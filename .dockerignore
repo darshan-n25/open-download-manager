@@ -1,0 +1,23 @@
+# The build context is the repository root — `deploy/Dockerfile` copies `Cargo.toml`,
+# `Cargo.lock` and `src/` from it — and the build itself happens inside the image, so nothing
+# else in the tree is read.
+#
+# `.gitignore` is not read by Docker: the two files are separate and have to be kept in step
+# by hand. Without this one, `docker build ... .` sends the working tree to the daemon first,
+# and `target/` alone is several gigabytes of build output the image would not use — a long
+# upload in exchange for nothing.
+target/
+.git/
+
+# Read by `cargo build` only when they are being built or run, which the image does to
+# neither: the tests are run from the checkout, and the Dockerfile copies `src/` alone.
+tests/
+benches/
+examples/
+scripts/
+.github/
+deploy/
+
+# Not compiled or copied at all.
+docs/
+extension/

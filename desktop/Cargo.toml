@@ -1,0 +1,26 @@
+[package]
+name = "odm-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Open Download Manager (ODM) — a native, modern download manager"
+
+# The program the user runs is `odm`, like the product it is. The crate keeps the
+# repository's name, because that is what the library it links against is called.
+[[bin]]
+name = "odm"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11"] }
+egui = "0.36"
+egui_extras = { version = "0.36", features = ["svg"] }
+egui-lucide = "0.1"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+odm = { path = ".." }

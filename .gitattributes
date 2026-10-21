@@ -1,0 +1,9 @@
+# One checkout, the same bytes on every platform.
+#
+# Windows checks out files with CRLF by default, which makes a diff of "the same" file show
+# every line as changed, and turns any byte-for-byte comparison of a checked-in file into a
+# platform-dependent answer. Open Download Manager ships to all three platforms, so the working tree is
+# pinned to LF everywhere and the platform difference is confined to binaries.
+* text=auto eol=lf
+*.exe binary
+*.png binary
