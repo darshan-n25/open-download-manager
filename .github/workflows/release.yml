@@ -63,11 +63,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `exec` says whether the binary can be *run* on the runner that built it.
+          # A cross-built binary for another architecture cannot be: the runner would
+          # answer "Exec format error", which is a property of the runner, not of the
+          # build. Those are checked with `file` instead.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             binary: odm
             exe: ""
+            exec: true
             # eframe's X11 backend links against these; they are build-time only.
             packages: libx11-dev libxkbcommon-dev libgl1-mesa-dev
           - os: macos-latest
@@ -75,18 +80,21 @@ jobs:
             archive: tar.gz
             binary: odm
             exe: ""
+            exec: true
             packages: ""
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
             binary: odm
             exe: ""
+            exec: false
             packages: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
             binary: odm.exe
             exe: ".exe"
+            exec: true
             packages: ""
     steps:
       - uses: actions/checkout@v4
@@ -114,8 +122,15 @@ jobs:
       - name: What was built
         shell: bash
         run: |
+          set -eu
           bin="desktop/target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          "$bin" --version
+          if [ "${{ matrix.exec }}" = "true" ]; then
+            "$bin" --version
+          else
+            # Built for another architecture, so it cannot run here. `file` says what it
+            # is, which is the part that can be checked without running it.
+            file "$bin"
+          fi
 
       - name: Package
         shell: bash
@@ -148,21 +163,39 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -eu
-          choco install innosetup --yes --no-progress
+          # Where is the compiler? The directory is looked for rather than assembled
+          # from an environment variable, because the 32-bit program files directory
+          # is spelled `PROGRAMFILES(X86)` — and that is not a name bash can expand:
+          # `${PROGRAMFILES(X86)}` is a "bad substitution". The paths below are the
+          # ones Chocolatey, a per-machine install and a per-user install use.
+          find_iscc() {
+            for candidate in \
+              "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+              "/c/Program Files/Inno Setup 6/ISCC.exe" \
+              "/c/ProgramData/chocolatey/bin/ISCC.exe" \
+              "/c/Users/runneradmin/AppData/Local/Programs/Inno Setup 6/ISCC.exe"; do
+              if [ -f "$candidate" ]; then echo "$candidate"; return 0; fi
+            done
+            return 1
+          }
+
+          iscc=$(find_iscc || true)
+          if [ -z "$iscc" ]; then
+            echo "Inno Setup is not on the runner; installing it"
+            choco install innosetup --yes --no-progress
+            iscc=$(find_iscc || true)
+          fi
+          if [ -z "$iscc" ]; then
+            echo "::error::Inno Setup was not found"
+            ls -d "/c/Program Files (x86)/Inno Setup"* 2>/dev/null || true
+            exit 1
+          fi
+          echo "using $iscc"
+
           mkdir -p dist/windows
           cp "desktop/target/${{ matrix.target }}/release/odm.exe" dist/windows/
           cp "target/${{ matrix.target }}/release/odm-cli.exe" dist/windows/
           cp "target/${{ matrix.target }}/release/odm-bt.exe" dist/windows/
-          # Chocolatey, a per-machine install and a per-user install each put Inno Setup
-          # somewhere else; try them in that order rather than hard-coding one.
-          iscc=""
-          for candidate in \
-            "$(cygpath "$PROGRAMFILES")/Inno Setup 6/ISCC.exe" \
-            "$(cygpath "${PROGRAMFILES(X86)}")/Inno Setup 6/ISCC.exe" \
-            "$(cygpath "$LOCALAPPDATA")/Programs/Inno Setup 6/ISCC.exe"; do
-            if [ -f "$candidate" ]; then iscc="$candidate"; break; fi
-          done
-          if [ -z "$iscc" ]; then echo "::error::Inno Setup was not found"; exit 1; fi
           "$iscc" /DAppVersion="$VERSION" desktop/assets/odm.iss
           ls -l dist
 
@@ -184,12 +217,16 @@ jobs:
       matrix:
         include:
           # Static, so it runs on a glibc-less Linux: Alpine, a `scratch` image, a NAS.
+          # `exec` says whether the binary can be *run* on the runner that built it; a
+          # cross-built binary for another architecture cannot be.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             packages: musl-tools
             cc: musl-gcc
             archive: tar.gz
             binary: odm-cli
+            exec: true
+            static: true
           # Every modern ARM Linux box that is not musl.
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
@@ -197,6 +234,8 @@ jobs:
             cc: aarch64-linux-gnu-gcc
             archive: tar.gz
             binary: odm-cli
+            exec: false
+            static: false
           # Both halves of the macOS world, from the arm64 runner.
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -204,12 +243,16 @@ jobs:
             cc: ""
             archive: tar.gz
             binary: odm-cli
+            exec: true
+            static: false
           - os: macos-latest
             target: x86_64-apple-darwin
             packages: ""
             cc: ""
             archive: tar.gz
             binary: odm-cli
+            exec: false
+            static: false
           # `packages: ""` rather than no key at all: an absent matrix value is not the empty
           # string, so `if: matrix.packages != ''` would be true and the step would run `apt`
           # with nothing to install.
@@ -219,6 +262,8 @@ jobs:
             cc: ""
             archive: zip
             binary: odm-cli.exe
+            exec: true
+            static: false
     steps:
       - uses: actions/checkout@v4
 
@@ -244,20 +289,36 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cc }}
         run: cargo build --release --locked --target ${{ matrix.target }} --bin odm-cli
 
-      # The claim the Linux archive makes is "static"; `ldd` is the one-line proof, and a
-      # release is a bad place to discover it is not true.
-      - name: Prove the Linux builds are static
-        if: contains(matrix.target, 'linux')
+      # The claim the musl archive makes is "static", and a release is a bad place to
+      # discover that it is not true.
+      #
+      # `readelf` rather than `ldd`, because it reads the file rather than the host:
+      # `ldd` on a binary for another architecture says "not a dynamic executable" and
+      # exits non-zero, which a check written as "did ldd print a shared library?"
+      # would read as "static" — a pass for the wrong reason. The program interpreter
+      # is the thing that has to be missing, and readelf says whether it is there.
+      - name: Prove the static build is static
+        if: matrix.static == true
         run: |
           bin=target/${{ matrix.target }}/release/odm-cli
-          if ldd "$bin" 2>&1 | grep -q '=>'; then
-            echo "::error::$bin links against shared libraries"
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "::error::$bin has a program interpreter, so it is not static"
+            readelf -l "$bin" | grep -A1 INTERP
             exit 1
           fi
+          file "$bin"
 
       - name: What was built
         shell: bash
-        run: target/${{ matrix.target }}/release/${{ matrix.binary }} --version
+        run: |
+          set -eu
+          bin=target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if [ "${{ matrix.exec }}" = "true" ]; then
+            "$bin" --version
+          else
+            # Built for another architecture, so it cannot run here.
+            file "$bin"
+          fi
 
       - name: Package
         shell: bash
@@ -376,7 +437,13 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          # Every published file, the installer included: a checksum file that leaves
+          # one of the downloads out is worse than none.
+          files=()
+          for f in *.zip *.tar.gz *.exe; do
+            if [ -e "$f" ]; then files+=("$f"); fi
+          done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       # `gh` rather than a third-party action: one less thing to trust with a write token.
