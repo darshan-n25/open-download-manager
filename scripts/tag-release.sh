@@ -15,8 +15,18 @@ cd "$(dirname "$0")/.."
 
 version=${1:-}
 if [ -z "$version" ]; then
-  echo "usage: scripts/tag-release.sh <version>   (for example: scripts/tag-release.sh 0.1.0)"
+  echo "usage: scripts/tag-release.sh <version> [--retag]   (for example: scripts/tag-release.sh 0.1.0)"
+  echo
+  echo "  --retag   replace a tag that already exists, pointing it at the current main."
+  echo "             This is what a failed release needs: the tag is deleted and pushed"
+  echo "             again, which starts the workflow a second time with the fixed"
+  echo "             workflow file."
   exit 2
+fi
+
+retag=no
+if [ "${2:-}" = "--retag" ]; then
+  retag=yes
 fi
 
 version=${version#v}
@@ -29,8 +39,10 @@ if [ "$in_cargo" != "$version" ]; then
   exit 1
 fi
 
-if git rev-parse "$tag" >/dev/null 2>&1; then
+if git rev-parse "$tag" >/dev/null 2>&1 && [ "$retag" = no ]; then
   echo "The tag $tag already exists."
+  echo "To move it to the current main (a release that failed and needs doing again):"
+  echo "   scripts/tag-release.sh $version --retag"
   exit 1
 fi
 
@@ -49,6 +61,12 @@ if ! git merge-base --is-ancestor origin/main HEAD && \
 fi
 
 echo "2. tagging $tag on origin/main"
+if [ "$retag" = yes ]; then
+  # The old tag goes first, locally and on the remote: a tag that exists cannot be
+  # moved, and the release workflow starts on the push of a *new* tag.
+  git tag -d "$tag" 2>/dev/null || true
+  git push origin ":refs/tags/$tag" 2>/dev/null || true
+fi
 git tag -a "$tag" -m "Open Download Manager $version" origin/main
 echo "   $tag -> $(git rev-parse --short "$tag^{commit}")"
 echo

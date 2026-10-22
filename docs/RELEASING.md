@@ -29,6 +29,18 @@ scripts/tag-release.sh 0.1.0
 That fetches `main`, refuses to tag a commit that `main` does not contain, creates the
 annotated tag on the merged commit and pushes it. The push is what starts the workflow.
 
+**If a release failed** — the workflow broke, or the binaries were wrong — fix it on
+`dev`, merge it into `main`, and then re-cut the tag:
+
+```sh
+scripts/tag-release.sh 0.1.0 --retag
+```
+
+A tag cannot be moved, so the old one is deleted and pushed again. That is what starts
+the workflow a second time, and it runs the *new* workflow file: re-running the failed
+job from the Actions page would repeat the failure, because that run still uses the
+workflow as it was when the tag was pushed.
+
 The order is the point: a release points at reviewed, merged code, never at a commit
 that only exists on a branch.
 
