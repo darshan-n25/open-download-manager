@@ -161,6 +161,14 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.version.outputs.version }}
+          # Git Bash on the Windows runner rewrites any argument that starts with `/`
+          # into a Windows path. `/DAppVersion=0.2.0` therefore reached ISCC as a second
+          # script filename, and it answered "You may not specify more than one script
+          # filename" — a path-rewriting bug, not a version one. Turning the conversion
+          # off for this step leaves the switch intact; the paths below are relative and
+          # need no rewriting.
+          MSYS2_ARG_CONV_EXCL: "*"
+          MSYS_NO_PATHCONV: "1"
         run: |
           set -eu
           # Where is the compiler? The directory is looked for rather than assembled
