@@ -769,8 +769,7 @@ mod audio {
             let supported = device
                 .supported_output_configs()
                 .map_err(|e| format!("audio device: {e}"))?
-                .filter(|c| c.channels() == 2)
-                .next()
+                .find(|c| c.channels() == 2)
                 .ok_or_else(|| "the audio device has no stereo output".to_string())?;
             let sample_format = supported.sample_format();
             let config: cpal::StreamConfig = supported
@@ -821,8 +820,10 @@ mod audio {
                             Ok(n) => n,
                         };
                         if let Ok(mut ring) = ring.lock() {
-                            for pair in raw[..n].chunks_exact(2) {
-                                let sample = i16::from_le_bytes([pair[0], pair[1]]);
+                            // `as_chunks` rather than `chunks_exact(2)`: the same
+                            // remainder-dropping behaviour, without a bounds check per pair.
+                            for pair in raw[..n].as_chunks::<2>().0 {
+                                let sample = i16::from_le_bytes(*pair);
                                 ring.push_back(sample as f32 / 32768.0);
                             }
                         }
