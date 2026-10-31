@@ -161,6 +161,54 @@ fn non_empty(get: &dyn Fn(&str) -> Option<OsString>, name: &str) -> Option<OsStr
     get(name).filter(|v| !v.is_empty())
 }
 
+/// Read exactly `buf.len()` bytes at `offset`, retrying short reads.
+///
+/// The counterpart of [`write_all_at`], and positional for the same reason: a BitTorrent
+/// piece is read back for hash checking, and the streaming server reads a byte range while
+/// the engine is writing other pieces of the same file.
+pub fn read_all_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    read_all_at_with(buf, offset, |part, at| read_at(file, part, at))
+}
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+fn read_all_at_with<F>(buf: &mut [u8], mut offset: u64, mut get: F) -> std::io::Result<()>
+where
+    F: FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+{
+    let mut read = 0usize;
+    while read < buf.len() {
+        match get(&mut buf[read..], offset)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected end of file",
+                ))
+            }
+            n if n > buf.len() - read => {
+                return Err(std::io::Error::other(
+                    "reader reported more bytes than it was given",
+                ))
+            }
+            n => {
+                read += n;
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Write all of `buf` at `offset`, retrying short writes.
 ///
 /// Positional writes never move the file cursor, so any number of workers can fill disjoint

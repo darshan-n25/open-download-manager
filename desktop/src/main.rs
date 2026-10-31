@@ -11,14 +11,37 @@
 use eframe::egui;
 use egui_lucide::Lucide;
 use odm::config::Config;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+mod player;
+
 /// The base URL of the in-process daemon, filled in once it has bound.
 static DAEMON_ADDR: OnceLock<String> = OnceLock::new();
+
+/// The runtime the streaming servers live on.
+///
+/// A broadcast is served by its own task, and it has to keep running while the
+/// download that feeds it continues on the worker thread's runtime. The player's
+/// stream server therefore gets a runtime of the interface, not of the download.
+static STREAM_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn stream_rt() -> Option<&'static tokio::runtime::Runtime> {
+    if let Some(rt) = STREAM_RT.get() {
+        return Some(rt);
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("odm-stream")
+        .build()
+        .ok()?;
+    let _ = STREAM_RT.set(rt);
+    STREAM_RT.get()
+}
 
 // ---------------------------------------------------------------------------
 // Data from the daemon
@@ -253,16 +276,33 @@ enum Tab {
 /// One torrent download, shared between the UI and the worker thread that runs it.
 #[derive(Clone)]
 struct TorrentJob {
+    id: u64,
     name: String,
     info_hash: String,
+    /// Where the torrent's files live: the download directory.
+    base: PathBuf,
+    /// The biggest file, which is what `output_path` reports.
     output: PathBuf,
     total: u64,
     downloaded: u64,
     speed_bps: f64,
+    peers: usize,
     /// "connecting", "downloading", "done", "failed" or "cancelled".
     state: String,
     error: Option<String>,
     cancel: Arc<AtomicBool>,
+    /// Set while the user has paused this torrent. Kept on the job rather than only
+    /// on the session so a pause requested before the metadata arrives still holds
+    /// when the session is created.
+    pause: Arc<AtomicBool>,
+    /// What the job was added from, so a failed or cancelled torrent can be retried
+    /// without asking the user for the file or the magnet link again.
+    source: Option<TorrentSource>,
+    /// The live session, once the metadata is known. Streaming goes through it, and
+    /// it is dropped (stopping the download's tasks) when the UI forgets the job.
+    session: Option<Arc<odm::bt::session::Session>>,
+    /// The files in the torrent, as (name, size) — what the player can choose from.
+    files: Vec<(String, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +319,15 @@ struct App {
     last_refresh: Option<std::time::Instant>,
     daemon_ok: bool,
     category: Category,
-    selected: Option<String>,
+    /// The row whose details are shown. Clicking a row focuses it; the checkbox is
+    /// a separate gesture, so a batch does not replace what the details strip says.
+    focused: Option<String>,
+    /// Downloads ticked for a batch action.
+    checked: BTreeSet<String>,
+    /// Torrents ticked for a batch action.
+    checked_torrents: BTreeSet<u64>,
+    /// The torrent the player is showing, so deleting it closes the player too.
+    playing_torrent: Option<u64>,
     sort: SortState,
     tab: Tab,
     show_add: bool,
@@ -301,6 +349,16 @@ struct App {
     rects: BTreeMap<String, egui::Rect>,
     /// The torrent downloads, shared with the worker threads that run them.
     torrents: Arc<std::sync::Mutex<Vec<TorrentJob>>>,
+    /// The player, when something is playing.
+    player: Option<player::Player>,
+    /// A stream server that is being started: the UI polls for its URL each frame.
+    starting_play: Option<(std::sync::mpsc::Receiver<Result<String, String>>, String)>,
+    /// The next torrent's id, so a job can be found even after a magnet discovers
+    /// its real name.
+    next_torrent_id: u64,
+    /// Stops the stream server that is feeding the player. Closing the player must
+    /// release its port; without this every play would leave a server behind.
+    stream_stop: Option<Arc<AtomicBool>>,
 }
 
 impl App {
@@ -327,6 +385,7 @@ impl App {
         if let Some(p) = http_get::<Vec<Project>>("/api/projects") {
             self.projects = p;
         }
+        self.prune_checked();
         self.last_refresh = Some(std::time::Instant::now());
     }
 
@@ -370,7 +429,7 @@ impl App {
     }
 
     fn selected_job(&self) -> Option<&Job> {
-        let id = self.selected.as_ref()?;
+        let id = self.focused.as_ref()?;
         self.jobs.iter().find(|j| &j.id == id)
     }
 
@@ -382,6 +441,21 @@ impl App {
     }
 
     fn act_all(&mut self, action: &str) {
+        // On the Torrents tab the toolbar means the torrents: the two lists are
+        // separate, so "Stop" there must not quietly pause downloads nobody is
+        // looking at.
+        if self.tab == Tab::Torrents {
+            let ids: Vec<u64> = self
+                .torrents
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|j| !matches!(j.state.as_str(), "done" | "failed" | "cancelled"))
+                .map(|j| j.id)
+                .collect();
+            self.torrents_action(&ids, action);
+            return;
+        }
         let ids: Vec<String> = self
             .jobs
             .iter()
@@ -392,6 +466,68 @@ impl App {
             let _ = http_post(&format!("/api/jobs/{id}/{action}"), "{}");
         }
         self.refresh();
+    }
+
+    /// Run a daemon action on an explicit set of downloads — the batch path.
+    fn act_ids(&mut self, ids: &[String], action: &str) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            let _ = http_post(&format!("/api/jobs/{id}/{action}"), "{}");
+        }
+        self.status = format!(
+            "{} {} download(s)",
+            match action {
+                "resume" => "started",
+                "pause" => "paused",
+                "remove" => "removed",
+                other => other,
+            },
+            ids.len()
+        );
+        self.refresh();
+    }
+
+    fn act_checked(&mut self, action: &str) {
+        let ids: Vec<String> = self.checked.iter().cloned().collect();
+        self.act_ids(&ids, action);
+        if action == "remove" {
+            self.checked.clear();
+            if self
+                .focused
+                .as_ref()
+                .is_some_and(|id| !self.jobs.iter().any(|j| &j.id == id))
+            {
+                self.focused = None;
+            }
+        }
+    }
+
+    /// The toolbar's Delete: whatever is ticked, or the focused row when nothing is.
+    fn remove_focused_or_checked(&mut self) {
+        if self.tab == Tab::Torrents {
+            let ids: Vec<u64> = self.checked_torrents.iter().copied().collect();
+            if !ids.is_empty() {
+                self.remove_torrents(&ids);
+            }
+            return;
+        }
+        if !self.checked.is_empty() {
+            self.act_checked("remove");
+        } else if let Some(id) = self.focused.clone() {
+            self.act(&id, "remove");
+            self.focused = None;
+        }
+    }
+
+    /// Keep the tick boxes honest when a refresh drops jobs that have gone away.
+    fn prune_checked(&mut self) {
+        self.checked
+            .retain(|id| self.jobs.iter().any(|j| &j.id == id));
+        let ids: std::collections::HashSet<u64> =
+            self.torrents.lock().unwrap().iter().map(|j| j.id).collect();
+        self.checked_torrents.retain(|id| ids.contains(id));
     }
 
     fn delete_finished(&mut self) {
@@ -451,25 +587,21 @@ impl App {
 }
 
 fn eta_secs(j: &Job) -> u64 {
-    if j.speed_bps <= 0.0 {
-        return 0;
-    }
     let Some(t) = j.total else { return 0 };
-    let left = t.saturating_sub(j.downloaded);
-    (left as f64 / j.speed_bps) as u64
+    eta_secs_bytes(t.saturating_sub(j.downloaded), j.speed_bps)
 }
 
-fn fmt_eta(j: &Job) -> String {
-    if j.state.eq_ignore_ascii_case("done") {
-        return String::new();
+/// How long the remaining bytes take at the current rate. Zero means "nothing
+/// honest to say": no speed, no total, or nothing left.
+fn eta_secs_bytes(left: u64, speed_bps: f64) -> u64 {
+    if speed_bps <= 0.0 || left == 0 {
+        return 0;
     }
-    if j.speed_bps <= 0.0 {
-        return "—".into();
-    }
-    let s = eta_secs(j);
-    if s == 0 {
-        return "—".into();
-    }
+    (left as f64 / speed_bps) as u64
+}
+
+/// `1h 02m`, `5m 03s`, `42s` — the shape a download list wants.
+fn fmt_secs(s: u64) -> String {
     let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
     if h > 0 {
         format!("{h}h {m:02}m")
@@ -478,6 +610,32 @@ fn fmt_eta(j: &Job) -> String {
     } else {
         format!("{sec}s")
     }
+}
+
+fn fmt_eta(j: &Job) -> String {
+    if j.state.eq_ignore_ascii_case("done") {
+        return String::new();
+    }
+    let s = eta_secs(j);
+    if s == 0 {
+        return "—".into();
+    }
+    fmt_secs(s)
+}
+
+/// How much of a torrent is finished, as a fraction for the progress bar.
+///
+/// A finished torrent is *exactly* complete: the engine counts verified bytes, so
+/// the last piece can leave the bar at 99.9% of the total, and a bar that rounds
+/// that down to "99%" over a file that is finished looks like a broken download.
+fn torrent_fraction(job: &TorrentJob) -> f32 {
+    if job.state == "done" || (job.total > 0 && job.downloaded >= job.total) {
+        return 1.0;
+    }
+    if job.total == 0 {
+        return 0.0;
+    }
+    (job.downloaded as f64 / job.total as f64).clamp(0.0, 1.0) as f32
 }
 
 fn fmt_bytes(n: u64) -> String {
@@ -542,6 +700,10 @@ impl App {
 
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 
+        // A stream that was being started gets its URL here, once the server has
+        // bound — the UI must never block waiting for a socket.
+        self.poll_starting_play();
+
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Downloads => self.downloads(ui),
             Tab::Projects => self.projects_tab(ui),
@@ -552,7 +714,17 @@ impl App {
             self.add_dialog(&ctx);
         }
 
-        ctx.request_repaint_after(Duration::from_millis(1200));
+        // The player is a window of its own, not a pane at the bottom of the list:
+        // a film is the reason the window exists, and a strip of it is not what
+        // "stream" should mean.
+        self.player_window(&ctx);
+
+        // A film needs a fresh frame far more often than a download list does.
+        if self.player.is_some() || self.starting_play.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(1200));
+        }
     }
 }
 
@@ -618,7 +790,12 @@ impl App {
             ui.menu_button("Help", |ui| {
                 if ui.button("About Open Download Manager").clicked() {
                     self.status =
-                        "Open Download Manager 0.1.0 — an open-source download manager".into();
+                        concat!(
+                            "Open Download Manager ",
+                            env!("CARGO_PKG_VERSION"),
+                            " — an open-source download manager"
+                        )
+                        .into();
                     ui.close();
                 }
             });
@@ -654,7 +831,7 @@ impl App {
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 14.0;
+                    ui.spacing_mut().item_spacing.x = 6.0;
 
                     self.tool_button(
                         ui,
@@ -689,9 +866,7 @@ impl App {
                         "Delete",
                         egui::Color32::from_rgb(148, 163, 184),
                         |s| {
-                            if let Some(id) = s.selected.clone() {
-                                s.act(&id, "remove");
-                            }
+                            s.remove_focused_or_checked();
                         },
                     );
                     self.tool_button(
@@ -704,9 +879,9 @@ impl App {
                         },
                     );
 
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     ui.separator();
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
 
                     self.tool_button(
                         ui,
@@ -766,38 +941,37 @@ impl App {
         color: egui::Color32,
         f: F,
     ) {
-        // The icon and the caption are two real buttons stacked on top of each other.
-        // An image and a label do not react to a click on their own, and a rectangle
-        // allocated by hand does not reliably get the pointer either — egui's own
-        // widgets are the ones that know how to be hovered and clicked.
-        //
-        // The style is scoped to this button: a transparent plate until the pointer
-        // arrives, a soft one while it is there, the accent while it is pressed.
+        // One square button, no caption: the icon is the whole control and the name
+        // arrives as a tooltip when the pointer rests on it. The plate is invisible
+        // until then, so the row reads as a set of symbols rather than a strip of
+        // boxes — and it is a single egui button, so both the click and the hover
+        // are the widget's own.
         let mut style = ui.style().as_ref().clone();
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
-        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(58, 66, 82);
-        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-        style.spacing.button_padding = egui::vec2(4.0, 2.0);
+        let rest = egui::Color32::TRANSPARENT;
+        let hover = egui::Color32::from_rgb(45, 50, 62);
+        let press = egui::Color32::from_rgb(37, 99, 235);
+        style.visuals.widgets.inactive.weak_bg_fill = rest;
+        style.visuals.widgets.inactive.bg_fill = rest;
+        style.visuals.widgets.hovered.weak_bg_fill = hover;
+        style.visuals.widgets.hovered.bg_fill = hover;
+        style.visuals.widgets.active.weak_bg_fill = press;
+        style.visuals.widgets.active.bg_fill = press;
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(7);
+        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(7);
+        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(7);
+        style.spacing.button_padding = egui::vec2(6.0, 6.0);
 
         let mut clicked = false;
         ui.scope(|ui| {
             ui.set_style(style);
-            let responses = ui.vertical(|ui| {
-                ui.set_max_width(66.0);
-                let icon_response = ui.add(
-                    egui::Button::new(icon.size(22.0).color(color).image())
-                        .min_size(egui::vec2(28.0, 26.0)),
-                );
-                let label_response = ui.add(
-                    egui::Button::new(egui::RichText::new(label).size(11.0))
-                        .min_size(egui::vec2(64.0, 18.0)),
-                );
-                (icon_response, label_response)
-            });
-            let (icon_response, label_response) = responses.inner;
-            self.rects
-                .insert(format!("tool.{label}"), icon_response.rect);
-            clicked = icon_response.clicked() || label_response.clicked();
+            let response = ui
+                .add(
+                    egui::Button::new(icon.size(18.0).color(color).image())
+                        .min_size(egui::vec2(32.0, 30.0)),
+                )
+                .on_hover_text(label);
+            self.rects.insert(format!("tool.{label}"), response.rect);
+            clicked = response.clicked();
         });
         if clicked {
             f(self);
@@ -907,6 +1081,39 @@ impl App {
         });
         ui.separator();
 
+        // Batch bar, the way IDM's selection mode works: ticking any row brings up
+        // the actions that make sense for a group, so ten downloads do not need ten
+        // clicks each.
+        if !self.checked.is_empty() {
+            let mut action: Option<&str> = None;
+            let mut clear = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} selected", self.checked.len()))
+                        .size(12.5)
+                        .strong(),
+                );
+                if ui.button("▶ Start").clicked() {
+                    action = Some("resume");
+                }
+                if ui.button("⏸ Pause").clicked() {
+                    action = Some("pause");
+                }
+                if ui.button("🗑 Delete").clicked() {
+                    action = Some("remove");
+                }
+                if ui.button("Clear").clicked() {
+                    clear = true;
+                }
+            });
+            if let Some(a) = action {
+                self.act_checked(a);
+            }
+            if clear {
+                self.checked.clear();
+            }
+        }
+
         if !self.daemon_ok {
             ui.centered_and_justified(|ui| {
                 ui.add_space(40.0);
@@ -966,7 +1173,22 @@ impl App {
                                     sort_clicked = Some(by);
                                 }
                             };
-                        header(ui, "File Name", SortBy::Name, 232.0);
+                        let mut all =
+                            !jobs.is_empty() && jobs.iter().all(|j| self.checked.contains(&j.id));
+                        if ui
+                            .add(egui::Checkbox::without_text(&mut all))
+                            .on_hover_text("Select all")
+                            .clicked()
+                        {
+                            for j in &jobs {
+                                if all {
+                                    self.checked.insert(j.id.clone());
+                                } else {
+                                    self.checked.remove(&j.id);
+                                }
+                            }
+                        }
+                        header(ui, "File Name", SortBy::Name, 212.0);
                         header(ui, "Size", SortBy::Size, 82.0);
                         header(ui, "Status", SortBy::Status, 74.0);
                         header(ui, "Time left", SortBy::Eta, 74.0);
@@ -987,22 +1209,38 @@ impl App {
                 });
 
             for job in jobs {
-                let selected = self.selected.as_deref() == Some(job.id.as_str());
-                let bg = if selected {
+                let focused = self.focused.as_deref() == Some(job.id.as_str());
+                let checked = self.checked.contains(&job.id);
+                let bg = if focused {
                     egui::Color32::from_rgb(37, 99, 235)
+                } else if checked {
+                    egui::Color32::from_rgb(31, 41, 59)
                 } else {
                     egui::Color32::from_rgb(24, 26, 32)
                 };
+                let mut tick_rect = None;
                 let row = egui::Frame::new()
                     .fill(bg)
                     .inner_margin(egui::Margin::symmetric(8, 5))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            let mut ticked = checked;
+                            let tick = ui.add(egui::Checkbox::without_text(&mut ticked));
+                            tick_rect = Some(tick.rect);
+                            self.rects
+                                .insert(format!("job.check.{}", job.id), tick.rect);
+                            if tick.changed() {
+                                if ticked {
+                                    self.checked.insert(job.id.clone());
+                                } else {
+                                    self.checked.remove(&job.id);
+                                }
+                            }
                             ui.horizontal(|ui| {
                                 ui.add(job_icon(&job).size(16.0).color(state_color(&job.state)));
                                 ui.vertical(|ui| {
                                     ui.add_sized(
-                                        [228.0, 18.0],
+                                        [208.0, 18.0],
                                         egui::Label::new(
                                             egui::RichText::new(
                                                 job.output
@@ -1023,7 +1261,7 @@ impl App {
                                             .unwrap_or(0.0);
                                         ui.add(
                                             egui::ProgressBar::new(pct)
-                                                .desired_width(224.0)
+                                                .desired_width(204.0)
                                                 .fill(egui::Color32::from_rgb(96, 165, 250)),
                                         );
                                     }
@@ -1087,13 +1325,21 @@ impl App {
                         });
                     });
                 // The row is a frame of labels, so the click is claimed for the row
-                // itself — otherwise the job list cannot be selected at all.
+                // itself — otherwise the job list cannot be selected at all. The
+                // checkbox is carved out of that rect: an interact registered after
+                // the checkbox sits on top of it and would swallow every tick, which
+                // is why single selection used to do nothing while "select all" (no
+                // row interact over it) worked.
+                let mut hit = row.response.rect;
+                if let Some(tick) = tick_rect {
+                    hit.min.x = (tick.max.x + ui.spacing().item_spacing.x).min(hit.max.x);
+                }
                 let resp = ui.interact(
-                    row.response.rect,
+                    hit,
                     ui.id().with(("job", job.id.clone())),
                     egui::Sense::click(),
                 );
-                if resp.hovered() && !selected {
+                if resp.hovered() && !focused {
                     // A bar down the left edge, rather than a fill: a fill painted over
                     // the row would hide the text it is meant to draw attention to.
                     ui.painter().rect_filled(
@@ -1106,7 +1352,7 @@ impl App {
                     );
                 }
                 if resp.clicked() {
-                    self.selected = Some(job.id.clone());
+                    self.focused = Some(job.id.clone());
                 }
             }
         });
@@ -1339,8 +1585,8 @@ impl App {
                 );
                 ui.label(
                     egui::RichText::new(
-                        "A .torrent file is read here and fetched from its tracker. \
-                         Magnet links and seeding come later.",
+                        "A .torrent file is read here; a magnet link finds its metadata \
+                         through trackers and the DHT. Press Play to watch while it downloads.",
                     )
                     .size(13.0)
                     .color(egui::Color32::GRAY),
@@ -1349,26 +1595,99 @@ impl App {
             return;
         }
 
+        // Batch bar for torrents, the same shape as the downloads table.
+        if !self.checked_torrents.is_empty() {
+            let ids: Vec<u64> = self.checked_torrents.iter().copied().collect();
+            let n = ids.len();
+            let mut action: Option<&str> = None;
+            let mut clear = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{n} selected"))
+                        .size(12.5)
+                        .strong(),
+                );
+                if ui.button("▶ Start").clicked() {
+                    action = Some("resume");
+                }
+                if ui.button("⏸ Pause").clicked() {
+                    action = Some("pause");
+                }
+                if ui.button("↻ Retry").clicked() {
+                    action = Some("retry");
+                }
+                if ui.button("🗑 Delete").clicked() {
+                    action = Some("remove");
+                }
+                if ui.button("Clear").clicked() {
+                    clear = true;
+                }
+            });
+            if let Some(a) = action {
+                self.torrents_action(&ids, a);
+            }
+            if clear {
+                self.checked_torrents.clear();
+            }
+            ui.separator();
+        }
+
+        ui.horizontal(|ui| {
+            let mut all = jobs.iter().all(|j| self.checked_torrents.contains(&j.id));
+            if ui
+                .add(egui::Checkbox::without_text(&mut all))
+                .on_hover_text("Select all torrents")
+                .clicked()
+            {
+                for j in &jobs {
+                    if all {
+                        self.checked_torrents.insert(j.id);
+                    } else {
+                        self.checked_torrents.remove(&j.id);
+                    }
+                }
+            }
+            ui.label(
+                egui::RichText::new(format!("{} torrents", jobs.len()))
+                    .size(12.0)
+                    .color(egui::Color32::GRAY),
+            );
+        });
+        ui.add_space(2.0);
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             for job in jobs {
+                let checked = self.checked_torrents.contains(&job.id);
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(24, 26, 32))
+                    .fill(if checked {
+                        egui::Color32::from_rgb(31, 41, 59)
+                    } else {
+                        egui::Color32::from_rgb(24, 26, 32)
+                    })
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            let mut ticked = checked;
+                            if ui.add(egui::Checkbox::without_text(&mut ticked)).changed() {
+                                if ticked {
+                                    self.checked_torrents.insert(job.id);
+                                } else {
+                                    self.checked_torrents.remove(&job.id);
+                                }
+                            }
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new(&job.name).size(13.0).strong());
-                                let pct = if job.total > 0 {
-                                    job.downloaded as f32 / job.total as f32
-                                } else {
-                                    0.0
-                                };
+                                let fraction = torrent_fraction(&job);
+                                // One decimal, and our own text: the built-in
+                                // percentage *truncates*, which is how a finished
+                                // download came to read "99%".
                                 ui.add(
-                                    egui::ProgressBar::new(pct)
-                                        .desired_width(320.0)
-                                        .show_percentage(),
+                                    egui::ProgressBar::new(fraction).desired_width(320.0).text(
+                                        egui::RichText::new(format!("{:.1}%", fraction * 100.0))
+                                            .size(12.0),
+                                    ),
                                 );
-                                let detail = match &job.error {
+                                let mut detail = match &job.error {
                                     Some(e) => format!("{} · {}", job.state, e),
                                     None => format!(
                                         "{} · {} / {} · {}",
@@ -1386,6 +1705,16 @@ impl App {
                                         }
                                     ),
                                 };
+                                if job.peers > 0 {
+                                    detail.push_str(&format!(" · {} peers", job.peers));
+                                }
+                                // How long is left is the question a download list
+                                // exists to answer, so it is part of the same line.
+                                let left = job.total.saturating_sub(job.downloaded);
+                                let eta = eta_secs_bytes(left, job.speed_bps);
+                                if job.state != "done" && eta > 0 {
+                                    detail.push_str(&format!(" · {} left", fmt_secs(eta)));
+                                }
                                 ui.label(
                                     egui::RichText::new(detail)
                                         .size(11.5)
@@ -1395,10 +1724,63 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if (job.state == "downloading" || job.state == "connecting")
-                                        && ui.button("Cancel").clicked()
+                                    // Rightmost: forgetting the torrent. It is last in
+                                    // reading order and first in the right-to-left
+                                    // layout, which keeps it away from Stream.
+                                    if ui
+                                        .button("🗑")
+                                        .on_hover_text("Remove this torrent")
+                                        .clicked()
                                     {
-                                        job.cancel.store(true, Ordering::SeqCst);
+                                        self.torrents_action(&[job.id], "remove");
+                                    }
+                                    let state = job.state.as_str();
+                                    let active =
+                                        matches!(state, "downloading" | "connecting" | "paused");
+                                    if state == "failed" || state == "cancelled" {
+                                        if ui
+                                            .button("↻ Retry")
+                                            .on_hover_text("Try this torrent again")
+                                            .clicked()
+                                        {
+                                            self.torrents_action(&[job.id], "retry");
+                                        }
+                                    } else if active {
+                                        if ui.button("Cancel").clicked() {
+                                            self.torrents_action(&[job.id], "cancel");
+                                        }
+                                        let paused = state == "paused";
+                                        let toggle = ui.button(if paused {
+                                            "▶ Resume"
+                                        } else {
+                                            "⏸ Pause"
+                                        });
+                                        if toggle.clicked() {
+                                            self.torrents_action(
+                                                &[job.id],
+                                                if paused { "resume" } else { "pause" },
+                                            );
+                                        }
+                                    }
+                                    if !job.files.is_empty()
+                                        && matches!(
+                                            state,
+                                            "downloading" | "connecting" | "done" | "paused"
+                                        )
+                                    {
+                                        let play = ui.button(if state == "done" {
+                                            "▶ Play"
+                                        } else {
+                                            "▶ Stream"
+                                        });
+                                        let play = play.on_hover_text(if state == "done" {
+                                            "Open this torrent in the player"
+                                        } else {
+                                            "Watch this torrent while it downloads"
+                                        });
+                                        if play.clicked() {
+                                            self.play_torrent(job.id);
+                                        }
                                     }
                                     ui.label(
                                         egui::RichText::new(
@@ -1417,188 +1799,368 @@ impl App {
     }
 
     /// Start a magnet download on a worker thread.
-    ///
-    /// A magnet link has no file information of its own, so the torrent file is
-    /// fetched from the swarm first and the download follows from there.
     fn add_magnet(&mut self, link: &str) {
-        let magnet = match odm::bt::magnet::Magnet::parse(link) {
-            Ok(m) => m,
-            Err(e) => {
-                self.status = format!("magnet link: {e}");
-                return;
-            }
-        };
-        let info_hash = magnet.hex();
-        let name = magnet.name.clone().unwrap_or_else(|| info_hash.clone());
-        let total = 0u64;
-        let out_dir = Config::load().download_dir;
-        let cancel = Arc::new(AtomicBool::new(false));
-        {
-            let mut jobs = self.torrents.lock().unwrap();
-            jobs.push(TorrentJob {
-                name,
-                info_hash,
-                output: out_dir.join("magnet"),
-                total,
-                downloaded: 0,
-                speed_bps: 0.0,
-                state: "connecting".into(),
-                error: None,
-                cancel: cancel.clone(),
-            });
+        match odm::bt::magnet::Magnet::parse(link) {
+            Ok(magnet) => self.start_torrent(TorrentSource::Magnet(Box::new(magnet))),
+            Err(e) => self.status = format!("magnet link: {e}"),
         }
-
-        let jobs = self.torrents.clone();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    set_torrent_error(&jobs, &out_dir.join("magnet"), &format!("{e}"));
-                    return;
-                }
-            };
-            rt.block_on(async {
-                let progress_jobs = jobs.clone();
-                let progress: odm::bt::engine::ProgressFn = Arc::new(move |p| {
-                    if let Ok(mut list) = progress_jobs.lock() {
-                        // The magnet added exactly one job, and it is the last one.
-                        if let Some(job) = list.last_mut() {
-                            job.downloaded = p.downloaded;
-                            job.total = p.total;
-                            job.speed_bps = p.speed_bps;
-                            if job.state == "connecting" {
-                                job.state = "downloading".into();
-                            }
-                        }
-                    }
-                });
-                match odm::bt::engine::download_magnet(
-                    &magnet,
-                    &out_dir,
-                    Some(progress),
-                    Some(cancel),
-                )
-                .await
-                {
-                    Ok(path) => {
-                        if let Ok(mut list) = jobs.lock() {
-                            if let Some(job) = list.iter_mut().last() {
-                                job.output = path.clone();
-                                job.name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| job.name.clone());
-                                job.state = "done".into();
-                                job.total = job.total.max(job.downloaded);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        let state = if msg.contains("cancelled") {
-                            "cancelled".to_string()
-                        } else {
-                            format!("failed: {msg}")
-                        };
-                        if let Ok(mut list) = jobs.lock() {
-                            if let Some(job) = list.iter_mut().last() {
-                                job.state = state;
-                            }
-                        }
-                    }
-                }
-            });
-        });
     }
 
     /// Start a torrent download on a worker thread.
     fn add_torrent(&mut self, path: &std::path::Path) {
-        let torrent = match odm::bt::engine::read_torrent(path) {
-            Ok(t) => t,
-            Err(e) => {
-                self.status = format!("{}: {e}", path.display());
-                return;
-            }
-        };
-        let name = torrent.name.clone();
-        let info_hash = hex::encode(torrent.info_hash);
-        let total = torrent.length;
+        self.start_torrent(TorrentSource::File(path.to_path_buf()));
+    }
+
+    /// The one way a torrent is added, whether it came from a file or a magnet.
+    ///
+    /// A magnet only knows its hash, so the job starts with no name and no size and
+    /// fills them in once the swarm hands over the metadata. That is also the moment
+    /// the session becomes playable: the player streams through the live session, so
+    /// a film can start minutes before the download ends.
+    fn start_torrent(&mut self, source: TorrentSource) {
         let out_dir = Config::load().download_dir;
-        let out_path = out_dir.join(&name);
+        std::fs::create_dir_all(&out_dir).ok();
+
+        let (name, info_hash, total, files, output) = match &source {
+            TorrentSource::File(path) => match odm::bt::engine::read_torrent(path) {
+                Ok(t) => (
+                    t.name.clone(),
+                    hex::encode(t.info_hash),
+                    t.length,
+                    t.files
+                        .iter()
+                        .map(|f| (f.display_name(), f.length))
+                        .collect(),
+                    odm::bt::engine::output_path(&t, &out_dir),
+                ),
+                Err(e) => {
+                    self.status = format!("{}: {e}", path.display());
+                    return;
+                }
+            },
+            TorrentSource::Magnet(m) => (
+                m.name.clone().unwrap_or_else(|| m.hex()),
+                m.hex(),
+                0,
+                Vec::new(),
+                out_dir.join("magnet"),
+            ),
+        };
+
+        let id = self.next_torrent_id;
+        self.next_torrent_id += 1;
         let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
         {
             let mut jobs = self.torrents.lock().unwrap();
             jobs.push(TorrentJob {
+                id,
                 name,
                 info_hash,
-                output: out_path.clone(),
+                base: out_dir.clone(),
+                output,
                 total,
                 downloaded: 0,
                 speed_bps: 0.0,
+                peers: 0,
                 state: "connecting".into(),
                 error: None,
                 cancel: cancel.clone(),
+                pause: pause.clone(),
+                source: Some(source.clone()),
+                session: None,
+                files,
             });
         }
 
-        let jobs = self.torrents.clone();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    set_torrent_error(&jobs, &out_path, &format!("{e}"));
-                    return;
+        spawn_torrent_worker(self.torrents.clone(), id, source, out_dir, cancel, pause);
+    }
+
+    /// Pause or resume one torrent without dropping its peers.
+    fn set_torrent_paused(&self, id: u64, paused: bool) {
+        let mut list = self.torrents.lock().unwrap();
+        let Some(job) = list.iter_mut().find(|j| j.id == id) else {
+            return;
+        };
+        job.pause.store(paused, Ordering::SeqCst);
+        if let Some(session) = job.session.clone() {
+            session.set_paused(paused);
+        }
+        if paused {
+            if job.state != "done" {
+                job.state = "paused".into();
+            }
+        } else if job.state == "paused" {
+            job.state = if job.total == 0 {
+                "connecting".into()
+            } else {
+                "downloading".into()
+            };
+        }
+    }
+
+    /// Cancel a torrent: the worker notices the flag and stops the session.
+    fn cancel_torrent(&self, id: u64) {
+        let mut list = self.torrents.lock().unwrap();
+        if let Some(job) = list.iter_mut().find(|j| j.id == id) {
+            job.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Forget a torrent and stop everything it owns — the player included.
+    fn remove_torrents(&mut self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(playing) = self.playing_torrent {
+            if ids.contains(&playing) {
+                self.close_player();
+                self.playing_torrent = None;
+            }
+        }
+        {
+            let mut list = self.torrents.lock().unwrap();
+            for id in ids {
+                if let Some(job) = list.iter_mut().find(|j| j.id == *id) {
+                    job.cancel.store(true, Ordering::SeqCst);
+                }
+            }
+            list.retain(|j| !ids.contains(&j.id));
+        }
+        for id in ids {
+            self.checked_torrents.remove(id);
+        }
+        self.status = format!("removed {} torrent(s)", ids.len());
+    }
+
+    /// Start a failed or cancelled torrent again from what it was added from.
+    fn retry_torrents(&mut self, ids: &[u64]) {
+        for id in ids {
+            let Some((source, out_dir, cancel, pause)) = ({
+                let list = self.torrents.lock().unwrap();
+                list.iter().find(|j| j.id == *id).and_then(|j| {
+                    // Only a run that has stopped can be started again: retrying a
+                    // live torrent would leave two workers writing the same job.
+                    if !matches!(j.state.as_str(), "failed" | "cancelled") {
+                        return None;
+                    }
+                    j.source
+                        .clone()
+                        .map(|s| (s, j.base.clone(), j.cancel.clone(), j.pause.clone()))
+                })
+            }) else {
+                continue;
+            };
+            // The old worker may still be unwinding; its flag must not stop the new one.
+            cancel.store(true, Ordering::SeqCst);
+            let cancel = Arc::new(AtomicBool::new(false));
+            pause.store(false, Ordering::SeqCst);
+            {
+                let mut list = self.torrents.lock().unwrap();
+                if let Some(job) = list.iter_mut().find(|j| j.id == *id) {
+                    job.cancel = cancel.clone();
+                    job.session = None;
+                    job.error = None;
+                    job.state = "connecting".into();
+                    job.downloaded = 0;
+                    job.speed_bps = 0.0;
+                    job.peers = 0;
+                }
+            }
+            spawn_torrent_worker(self.torrents.clone(), *id, source, out_dir, cancel, pause);
+        }
+        self.status = format!("retrying {} torrent(s)", ids.len());
+    }
+
+    /// Apply one action to a set of torrents, for the batch bar.
+    fn torrents_action(&mut self, ids: &[u64], action: &str) {
+        match action {
+            "pause" => {
+                for id in ids {
+                    self.set_torrent_paused(*id, true);
+                }
+                self.status = format!("paused {} torrent(s)", ids.len());
+            }
+            "resume" => {
+                for id in ids {
+                    self.set_torrent_paused(*id, false);
+                }
+                self.status = format!("resumed {} torrent(s)", ids.len());
+            }
+            "cancel" => {
+                for id in ids {
+                    self.cancel_torrent(*id);
+                }
+            }
+            "retry" => self.retry_torrents(ids),
+            "remove" => self.remove_torrents(ids),
+            _ => {}
+        }
+    }
+
+    /// Play a torrent: the local file once it is finished, the live stream before.
+    fn play_torrent(&mut self, id: u64) {
+        let Some(job) = self
+            .torrents
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|j| j.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        // One player at a time. Closing the previous one also stops the server that
+        // was feeding it, so the port is not held by a film nobody is watching.
+        self.close_player();
+
+        // The biggest video file, or the biggest file if nothing looks like video.
+        let file = pick_playable(&job.files);
+        let Some((file_name, _)) = job.files.get(file).cloned() else {
+            self.status = "this torrent has no files to play".into();
+            return;
+        };
+        self.playing_torrent = Some(id);
+
+        if job.state == "done" {
+            // Finished: read straight from the file, no server in the way. The file's
+            // name is its path inside the download directory, so a multi-file torrent
+            // resolves to `<downloads>/<name>/<subdir>/<file>`.
+            let path = {
+                let candidate = job.base.join(&file_name);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    job.output.clone()
                 }
             };
-            rt.block_on(async {
-                let peer_id = *b"-RT0001-0123456789ab";
-                let peers =
-                    match odm::bt::tracker::announce(&torrent, &peer_id, 6881, torrent.length)
-                        .await
-                    {
-                        Ok(p) => p,
-                        Err(e) => {
-                            set_torrent_error(&jobs, &out_path, &format!("tracker: {e}"));
-                            return;
-                        }
-                    };
-                if peers.is_empty() {
-                    set_torrent_error(&jobs, &out_path, "the tracker returned no peers");
-                    return;
+            match player::Player::open(&file_name, &path.to_string_lossy()) {
+                Ok(p) => {
+                    self.player = Some(p);
+                    self.status = format!("playing {}", path.display());
                 }
-                set_torrent_state(&jobs, &out_path, "downloading");
-                let progress_jobs = jobs.clone();
-                let progress_path = out_path.clone();
-                let progress: odm::bt::engine::ProgressFn = Arc::new(move |p| {
-                    if let Ok(mut list) = progress_jobs.lock() {
-                        if let Some(job) = list.iter_mut().find(|j| j.output == progress_path) {
-                            job.downloaded = p.downloaded;
-                            job.total = p.total;
-                            job.speed_bps = p.speed_bps;
-                        }
-                    }
-                });
-                match odm::bt::engine::download_with(
-                    &torrent,
-                    &peers,
-                    &out_path,
-                    Some(progress),
-                    Some(cancel),
-                )
-                .await
-                {
-                    Ok(()) => set_torrent_state(&jobs, &out_path, "done"),
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("cancelled") {
-                            set_torrent_state(&jobs, &out_path, "cancelled");
-                        } else {
-                            set_torrent_error(&jobs, &out_path, &msg);
-                        }
-                    }
+                Err(e) => {
+                    self.close_player();
+                    self.status = e;
                 }
-            });
+            }
+            return;
+        }
+
+        // Still downloading: serve the file from the live session and play that.
+        let Some(session) = job.session.clone() else {
+            self.status = "the torrent is still finding its peers".into();
+            return;
+        };
+        let Some(rt) = stream_rt() else {
+            self.status = "could not start the streaming runtime".into();
+            return;
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            let result = match odm::bt::stream::start_with_cancel(session, file, server_stop).await
+            {
+                Ok(info) => Ok(info.url),
+                Err(e) => Err(format!("stream: {e}")),
+            };
+            let _ = tx.send(result);
         });
+        self.stream_stop = Some(stop);
+        self.starting_play = Some((rx, file_name));
+        self.status = "starting the stream…".into();
+    }
+
+    /// Show the player in its own window.
+    ///
+    /// egui renders an immediate viewport inline, in this frame, into a window of
+    /// its own — so the player keeps its state here while the picture, the scrubber
+    /// and the transport controls belong to the child window. Closing that window
+    /// (its ✕, Alt-F4, or the player's own button) closes the player and, with it,
+    /// the stream server feeding it.
+    fn player_window(&mut self, ctx: &egui::Context) {
+        // Taken out for the duration of the frame: the closure below needs the
+        // player mutably, and borrowing it through `self` would also borrow the
+        // rest of the interface.
+        let Some(mut player) = self.player.take() else {
+            return;
+        };
+        let mut close = false;
+        let title = player.title().to_string();
+
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("odm-player"),
+            egui::ViewportBuilder::default()
+                .with_title(format!("{title} — Open Download Manager"))
+                .with_inner_size([1024.0, 648.0])
+                .with_min_inner_size([520.0, 340.0]),
+            |ui, _class| {
+                // The whole child window is the player: picture, scrubber and
+                // transport controls, with no panel furniture around them.
+                ui.painter()
+                    .rect_filled(ui.max_rect(), 0.0, egui::Color32::BLACK);
+                player.pump(ui.ctx());
+                if player.ui(ui) {
+                    close = true;
+                }
+                // The window's own close button is the last word on whether the
+                // film is still being watched.
+                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                    close = true;
+                }
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+            },
+        );
+
+        if close {
+            self.close_player();
+        } else {
+            self.player = Some(player);
+        }
+    }
+
+    /// Close the player, and the stream server behind it with it.
+    fn close_player(&mut self) {
+        self.player = None;
+        self.starting_play = None;
+        self.playing_torrent = None;
+        if let Some(stop) = self.stream_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Poll the stream server that was being started, and open the player when it
+    /// has an address.
+    fn poll_starting_play(&mut self) {
+        let Some((rx, title)) = &self.starting_play else {
+            return;
+        };
+        let outcome = match rx.try_recv() {
+            Ok(v) => v,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("the streaming server stopped".to_string())
+            }
+        };
+        let title = title.clone();
+        self.starting_play = None;
+        match outcome {
+            Ok(url) => match player::Player::open(&title, &url) {
+                Ok(p) => {
+                    self.player = Some(p);
+                    self.status = format!("playing {title}");
+                }
+                Err(e) => {
+                    self.close_player();
+                    self.status = e;
+                }
+            },
+            Err(e) => {
+                self.close_player();
+                self.status = e;
+            }
+        }
     }
 
     // ----- status bar -----------------------------------------------------
@@ -1877,9 +2439,98 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 /// Mark a torrent download as failed, with the reason.
-fn set_torrent_error(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, path: &PathBuf, msg: &str) {
+/// What a torrent was added from.
+#[derive(Clone)]
+enum TorrentSource {
+    /// A `.torrent` file on disk.
+    File(PathBuf),
+    /// A magnet link, which still has to find its metadata.
+    Magnet(Box<odm::bt::magnet::Magnet>),
+}
+
+/// Run one torrent on its own thread and runtime.
+///
+/// Shared by the first attempt and by Retry: a torrent that failed while the swarm
+/// was unreachable is the same torrent, and asking the user to find the `.torrent`
+/// again to try once more would be a strange thing to require.
+fn spawn_torrent_worker(
+    jobs: Arc<std::sync::Mutex<Vec<TorrentJob>>>,
+    id: u64,
+    source: TorrentSource,
+    out_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                set_torrent_error(&jobs, id, &format!("{e}"));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let progress = progress_fn(&jobs, id);
+            let opened = match source {
+                TorrentSource::File(path) => match odm::bt::engine::read_torrent(&path) {
+                    Ok(t) => {
+                        let torrent = Arc::new(t);
+                        odm::bt::engine::open_torrent(
+                            torrent,
+                            out_dir.clone(),
+                            Some(progress),
+                            Some(cancel.clone()),
+                        )
+                        .await
+                        .map(|s| (s.torrent.clone(), s))
+                    }
+                    Err(e) => Err(e),
+                },
+                TorrentSource::Magnet(m) => {
+                    odm::bt::engine::open_magnet(&m, &out_dir, Some(progress), Some(cancel.clone()))
+                        .await
+                }
+            };
+
+            let (torrent, session) = match opened {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("cancelled") {
+                        set_torrent_state(&jobs, id, "cancelled");
+                    } else {
+                        set_torrent_error(&jobs, id, &msg);
+                    }
+                    return;
+                }
+            };
+
+            publish_metadata(&jobs, id, &torrent, &session, &out_dir);
+            // A pause asked for while the metadata was still being fetched holds now
+            // that there is a session to hold it.
+            if pause.load(Ordering::SeqCst) {
+                session.set_paused(true);
+                set_torrent_state(&jobs, id, "paused");
+            }
+
+            match session.wait().await {
+                Ok(()) => set_torrent_state(&jobs, id, "done"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("cancelled") {
+                        set_torrent_state(&jobs, id, "cancelled");
+                    } else {
+                        set_torrent_error(&jobs, id, &msg);
+                    }
+                }
+            }
+        });
+    });
+}
+
+fn set_torrent_error(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, id: u64, msg: &str) {
     if let Ok(mut list) = jobs.lock() {
-        if let Some(job) = list.iter_mut().find(|j| &j.output == path) {
+        if let Some(job) = list.iter_mut().find(|j| j.id == id) {
             job.state = "failed".into();
             job.error = Some(msg.to_string());
         }
@@ -1887,12 +2538,94 @@ fn set_torrent_error(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, path: &PathB
 }
 
 /// Move a torrent download to a new state.
-fn set_torrent_state(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, path: &PathBuf, state: &str) {
+fn set_torrent_state(jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>, id: u64, state: &str) {
     if let Ok(mut list) = jobs.lock() {
-        if let Some(job) = list.iter_mut().find(|j| &j.output == path) {
+        if let Some(job) = list.iter_mut().find(|j| j.id == id) {
             job.state = state.to_string();
+            if state == "done" {
+                // The last progress callback may have been a second before the
+                // final piece verified; a finished job is finished.
+                if job.total > 0 {
+                    job.downloaded = job.total;
+                }
+                job.speed_bps = 0.0;
+            }
         }
     }
+}
+
+/// Report the session's progress into the list the interface draws from.
+fn progress_fn(
+    jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>,
+    id: u64,
+) -> odm::bt::session::ProgressFn {
+    let jobs = jobs.clone();
+    Arc::new(move |p: odm::bt::session::TorrentProgress| {
+        if let Ok(mut list) = jobs.lock() {
+            if let Some(job) = list.iter_mut().find(|j| j.id == id) {
+                job.downloaded = p.downloaded;
+                job.total = p.total;
+                job.speed_bps = p.speed_bps;
+                job.peers = p.peers;
+            }
+        }
+    })
+}
+
+/// The metadata is in: fill in the name, the size and the files, and hand the live
+/// session to the interface so it can be streamed.
+fn publish_metadata(
+    jobs: &Arc<std::sync::Mutex<Vec<TorrentJob>>>,
+    id: u64,
+    torrent: &odm::bt::torrent::Torrent,
+    session: &Arc<odm::bt::session::Session>,
+    out_dir: &std::path::Path,
+) {
+    if let Ok(mut list) = jobs.lock() {
+        if let Some(job) = list.iter_mut().find(|j| j.id == id) {
+            job.name = torrent.name.clone();
+            job.total = torrent.length;
+            job.files = torrent
+                .files
+                .iter()
+                .map(|f| (f.display_name(), f.length))
+                .collect();
+            job.output = odm::bt::engine::output_path(torrent, out_dir);
+            // The player streams through this session, so the interface has to hold
+            // on to it; the worker thread only keeps the download running.
+            job.session = Some(session.clone());
+            if job.state == "connecting" {
+                job.state = "downloading".into();
+            }
+        }
+    }
+}
+
+/// Which file in a torrent a player should open: the biggest video, or — for a
+/// torrent of music, say — the biggest file of any kind.
+fn pick_playable(files: &[(String, u64)]) -> usize {
+    const VIDEO: &[&str] = &[
+        "mp4", "m4v", "mkv", "webm", "avi", "mov", "ts", "m2ts", "mpg", "mpeg", "flv", "wmv",
+    ];
+    let video = files
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _))| {
+            name.rsplit('.')
+                .next()
+                .map(|ext| VIDEO.contains(&ext.to_ascii_lowercase().as_str()))
+                .unwrap_or(false)
+        })
+        .max_by_key(|(_, (_, size))| *size)
+        .map(|(i, _)| i);
+    video.unwrap_or_else(|| {
+        files
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (_, size))| *size)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2000,6 +2733,177 @@ mod tests {
         assert!(!app.show_add, "the dialog starts closed");
         click(&mut app, &ctx, "tool.Add URL");
         assert!(app.show_add, "the Add URL button did not open the dialog");
+    }
+
+    #[test]
+    fn print_control_rects() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1536.0, 792.0),
+            )),
+            ..Default::default()
+        };
+        frame(&mut app, &ctx, input);
+        let mut rects: Vec<_> = app.rects.iter().collect();
+        rects.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, rect) in rects {
+            println!(
+                "{name}: center=({:.1},{:.1}) rect=({:.1},{:.1})-({:.1},{:.1})",
+                rect.center().x,
+                rect.center().y,
+                rect.min.x,
+                rect.min.y,
+                rect.max.x,
+                rect.max.y
+            );
+        }
+    }
+
+    /// A torrent job with nothing but the fields a progress bar reads.
+    fn a_torrent(state: &str, downloaded: u64, total: u64) -> TorrentJob {
+        TorrentJob {
+            id: 1,
+            name: "t".into(),
+            info_hash: "0".repeat(40),
+            base: std::env::temp_dir(),
+            output: std::env::temp_dir().join("t.mkv"),
+            total,
+            downloaded,
+            speed_bps: 0.0,
+            peers: 0,
+            state: state.into(),
+            error: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
+            source: None,
+            session: None,
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_finished_torrent_reads_one_hundred_percent() {
+        // The progress bar's built-in text truncates, so the last tick before the
+        // final piece verified stayed on screen as "99%" over a finished download.
+        let nearly = torrent_fraction(&a_torrent("downloading", 999, 1000));
+        assert!((nearly - 0.999).abs() < 1e-6, "{nearly}");
+        assert_eq!(torrent_fraction(&a_torrent("downloading", 1000, 1000)), 1.0);
+        assert_eq!(torrent_fraction(&a_torrent("done", 999, 1000)), 1.0);
+        // A magnet before its metadata: no size, so no honest fraction.
+        assert_eq!(torrent_fraction(&a_torrent("connecting", 0, 0)), 0.0);
+    }
+
+    #[test]
+    fn finishing_a_torrent_marks_it_complete() {
+        let jobs = Arc::new(std::sync::Mutex::new(vec![a_torrent(
+            "downloading",
+            990,
+            1000,
+        )]));
+        set_torrent_state(&jobs, 1, "done");
+        let list = jobs.lock().unwrap();
+        assert_eq!(list[0].downloaded, 1000, "a done job is a complete job");
+        assert_eq!(list[0].speed_bps, 0.0);
+        assert_eq!(torrent_fraction(&list[0]), 1.0);
+    }
+
+    #[test]
+    fn pausing_a_torrent_is_reversible_without_losing_its_place() {
+        let jobs = Arc::new(std::sync::Mutex::new(vec![a_torrent(
+            "downloading",
+            400,
+            1000,
+        )]));
+        let app = App {
+            torrents: jobs.clone(),
+            ..Default::default()
+        };
+
+        app.set_torrent_paused(1, true);
+        {
+            let list = jobs.lock().unwrap();
+            assert_eq!(list[0].state, "paused");
+            assert!(list[0].pause.load(Ordering::SeqCst));
+            assert_eq!(list[0].downloaded, 400, "a pause is not a reset");
+        }
+
+        app.set_torrent_paused(1, false);
+        let list = jobs.lock().unwrap();
+        assert_eq!(list[0].state, "downloading");
+        assert!(!list[0].pause.load(Ordering::SeqCst));
+        assert_eq!(list[0].downloaded, 400);
+    }
+
+    #[test]
+    fn a_magnet_that_has_no_size_yet_returns_to_connecting() {
+        let jobs = Arc::new(std::sync::Mutex::new(vec![a_torrent("paused", 0, 0)]));
+        let app = App {
+            torrents: jobs.clone(),
+            ..Default::default()
+        };
+        app.set_torrent_paused(1, false);
+        assert_eq!(jobs.lock().unwrap()[0].state, "connecting");
+    }
+
+    #[test]
+    fn deleting_a_batch_forgets_every_ticked_torrent() {
+        let mut second = a_torrent("downloading", 10, 100);
+        second.id = 2;
+        let jobs = Arc::new(std::sync::Mutex::new(vec![
+            a_torrent("downloading", 10, 100),
+            second,
+        ]));
+        let mut app = App {
+            torrents: jobs.clone(),
+            checked_torrents: BTreeSet::from([1, 2]),
+            ..Default::default()
+        };
+        app.remove_torrents(&[1, 2]);
+        assert!(jobs.lock().unwrap().is_empty());
+        assert!(app.checked_torrents.is_empty());
+    }
+
+    #[test]
+    fn the_time_left_follows_the_rate() {
+        let mib = 1024.0 * 1024.0;
+        assert_eq!(fmt_secs(eta_secs_bytes(10 * 1024 * 1024, mib)), "10s");
+        assert_eq!(fmt_secs(eta_secs_bytes(90 * 1024 * 1024, mib)), "1m 30s");
+        assert_eq!(fmt_secs(eta_secs_bytes(3661, 1.0)), "1h 01m");
+        // No rate, or nothing left, is not an estimate: saying "0s" would lie.
+        assert_eq!(eta_secs_bytes(1000, 0.0), 0);
+        assert_eq!(eta_secs_bytes(0, 5.0), 0);
+    }
+
+    #[test]
+    fn a_single_download_can_be_ticked_without_selecting_the_row() {
+        // The row claims clicks for selection and is registered *after* the
+        // checkbox, so its interact used to cover the checkbox too: the tick was
+        // swallowed, and only "select all" — which has no row interact over it —
+        // worked.
+        let mut app = app();
+        app.tab = Tab::Downloads;
+        app.daemon_ok = true;
+        // The first frame normally asks the daemon for the job list, which would
+        // replace the fixture with an empty one.
+        app.last_refresh = Some(std::time::Instant::now());
+        app.jobs = vec![Job {
+            id: "a".into(),
+            output: "/tmp/movie.mkv".into(),
+            state: "done".into(),
+            ..Default::default()
+        }];
+        let ctx = egui::Context::default();
+        click(&mut app, &ctx, "job.check.a");
+        assert!(app.checked.contains("a"), "the checkbox did not tick");
+        assert!(
+            app.focused.is_none(),
+            "ticking the checkbox also selected the row"
+        );
+        click(&mut app, &ctx, "job.check.a");
+        assert!(!app.checked.contains("a"), "the second click did not untick");
     }
 
     #[test]

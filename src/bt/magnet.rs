@@ -14,6 +14,10 @@ pub struct Magnet {
     pub name: Option<String>,
     /// The trackers, in the order the link listed them.
     pub trackers: Vec<String>,
+    /// The size the link advertises (`xl`), if it has one. Trackers want it in the
+    /// announce: a client that reports 0 bytes left is a seeder, and is treated as
+    /// one when peers are handed out.
+    pub length: Option<u64>,
 }
 
 impl Magnet {
@@ -30,6 +34,7 @@ impl Magnet {
         let mut info_hash: Option<[u8; 20]> = None;
         let mut name = None;
         let mut trackers = Vec::new();
+        let mut length = None;
 
         for part in rest.split('&') {
             let Some((key, value)) = part.split_once('=') else {
@@ -51,6 +56,9 @@ impl Magnet {
                         trackers.push(t);
                     }
                 }
+                // `xl` is a hint, not a promise: a wrong one only affects what the
+                // tracker is told, never how bytes are counted.
+                "xl" => length = value.parse::<u64>().ok().filter(|n| *n > 0),
                 _ => {}
             }
         }
@@ -61,6 +69,7 @@ impl Magnet {
             info_hash,
             name,
             trackers,
+            length,
         })
     }
 
@@ -174,5 +183,23 @@ mod tests {
             Magnet::parse("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=a&tr=b")
                 .unwrap();
         assert_eq!(m.trackers, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_advertised_size_is_kept_when_it_is_usable() {
+        let m = Magnet::parse(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&xl=2330554994",
+        )
+        .unwrap();
+        assert_eq!(m.length, Some(2330554994));
+
+        // Junk or zero is not a size; announcing it would be worse than not knowing.
+        for bad in ["xl=0", "xl=-5", "xl=big"] {
+            let m = Magnet::parse(&format!(
+                "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&{bad}"
+            ))
+            .unwrap();
+            assert_eq!(m.length, None, "{bad}");
+        }
     }
 }

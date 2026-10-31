@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Open Download Manager Integration",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Hands downloads to the Open Download Manager daemon: parallel connections, resume, HLS/DASH capture.",
   "browser_specific_settings": {
     "gecko": {
