@@ -7,11 +7,11 @@
 
 #define AppName "Open Download Manager"
 ; The version comes from the command line in the release workflow
-; (`ISCC /DAppVersion=0.1.0 odm.iss`), so there is one version number in the project
+; (`ISCC /DAppVersion=0.2.0 odm.iss`), so there is one version number in the project
 ; rather than two that can drift apart. The value below is the fallback for a local
 ; build, and it is the version in `Cargo.toml`.
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.2.0"
 #endif
 #define AppPublisher "Open Download Manager"
 #define AppExeName "odm.exe"
