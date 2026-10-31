@@ -96,6 +96,7 @@ offset. Open Download Manager does the same, with the parts that matter recovere
 | Limits | Global and per-file rate limits, a per-server connection cap, and a bytes-per-window budget (`--quota 500M --quota-window 1h`) that pauses jobs instead of failing them |
 | Integrity | Optional `--checksum sha256:<hex>` (also `sha512`, `sha1`, `md5`, or a bare digest) checked against the working file **before** it is renamed into place: a mismatch fails the job, removes the working file, and never touches the output |
 | Media | HLS (`EXT-X-*`, byteranges, AES-128 keys, master playlists) and DASH (SegmentTemplate, SegmentTimeline, SegmentList); separate audio+video tracks are muxed into one file; an MPEG-TS stream `ffmpeg` cannot remux is kept as `.ts` rather than turned into a broken `.mp4` |
+| BitTorrent | `.torrent` files and magnet links; multi-file torrents, HTTP and UDP trackers, mainline DHT, peer exchange, SHA-1 piece verification with corrupt-peer banning, resume across restarts, and a localhost `Range` server so a film can be watched in the window while it downloads |
 | FTP | Passive mode, `SIZE`, `REST`-based resume, anonymous defaults |
 | Grabber | BFS crawl with depth/page limits, include/exclude wildcards, media/archive classification, tracker filtering |
 | Archiving | `grab --archive` (or a `site` project with `--archive`) keeps a page and everything it needs to render — stylesheets, scripts, images, fonts — rewriting the markup to local relative paths; every URL gets a path decided by the URL alone, and anything it could not hold keeps pointing at the live site |
@@ -124,8 +125,8 @@ install -m755 desktop/target/release/odm ~/.local/bin/odm
 cargo build --release
 install -m755 target/release/odm-cli ~/.local/bin/odm-cli
 
-cargo test                                        # 355 tests: unit + protocol + end-to-end
-cargo test --manifest-path desktop/Cargo.toml    # 3 tests: the window's own interface
+cargo test                                        # 388 tests: unit + protocol + end-to-end
+cargo test --manifest-path desktop/Cargo.toml    # 7 tests: the window's own interface, and a real decode
 ```
 
 On Linux the app needs the X11 development packages at build time
@@ -396,7 +397,40 @@ odm-cli config set speed_limit 4M
 odm-cli config set quota_bytes 500M
 ```
 
-## Recurring projects
+## BitTorrent
+
+`odm-bt` is a separate program, not a mode of the HTTP engine: a different wire protocol,
+a different peer model and different failure modes, and folding one into the other would
+put both at risk. It reads `.torrent` files and magnet links.
+
+```sh
+# What is in this file?
+odm-bt info ubuntu.torrent
+
+# Download it — or hand it a magnet link, whose metadata is fetched from the swarm.
+odm-bt download ubuntu.torrent
+odm-bt download 'magnet:?xt=urn:btih:...'
+
+# Serve one file over localhost while it downloads, and play the printed URL.
+odm-bt stream ubuntu.torrent --file 2
+```
+
+Peers come from HTTP and UDP trackers, from the mainline DHT (which is what makes a magnet
+link work at all), and from the peers themselves through PEX. Every piece is checked
+against its SHA-1 before it is accepted; a peer that fails three checks is banned and its
+pieces are fetched from someone else. Progress is kept in a resume file, so closing the
+program and starting it again picks up where it stopped. That file records the folder it
+describes: the same torrent saved somewhere else starts from zero rather than inheriting a
+bitfield that says nothing about the bytes at the new path.
+
+The window's Torrents tab is the same engine. **Stream** opens the film in a player
+window of its own, fed from the download by a localhost HTTP server, so it can be watched
+while the rest of it is still arriving. See
+[Watching a torrent while it downloads](#the-window).
+
+The engine downloads; it does not seed, does not speak uTP, and does not offer
+libtorrent-style encrypted connections — see [Known limitations](#known-limitations).
+
 
 IDM's *periodic synchronization* and its *scheduled site grabber* are the same idea — a
 named definition meant to run again — so Open Download Manager stores both the same way, one JSON
@@ -593,7 +627,7 @@ tests/           end-to-end tests against servers that really do byte ranges, co
 | Browser integration that survives browser policy | Chrome disabling IDM's MV2 extension; IDM's own "keep the extension enabled" advice | Loopback daemon is the integration; the extension is a thin MV3 client, and `curl` can do everything it can |
 | Never lose media again, and say so honestly when it cannot | The video panel is the reason people stay; protected streams and YouTube changes are the top failures | HLS/DASH capture and muxing; no DRM circumvention and no per-site signature layer, by design |
 | Speed, resume, batch | "up to 8 times faster", "paste 100 links", resume after a crash | Dynamic segmentation, conditional resume, queue; batch is the shell and the daemon API |
-| BitTorrent and magnet links | The single most-cited reason to keep a second app installed | `odm-bt` and the window's Torrents tab: `.torrent` files and magnet links, pieces verified by SHA-1. A second engine, not a mode of the HTTP one |
+| BitTorrent and magnet links | The single most-cited reason to keep a second app installed | `odm-bt` and the window's Torrents tab: `.torrent` files and magnet links, multi-file torrents, DHT, peer exchange, pieces verified by SHA-1 and bad peers banned. A second engine, not a mode of the HTTP one |
 | Checksum verification | Listed as a headline feature by neighbouring projects | `--checksum sha256:…`, verified before the rename |
 | Headless / NAS / remote control | "headless NAS server", aria2's "RPC daemon mode" | Daemon + JSON API + `project tick` + an optional bearer token on every route, and a `scratch` image that runs it all: `docker compose up -d`, `docker stop` and back without losing a queue |
 | No ads, no nag, no account | The most common reason given for choosing an alternative | Nothing to build: no account, no telemetry, no nag |
@@ -640,16 +674,37 @@ and ranks what to build next. The ranking, in short:
    glibc's. See [Headless and containers](#headless-and-containers).
 
 **The window.** `odm.exe` (or `odm` on Linux) is a native application — not a web page in
-a browser — with the layout the brief asked for: a menu bar, a toolbar of icon actions
+a browser — with the layout the brief asked for: a menu bar, a toolbar of icon buttons
 (Add URL, Resume, Stop, Delete, Delete Completed, Options, Scheduler, Start Queue, Stop
-Queue), a category tree down the left (All Downloads, Unfinished, Finished, Failed, and
-per-type categories), and a sortable table with File Name, Size, Status, Time left,
-Transfer rate, Last Try and Description. It is styled dark and flat, the way a modern
-application should be, rather than the grey of a 2000s-era program.
+Queue) whose names appear as tooltips, a category tree down the left (All Downloads,
+Unfinished, Finished, Failed, and per-type categories), and a sortable table with File
+Name, Size, Status, Time left, Transfer rate, Last Try and Description. It is styled dark
+and flat, the way a modern application should be, rather than the grey of a 2000s-era
+program.
 
 It is standalone: it starts the daemon in-process, so running the program is all there is
 to do. The Torrents tab takes a `.torrent` file — dropped onto the window or typed — and a
-magnet link, and shows the transfer as it happens.
+magnet link, and shows the transfer as it happens, peers included.
+
+**Watching a torrent while it downloads.** Each torrent row has a **Stream** button, and
+the film opens in a player window of its own — no browser, no temporary file, and no
+panel taking the download list's place. The download feeds a localhost HTTP server that
+speaks `Range`, and FFmpeg reads from it the way a browser would; the piece picker is
+pointed at the byte the player is about to need, so the swarm fetches that part of the
+file first (the same arrangement as uTorrent's streamer, and libtorrent's
+`media_streamer` before it). Playback has pause, ±10-second jumps and a scrubber: drag it,
+or click anywhere on it, and playback restarts from that point, asking the stream for the
+bytes there. Sound is decoded by a second FFmpeg process and fed to the default output
+device on Windows and macOS; on Linux the window is picture-only unless the ALSA
+development headers are present at build time, because the audio backend needs them.
+
+**Pausing, and doing it in batches.** Both tables have a checkbox on every row and a
+select-all box in the header. Ticking rows brings up a batch bar — Start, Pause, Retry and
+Delete for torrents, Start, Pause and Delete for downloads — so a group is one click
+rather than one click per item. A paused torrent keeps its peer connections and the
+blocks already in flight; only the picker stops handing out new work, which is what makes
+resuming instant. A failed or cancelled torrent can be retried from the `.torrent` or
+magnet link it was added from, without finding that link again.
 
 **How the window is tested.** The interface is exercised the way a person uses it — a
 click at a point — but headlessly: no display, no mouse, no timing, and the same result
@@ -863,9 +918,15 @@ against this implementation (§12 there). The short version:
 - **No PAC evaluation, no FTPS, no MMS.** See the protocol section above for each.
 - **No antivirus-on-completion hook**, no self-updater, no installation wizard, and no UI
   languages other than English.
-- **No BitTorrent features beyond the basics**: single-file torrents only, HTTP trackers
-  only, no DHT, no peer exchange, no seeding, no multi-file torrents. IDM has no BitTorrent
-  at all, so this is already more than it has — but a modern client would do more.
+- **No seeding, no uTP, no protocol encryption.** The torrent engine downloads: it does
+  not upload pieces back, it speaks TCP only (no BEP 29 uTP), and it does not offer
+  libtorrent-style encrypted connections (MSE/PE), so a private tracker that requires
+  encryption will refuse it. It also ignores web seeds (BEP 19). IDM has no BitTorrent at
+  all, so this is already more than it has — but a modern client would do more.
+- **Torrent audio is missing on Linux unless the ALSA headers are installed.** The player
+  decodes sound through `cpal`, which is compiled only for Windows and macOS: a plain
+  Linux desktop with no `libasound2-dev` gets the picture and no sound rather than a build
+  that fails.
 
 **Platform and interface**
 
@@ -897,23 +958,26 @@ against this implementation (§12 there). The short version:
 ## Testing
 
 ```sh
-cargo test                              # Rust: 355 tests
-cargo test --manifest-path desktop/Cargo.toml    # 3 more: the window's interface
+cargo test                              # Rust: 388 tests
+cargo test --manifest-path desktop/Cargo.toml    # 17 more: the window's interface and player
 node --test extension/tests/protocol.test.mjs   # JavaScript: 15 tests
 ./scripts/check-portability.sh          # the platform module, for all 7 targets
 ./scripts/check-headless.sh             # the static binary alone in a one-file rootfs
 ```
 
-355 Rust tests in the library and the command line — 268 unit tests across every module, 17
+388 Rust tests in the library and the command line — 310 unit tests across every module, 20
 daemon-protocol tests driving a real WebSocket client against a bound daemon, 9 end-to-end tests that stand up an HTTP server
 which really does byte ranges, 6 that stand up a mock `Negotiate` server, 6 that verify
 checksums end-to-end against a real HTTP server, 17 that stand up a server which really
 honours `If-None-Match` and `Range`, 10 that archive a small site and then read their own
-output back to check that every rewritten reference resolves, and 4 that start the released
-**binary**, send it a real signal, and check what it does about it — three to the daemon
-(SIGTERM mid-download, SIGINT, an idle stop that must not wait) and one to a foreground
-`odm-cli download`. Three more live in the window's own crate and drive the interface
-with simulated clicks.
+output back to check that every rewritten reference resolves, 6 that download from a peer
+in the same process over loopback — a multi-file torrent, a corrupt piece that must be
+retried, a range served while the download runs, a slow two-peer swarm that must not
+stall, a bad stream token — and 4 that start the released **binary**, send it a real
+signal, and check what it does about it — three to the daemon (SIGTERM mid-download,
+SIGINT, an idle stop that must not wait) and one to a foreground `odm-cli download`. Seven
+more live in the window's own crate: four drive the interface with simulated clicks, and
+three decode a real file through FFmpeg, seek it, and check that pausing stops the clock.
 
 The end-to-end ones assert that
 

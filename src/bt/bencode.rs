@@ -70,6 +70,33 @@ pub fn decode_one_doc(data: &[u8]) -> Result<Value> {
     Ok(v)
 }
 
+/// The byte range of the value stored under `key` in the top-level dictionary
+/// `data`, as `(start, end)` into `data`.
+///
+/// This exists because a torrent's info hash is the SHA-1 of the *encoded* info
+/// dictionary exactly as it appeared in the file. Decoding and re-encoding it is
+/// only equivalent when the dictionary's keys were already in canonical order;
+/// a file written by a tool that did not sort them would otherwise hash to a
+/// different value, and no tracker or peer would recognise the torrent.
+pub fn dict_value_span(data: &[u8], key: &[u8]) -> Option<(usize, usize)> {
+    if data.first() != Some(&b'd') {
+        return None;
+    }
+    let mut rest = &data[1..];
+    while !rest.is_empty() && rest[0] != b'e' {
+        let (k, after_key) = decode_one(rest).ok()?;
+        let key_bytes = k.as_bytes()?;
+        let value_start = data.len() - after_key.len();
+        let (_, after_value) = decode_one(after_key).ok()?;
+        let value_end = data.len() - after_value.len();
+        if key_bytes == key {
+            return Some((value_start, value_end));
+        }
+        rest = after_value;
+    }
+    None
+}
+
 fn decode_one(data: &[u8]) -> Result<(Value, &[u8])> {
     if data.is_empty() {
         return Err(OdmError::other("unexpected end of bencode"));
@@ -193,5 +220,16 @@ mod tests {
         let (v, n) = decode(b"0:").unwrap();
         assert_eq!(v, Value::Bytes(vec![]));
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn a_value_span_points_at_the_original_bytes() {
+        // Deliberately out of key order: the span must be of the bytes as they
+        // are, not of a canonical re-encoding.
+        let data = b"d4:infod6:lengthi7e4:name4:teste8:announce3:urle";
+        let (start, end) = dict_value_span(data, b"info").unwrap();
+        assert_eq!(&data[start..end], b"d6:lengthi7e4:name4:teste");
+        assert_eq!(dict_value_span(data, b"missing"), None);
+        assert_eq!(dict_value_span(b"l1:ae", b"info"), None);
     }
 }

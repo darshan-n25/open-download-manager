@@ -1,6 +1,6 @@
 [package]
 name = "odm-desktop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Open Download Manager (ODM) — a native, modern download manager"
 
@@ -24,3 +24,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 odm = { path = ".." }
+
+# Sound for the in-app player. Only where a platform backend exists: on Linux cpal
+# pulls in the ALSA development headers, which a plain desktop install often does
+# not have — the player there is picture-only, and this dependency is never even
+# resolved.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+cpal = "0.15"

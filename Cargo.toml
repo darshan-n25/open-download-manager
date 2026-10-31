@@ -1,6 +1,6 @@
 [package]
 name = "odm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Open Download Manager — an open-source, cross-platform download manager in the spirit of Internet Download Manager"
 license = "MIT"

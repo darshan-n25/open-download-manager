@@ -29,3 +29,6 @@ desktop/target/
 # The release archives, built by `scripts/package-release.sh` and by the release
 # workflow. They are outputs, not sources: a release publishes them from CI.
 dist/
+
+# graphify reverse-engineering output (generated, local)
+graphify-out/
